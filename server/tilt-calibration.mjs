@@ -353,13 +353,14 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
       rmsResidualPixels: Math.sqrt(values.reduce((sum, value) => sum + value.pixels ** 2, 0) / values.length) };
   });
   const rmsResidualPixels = Math.sqrt(perSnapshot.reduce((sum, item) => sum + item.rmsResidualPixels ** 2, 0) / samples.length);
+  const rmsAngularResidualDegrees = Math.sqrt(normal.values.reduce((sum, value) => sum + value.weight * value.angle ** 2, 0) / samples.length) / rad;
   const accepted = solution.converged && conditionNumber !== null && conditionNumber < 1e8
     && Number.isFinite(rmsResidualPixels) && rmsResidualPixels <= maximumRmsPixels;
   const [pAxisPitch, pAxisRoll, tiltOffset, imageRoll] = solution.parameters;
   return { ...base, status: accepted ? 'estimated' : 'unreliable',
     installation: accepted ? { pAxisPitch, pAxisRoll, tiltOffset, imageRoll } : null,
     diagnostics: { converged: solution.converged, iterations: solution.iterations, conditionNumber,
-      rmsResidualPixels, maximumAcceptedRmsPixels: maximumRmsPixels, perSnapshot },
+      rmsResidualPixels, rmsAngularResidualDegrees, maximumAcceptedRmsPixels: maximumRmsPixels, perSnapshot },
     warnings: ['必须复核真实海天线；稳定的岸线误识别也可能得到较小残差',
       '经纬度、高度与默认朝向采用当前配置，海天线不能独立标定安装高度或绝对朝向',
       '截图与 PTZ 尚未确认严格同步；未建模潮汐、折射、畸变或稳像裁剪',

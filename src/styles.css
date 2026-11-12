@@ -1,0 +1,19 @@
+:root{font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif;color:#282d35;background:#f6f7f9;font-synthesis:none;font-size:13px;color-scheme:light}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden}
+button,input{font:inherit}
+button,a,input{-webkit-tap-highlight-color:transparent}
+button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;background:transparent;color:inherit;transition:background-color .12s ease,color .12s ease}
+button:disabled{cursor:default;opacity:.38}
+button:focus-visible,a:focus-visible{outline:2px solid #3879ef;outline-offset:3px}
+input{color:#282d35;background:#fff;border:1px solid #dce0e6;border-radius:3px;min-width:0;outline:none}
+input:focus{border-color:#5489e8;box-shadow:0 0 0 2px #5489e815}
+input::placeholder{color:#b4b9c2}
+input:disabled{background:#f7f8fa;color:#68707e}
+input.ng-touched.ng-invalid{border-color:#bc675c}
+fieldset{border:0;margin:0;padding:0;min-width:0}
+h1,h2,h3,p,figure{margin:0}
+a{color:inherit;text-decoration:none}
+.cesium-viewer-bottom{left:8px!important;bottom:25px!important}
+.cesium-widget-credits{font-size:10px!important}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}

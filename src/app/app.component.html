@@ -1,0 +1,215 @@
+<div class="workspace" [class.recognition-page]="page() === 'recognition'">
+  <nav class="icon-rail" aria-label="主菜单">
+    <div class="brand" title="云台姿态调试"><app-icon name="target" /></div>
+    <button type="button" title="三维视场" aria-label="三维视场" [class.active]="page() === 'scene' && !panel()" (click)="openPage('scene')"><app-icon name="map" /></button>
+    <button type="button" title="摄像头" aria-label="摄像头" [class.active]="panel() === 'devices'" (click)="togglePanel('devices')"><app-icon name="devices" /></button>
+    <button type="button" title="截图记录" aria-label="截图记录" [class.active]="panel() === 'snapshots'" (click)="togglePanel('snapshots')"><app-icon name="image" /></button>
+    <button type="button" title="截图任务" aria-label="截图任务" [class.active]="page() === 'tasks'" (click)="openPage('tasks')"><app-icon name="tasks" /></button>
+    <button type="button" title="识别任务" aria-label="识别任务" [class.active]="page() === 'recognition'" (click)="openPage('recognition')"><app-icon name="horizon" /></button>
+    <span class="service-dot" [class.connected]="apiConnected()" [title]="apiConnected() ? '调试服务已连接' : '调试服务未连接'" role="status" [attr.aria-label]="apiConnected() ? '调试服务已连接' : '调试服务未连接'"></span>
+  </nav>
+
+  <main class="map-area">
+    @if (page() === 'recognition') {
+      <app-recognition-tasks [taskId]="recognitionTaskId()" (applied)="installationApplied($event)" />
+    } @else if (page() === 'tasks') {
+      <app-snapshot-tasks (opened)="openTaskSnapshot($event)" (removed)="forgetSnapshot($event)" (changed)="loadSnapshots()" (recognitionCreated)="openRecognition($event)" />
+    } @else {
+    <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()" />
+    <header class="map-toolbar">
+      <button type="button" class="device-picker" (click)="togglePanel('devices')">
+        <app-icon name="camera" /><span>{{ selectedCamera()?.name || '选择摄像头' }}</span><app-icon name="down" />
+      </button>
+      <div class="view-actions">
+        @if (!selectedSnapshot()) {
+          <button type="button" [class.selected]="showVideo()" (click)="showVideo.set(!showVideo())"><app-icon name="video" />直播融合</button>
+        }
+        @if (selectedSnapshot()) {
+          <span class="history-badge">历史快照</span>
+          <button type="button" (click)="exitHistory()"><app-icon name="back" />返回实时</button>
+        }
+        <button type="button" [class.selected]="following()" [disabled]="!selectedId()" (click)="following.set(!following())">{{ following() ? '跟随摄像头' : '固定观察' }}</button>
+        <button type="button" [disabled]="!selectedId()" (click)="bestView()"><app-icon name="target" />最佳观察</button>
+        <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId()" (click)="overview()"><app-icon name="map" /></button>
+      </div>
+    </header>
+    @if (pageError()) {
+      <div class="page-error" role="alert"><span>{{ pageError() }}</span><button type="button" class="icon-button" aria-label="关闭提示" (click)="pageError.set('')"><app-icon name="close" /></button></div>
+    }
+    @if (panel()) {
+      <section class="drawer" [attr.aria-label]="panel() === 'devices' ? '摄像头列表' : '截图记录'">
+        <div class="drawer-heading">
+          <h2>{{ panel() === 'devices' ? '摄像头' : '截图记录' }}</h2>
+          <button type="button" class="icon-button" title="关闭" aria-label="关闭侧栏" (click)="panel.set(null)"><app-icon name="close" /></button>
+        </div>
+        @if (panel() === 'devices') {
+          <div class="device-list">
+            @for (camera of cameras(); track camera.id) {
+              <button type="button" class="device-row" [class.current]="selectedId() === camera.id" [disabled]="!!operating() || saving()" (click)="selectCamera(camera)">
+                <app-icon name="camera" /><span><strong>{{ camera.name }}</strong><small>{{ camera.code }}</small></span>
+                @if (selectedId() === camera.id) { <app-icon name="check" /> }
+              </button>
+            } @empty { <p class="empty-state">还没有摄像头</p> }
+          </div>
+          <button type="button" class="add-device" [disabled]="!!operating() || saving()" (click)="newCamera()"><app-icon name="plus" />注册摄像头</button>
+        } @else {
+          <div class="history-context"><span>{{ selectedCamera()?.name || '请先选择摄像头' }}</span><button type="button" class="icon-button" title="刷新截图记录" aria-label="刷新截图记录" [disabled]="!selectedId() || historyLoading()" (click)="loadSnapshots()"><app-icon name="refresh" /></button></div>
+          <div class="snapshot-list">
+            @for (group of snapshotGroups(); track group.id) {
+              <section class="snapshot-group">
+                <button type="button" class="snapshot-group-heading" [attr.aria-expanded]="expandedGroupId() === group.id" (click)="toggleGroup(group)">
+                  <span>{{ group.kind === 'scan' ? '自动截图' : '单张截图' }} · {{ group.createdAt | date:'MM-dd HH:mm:ss' }}</span>
+                  <small>{{ taskStatuses[group.status] }} · {{ group.snapshotCount }} 张@if (group.kind === 'scan') { · {{ group.completedCount }}/{{ group.sampleCount }} }</small>
+                </button>
+                @if (expandedGroupId() === group.id) {
+                  @for (snapshot of snapshots(); track snapshot.id) {
+                    <app-snapshot-item [snapshot]="snapshot" [current]="selectedSnapshot()?.id === snapshot.id" [disabled]="!!operating() || saving() || deletingSnapshot()" [deleteDisabled]="group.status === 'running' || group.status === 'pausing'" (opened)="viewSnapshot($event)" (removed)="deleteSnapshot($event)" />
+                  } @empty { <p class="empty-state">{{ groupLoading() ? '正在读取…' : '暂无截图' }}</p> }
+                  @if (nextSnapshotOffset() !== null) { <button type="button" class="load-more" [disabled]="groupLoading()" (click)="loadGroupSnapshots(true)">更多截图</button> }
+                }
+              </section>
+            } @empty { <p class="empty-state">{{ historyLoading() ? '正在读取…' : '暂无截图' }}</p> }
+            @if (nextGroupOffset() !== null) { <button type="button" class="load-more" [disabled]="historyLoading()" (click)="loadSnapshots(selectedId(), true)">更多分组</button> }
+          </div>
+        }
+      </section>
+    }
+
+    <div class="media-dock">
+    @if (showVideo() && !selectedSnapshot() && selectedId()) {
+      @if (playbackSource(); as source) {
+        <app-live-video [source]="source" [opacity]="videoOpacity()" [warning]="videoChannelMatches() ? '' : '设备信息与直播通道不一致，请保存设备信息后重试'"
+          (ready)="liveVideo.set($event)" (opacityChange)="videoOpacity.set($event)" (closed)="showVideo.set(false)" />
+      } @else if (playbackError()) {
+        <div class="video-config-error" role="alert"><p>{{ playbackError() }}</p><button type="button" (click)="loadPlayback()"><app-icon name="refresh" />重试</button></div>
+      }
+    }
+    @if (preview(); as snapshot) {
+      <figure class="snapshot-preview">
+        <figcaption><span>{{ selectedSnapshot() ? '历史快照' : '最新截图' }} · {{ snapshot.createdAt | date:'MM-dd HH:mm:ss' }}</span><div><a [href]="snapshot.imageUrl" target="_blank" rel="noopener" title="打开原图" aria-label="打开原图"><app-icon name="image" /></a>@if (!selectedSnapshot()) { <button type="button" class="icon-button" aria-label="收起截图" (click)="hidePreview.set(true)"><app-icon name="close" /></button> }</div></figcaption>
+        @if (selectedSnapshot()) {
+          <label class="snapshot-opacity">截图不透明度 <input type="range" min="0" max="1" step="0.05" aria-label="截图不透明度" [ngModel]="videoOpacity()" (ngModelChange)="videoOpacity.set($event)"><span>{{ videoOpacity() * 100 | number:'1.0-0' }}%</span></label>
+        } @else {
+          <img [src]="snapshot.imageUrl" alt="当前保存的摄像头快照">
+        }
+        <div class="preview-meta"><span>{{ snapshot.width }} × {{ snapshot.height }}</span><span>P {{ snapshot.ptz.raw.Pan | number:'1.1-2' }} · T {{ snapshot.ptz.raw.Tilt | number:'1.1-2' }} · Z {{ snapshot.ptz.raw.Zoom | number:'1.1-2' }}</span></div>
+      </figure>
+    }
+    </div>
+    <div class="map-coordinate-note">WGS84 · 椭球零高程近似海面</div>
+    }
+  </main>
+
+  <aside class="right-panel" [hidden]="page() === 'recognition'" aria-label="云台控制与安装参数">
+    <section class="controller-section">
+      <div class="section-heading"><h1>云台控制</h1><span class="connection-label" [class.live]="!!reading() && !stale() && !selectedSnapshot()">{{ selectedSnapshot() ? '历史状态' : operating() === 'snapshot' ? '正在截图' : stopping() ? '正在停止' : operating() === 'control' ? '控制未结束' : operating() === 'precise' ? '精确定位' : !selectedId() ? '未选择设备' : stale() ? '等待回读' : '实时' }}</span></div>
+      <div class="controller-workbench">
+        <div class="ptz-pad">
+          @for (control of padControls; track control.command) {
+            <button type="button" [class]="'pad-' + control.slot" [class.pressed]="heldCommand() === control.command"
+              [attr.aria-label]="control.label + '，按住控制，松手停止'" [title]="control.label + '（按住）'"
+              [disabled]="!canControl() && heldCommand() !== control.command"
+              (pointerdown)="pressControl($event, control.command)" (pointerleave)="leaveControl()"
+              (keydown)="keyControl($event, control.command)" (blur)="releaseControl()" (contextmenu)="$event.preventDefault()">
+              <app-icon [name]="control.icon" />
+            </button>
+          }
+        </div>
+        <button type="button" class="capture-button" [disabled]="!canCapture()" (click)="capture()"><app-icon name="camera" /><span>{{ operating() === 'snapshot' ? '保存中' : '截图' }}</span></button>
+      </div>
+      <div class="control-speed"><label>速度 <input type="number" aria-label="云台控制速度，0 到 255" min="0" max="255" step="1" [disabled]="!!operating() || saving() || !!selectedSnapshot()" [ngModel]="controlSpeed()" (ngModelChange)="controlSpeed.set($event)"></label><span>按住控制，松手停止</span><button type="button" class="stop-control" [disabled]="!selectedId() || saving() || operating() === 'snapshot' || !!selectedSnapshot() || stopping()" (click)="stopControl()">停止</button></div>
+      <details class="precise-control">
+        <summary>精确 PTZ（高级）</summary>
+        <form (ngSubmit)="sendPrecise()">
+          <fieldset [disabled]="!!operating() || saving() || !!selectedSnapshot()">
+            <div class="precise-fields">
+              <label for="precise-pan">P（°）<input id="precise-pan" name="precisePan" type="number" min="0" max="360" step="0.01" required [ngModel]="preciseTarget().pan" (ngModelChange)="editPrecise('pan', $event)"></label>
+              <label for="precise-tilt">T（°）<input id="precise-tilt" name="preciseTilt" type="number" min="0" max="360" step="0.01" required [ngModel]="preciseTarget().tilt" (ngModelChange)="editPrecise('tilt', $event)"></label>
+              <label for="precise-zoom">Z<input id="precise-zoom" name="preciseZoom" type="number" min="1" step="0.1" required [ngModel]="preciseTarget().zoom" (ngModelChange)="editPrecise('zoom', $event)"></label>
+            </div>
+            <div class="precise-actions"><button type="button" [disabled]="!reading() || stale()" (click)="fillPrecise()">填入当前读数</button><button type="submit" [disabled]="!canPrecise()">发送精确定位</button></div>
+          </fieldset>
+        </form>
+      </details>
+      <div class="ptz-readout" [class.stale]="stale() && !selectedSnapshot()">
+        @if (currentReading(); as current) {
+          <div><span>P</span><strong>{{ current.raw.Pan | number:'1.2-2' }}<small>°</small></strong></div>
+          <div><span>T</span><strong>{{ current.raw.Tilt | number:'1.2-2' }}<small>°</small></strong></div>
+          <div><span>Z</span><strong>{{ current.raw.Zoom | number:'1.1-2' }}</strong></div>
+        } @else { <div><span>P</span><strong>—</strong></div><div><span>T</span><strong>—</strong></div><div><span>Z</span><strong>—</strong></div> }
+      </div>
+      @if (currentReading(); as current) {
+        <div class="fov-readout"><span>HFOV {{ current.raw.HorizontalFieldAngle | number:'1.2-2' }}°</span><span>VFOV {{ current.raw.VerticalFieldAngle | number:'1.2-2' }}°</span></div>
+        <div class="read-time">{{ selectedSnapshot() ? '采样回读' : stale() ? '最近回读（已过期）' : '最新回读' }} {{ current.receivedAt | date:'HH:mm:ss' }} · {{ current.durationMs }} ms</div>
+      }
+      @if (controlTarget(); as target) { <div class="control-target">精确请求目标 P {{ target.pan | number:'1.2-2' }} · T {{ target.tilt | number:'1.2-2' }} · Z {{ target.zoom | number:'1.1-2' }}</div> }
+      @if (operationError() || liveError()) { <p class="inline-error" role="alert">{{ operationError() || liveError() }}</p> }
+      @if (operationMessage()) { <p class="inline-message" role="status">{{ operationMessage() }}</p> }
+    </section>
+
+    <form class="installation-form" (ngSubmit)="save()">
+      <fieldset [disabled]="saving() || !!selectedSnapshot()">
+        <div class="form-title"><h2>{{ selectedId() ? '安装参数' : '注册摄像头' }}</h2>@if (selectedSnapshot()) { <span>历史参数</span> } @else if (isDirty()) { <span>未保存</span> }</div>
+        @if (page() === 'scene' && !selectedSnapshot()) {
+          <section class="form-section scan-form">
+            <h3>自动截图</h3>
+            <div class="field-grid">
+              <label for="scan-pan-min">最小 P <span>°</span><input id="scan-pan-min" name="scanPanMin" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMin()" (ngModelChange)="scanPanMin.set($event)"></label>
+              <label for="scan-pan-max">最大 P <span>°</span><input id="scan-pan-max" name="scanPanMax" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMax()" (ngModelChange)="scanPanMax.set($event)"></label>
+            </div>
+            <p class="scan-baseline">开始时读取当前 T/Z，固定整轮使用</p>
+            <div class="scan-actions"><button type="button" [disabled]="!canScan()" (click)="startSnapshotScan()">开始自动截图</button><button type="button" (click)="page.set('tasks'); panel.set(null)">查看任务</button></div>
+            @if (currentScan(); as task) {
+              <div class="scan-progress"><span>{{ taskStatuses[task.status] }} · 已采样 {{ task.completedCount }}/{{ task.sampleCount }}</span><progress [value]="task.completedCount" [max]="task.sampleCount" aria-label="自动截图进度"></progress>
+                @if (task.basePtz; as base) { <small>本次固定 T {{ base.tilt }}° / Z {{ base.zoom }} · 现存 {{ task.snapshotCount }} 张</small> }
+                @if (task.error) { <p class="inline-error" role="alert">{{ task.error }}</p> }
+                @if (task.status === 'running') { <button type="button" [disabled]="!!operating()" (click)="scanAction('pause')">暂停</button> }
+                @if (task.status === 'paused' || task.status === 'interrupted' || task.status === 'failed') { <button type="button" [disabled]="!!operating() || scanning() || task.completedCount >= task.sampleCount" (click)="scanAction('start')">继续本次截图</button> }
+              </div>
+            }
+          </section>
+        }
+        <section class="form-section">
+          <div class="parameter-heading"><h3>云台 P 轴姿态</h3><app-calibration-help topic="p-axis" /></div>
+          <div class="field-grid">
+            <label for="axis-pitch">前后倾 <span>°</span><input id="axis-pitch" name="pAxisPitch" type="number" step="0.01" min="-180" max="180" required [ngModel]="formValue().pAxisPitch" (ngModelChange)="editNumber('pAxisPitch', $event)"></label>
+            <label for="axis-roll">左右倾 <span>°</span><input id="axis-roll" name="pAxisRoll" type="number" step="0.01" min="-180" max="180" required [ngModel]="formValue().pAxisRoll" (ngModelChange)="editNumber('pAxisRoll', $event)"></label>
+          </div>
+          <label for="pan-offset">默认朝向（P 偏移）<span>°</span><input id="pan-offset" name="panOffset" type="number" step="0.01" min="-360" max="360" required [ngModel]="formValue().panOffset" (ngModelChange)="editNumber('panOffset', $event)"></label>
+        </section>
+        <details class="form-section advanced-calibration">
+          <summary>高级标定</summary>
+          <div class="field-grid">
+            <div class="calibration-field">
+              <div class="field-heading"><label for="tilt-offset">T 偏移<span>°</span></label><app-calibration-help topic="tilt-offset" /></div>
+              <input id="tilt-offset" name="tiltOffset" type="number" step="0.01" min="-180" max="180" required title="T 偏移正值上抬" [ngModel]="formValue().tiltOffset" (ngModelChange)="editNumber('tiltOffset', $event)">
+            </div>
+            <div class="calibration-field">
+              <div class="field-heading"><label for="image-roll">画面 Roll 修正<span>°</span></label><app-calibration-help topic="image-roll" /></div>
+              <input id="image-roll" name="imageRoll" type="number" step="0.01" min="-180" max="180" required [ngModel]="formValue().imageRoll" (ngModelChange)="editNumber('imageRoll', $event)">
+            </div>
+          </div>
+        </details>
+        <section class="form-section">
+          <h3>安装位置</h3>
+          <div class="field-grid">
+            <label for="longitude">经度 <span>°</span><input id="longitude" name="longitude" type="number" step="0.000001" min="-180" max="180" placeholder="待填写" [ngModel]="formValue().longitude" (ngModelChange)="editNumber('longitude', $event)"></label>
+            <label for="latitude">纬度 <span>°</span><input id="latitude" name="latitude" type="number" step="0.000001" min="-90" max="90" placeholder="待填写" [ngModel]="formValue().latitude" (ngModelChange)="editNumber('latitude', $event)"></label>
+          </div>
+          <label for="height">高度 <span>m</span><input id="height" name="height" type="number" step="0.1" min="0" max="100000" placeholder="待填写" [ngModel]="formValue().height" (ngModelChange)="editNumber('height', $event)"></label>
+        </section>
+        <section class="form-section device-fields">
+          <h3>设备信息</h3>
+          <label for="camera-name">名称<input id="camera-name" name="name" type="text" maxlength="100" required autocomplete="off" [ngModel]="formValue().name" (ngModelChange)="editText('name', $event)"></label>
+          <label for="camera-serial">设备编号<input id="camera-serial" name="serial" type="text" maxlength="100" required autocomplete="off" spellcheck="false" [ngModel]="formValue().serial" (ngModelChange)="editText('serial', $event)"></label>
+          <label for="camera-code">通道编号<input id="camera-code" name="code" type="text" maxlength="100" required autocomplete="off" spellcheck="false" [ngModel]="formValue().code" (ngModelChange)="editText('code', $event)"></label>
+        </section>
+      </fieldset>
+      <div class="form-footer">
+        @if (formError()) { <p class="inline-error" role="alert">{{ formError() }}</p> }
+        @if (formMessage()) { <p class="saved-message" role="status"><app-icon name="check" />{{ formMessage() }}</p> }
+        <button type="submit" class="save-button" [disabled]="!formValid() || saving() || !!operating() || scanning() || !!selectedSnapshot() || (!isDirty() && !!selectedId())"><app-icon name="save" />{{ saving() ? '正在保存…' : selectedId() ? '保存配置' : '注册并保存' }}</button>
+      </div>
+    </form>
+  </aside>
+</div>

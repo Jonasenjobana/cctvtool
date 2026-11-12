@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.angular/
+.env
+.env.*
+!.env.example
+mcp.config.local.json
+data/
+*.log
+__pycache__/

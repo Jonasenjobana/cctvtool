@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "cctv-tilt-calibration": {
+      "url": "http://10.10.101.132:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_API_KEY>"
+      }
+    }
+  }
+}

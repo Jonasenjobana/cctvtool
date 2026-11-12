@@ -1,0 +1,132 @@
+<header class="heading">
+  <div class="page-title"><app-icon name="horizon" /><h1>海天线识别任务</h1></div>
+  <button type="button" [disabled]="busy() || loading() || dirty()" (click)="refresh()"><app-icon name="refresh" />刷新</button>
+</header>
+@if (problem()) { <p class="error page-feedback" role="alert">{{ problem() }}</p> }
+@if (message()) { <p class="message page-feedback" role="status">{{ message() }}</p> }
+<div class="layout">
+  <section class="task-list" aria-label="识别任务列表">
+    <div class="list-heading"><h2>识别任务</h2></div>
+    <div class="task-rows">
+      @for (task of tasks(); track task.id) {
+        <button type="button" class="task-row" [class.current]="selected()?.id === task.id"
+          [attr.aria-current]="selected()?.id === task.id ? 'true' : null" [disabled]="busy()" (click)="loadTask(task.id)">
+          <strong>{{ task.cameraName }}</strong>
+          <span class="task-date">{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</span>
+          <span class="task-progress"><span class="status" [attr.data-status]="task.status">{{ statuses[task.status] }}</span><small>{{ task.completedCount }} / {{ task.sampleCount }} 张</small></span>
+          <progress [value]="task.completedCount" [max]="task.sampleCount" aria-label="识别进度"></progress>
+        </button>
+      } @empty { <p class="empty">{{ loading() ? '正在加载任务…' : '从截图任务中点击“创建识别任务”开始。' }}</p> }
+      @if (nextTaskOffset() !== null) { <button type="button" class="more" [disabled]="loading() || busy()" (click)="loadMore('tasks')">更多任务</button> }
+    </div>
+  </section>
+  <section class="detail" aria-label="海天线标注与安装参数">
+    @if (selected(); as task) {
+      <div class="toolbar">
+        <div class="task-title"><h2>{{ task.cameraName }}</h2><p><span class="status" [attr.data-status]="task.status">{{ statuses[task.status] }}</span><span>{{ task.completedCount }} / {{ task.sampleCount }} 张</span></p></div>
+        <div class="actions">
+          @if (running()) { <button type="button" [disabled]="busy()" (click)="cancel()">取消识别</button> }
+          @else {
+            <button type="button" [disabled]="busy() || dirty()" (click)="recreate()">创建新一轮识别</button>
+            <button type="button" class="primary" [disabled]="busy()" (click)="generate()">{{ busy() ? '处理中…' : '生成安装参数' }}</button>
+          }
+        </div>
+      </div>
+      @if (task.error) { <p class="error" role="alert">{{ task.error }}</p> }
+      <div class="workbench">
+        <section class="review" aria-label="截图复核">
+          <section class="editor" aria-label="海天线编辑">
+            <div class="section-heading"><h3>海天线复核</h3>
+              @if (item(); as entry) { <span class="annotation-source" [class.unsaved]="dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ dirty() ? ' · 未保存' : '' }}</span> }
+            </div>
+            @if (item(); as entry) {
+              <p class="image-info">{{ entry.snapshot.width }} × {{ entry.snapshot.height }}<span>P {{ entry.snapshot.ptz.raw.Pan | number:'1.2-2' }}°</span><span>T {{ entry.snapshot.ptz.raw.Tilt | number:'1.2-2' }}°</span><span>Z {{ entry.snapshot.ptz.raw.Zoom }}</span></p>
+              @if (entry.missing) { <p class="error">原图已删除，重新生成数据时会排除此图。</p> }
+              @else {
+                <div class="annotation" [style.aspect-ratio]="entry.snapshot.width + ' / ' + entry.snapshot.height">
+                  <img [src]="entry.snapshot.imageUrl" alt="拖动红色标注端点调整海天线">
+                  <svg [attr.viewBox]="'0 0 ' + entry.snapshot.width + ' ' + entry.snapshot.height" role="img" aria-label="海天线标注层，也可在下方输入归一化坐标"
+                    (pointerdown)="startDrag($event)" (pointermove)="drag($event)" (pointerup)="endDrag()" (pointercancel)="endDrag()" (lostpointercapture)="endDrag()">
+                    @if (entry.detectedPoints.length === 2) {
+                      <line class="model-line" [attr.x1]="entry.detectedPoints[0].x * entry.snapshot.width" [attr.y1]="entry.detectedPoints[0].y * entry.snapshot.height"
+                        [attr.x2]="entry.detectedPoints[1].x * entry.snapshot.width" [attr.y2]="entry.detectedPoints[1].y * entry.snapshot.height" />
+                    }
+                    @if (points().length === 2) {
+                      <line class="edited-line" [attr.x1]="points()[0].x * entry.snapshot.width" [attr.y1]="points()[0].y * entry.snapshot.height"
+                        [attr.x2]="points()[1].x * entry.snapshot.width" [attr.y2]="points()[1].y * entry.snapshot.height" />
+                      @for (point of points(); track $index) { <circle [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height" [attr.r]="entry.snapshot.width / 100" /> }
+                    }
+                  </svg>
+                </div>
+              }
+              <div class="legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span><span>拖动两端调整海天线</span></div>
+              <fieldset [disabled]="busy() || running() || entry.missing">
+                <div class="annotation-actions">
+                  <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
+                  <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
+                    <button type="button" class="primary" [disabled]="!dirty()" (click)="save()"><app-icon name="save" />保存标注</button></div>
+                </div>
+                <div class="coordinates">
+                  @for (point of points(); track $index; let i = $index) {
+                    <div class="coordinate-point"><span>端点 {{ i + 1 }}</span>
+                      <label>X<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'" [ngModel]="point.x" (ngModelChange)="editPoint(i, 'x', $event)"></label>
+                      <label>Y<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'" [ngModel]="point.y" (ngModelChange)="editPoint(i, 'y', $event)"></label>
+                    </div>
+                  }
+                </div>
+              </fieldset>
+              @if (entry.ignoreReason && !dirty()) { <p class="note">{{ entry.ignoreReason }}</p> }
+              @if (entry.detection?.error; as detectionError) { <p class="error">{{ detectionError }}</p> }
+              @for (warning of entry.detection?.warnings || []; track $index) { <p class="note">{{ warning }}</p> }
+              @let pixels = residual(entry.snapshotId);
+              @if (pixels !== undefined) { <p class="note">本图拟合残差：{{ pixels | number:'1.2-2' }} 像素</p> }
+            } @else { <p class="empty editor-empty">{{ running() ? '正在读取本地模型，请等待识别结果。' : '选择截图复核海天线。' }}</p> }
+          </section>
+          <section class="images-panel" aria-label="识别截图列表">
+            <div class="section-heading"><h3>截图列表</h3><span>{{ items().length }} 张已加载</span></div>
+            <div class="images">
+              @for (entry of items(); track entry.snapshotId) {
+                <button type="button" class="image-row" [class.current]="selectedItemId() === entry.snapshotId" [class.ignored]="entry.ignored || entry.missing" [class.missing]="entry.missing"
+                  [attr.aria-current]="selectedItemId() === entry.snapshotId ? 'true' : null" [disabled]="busy()" (click)="openItem(entry)">
+                  <span class="thumbnail">
+                    @if (!entry.missing) { <img [src]="entry.snapshot.imageUrl" loading="lazy" alt="待复核截图"> }
+                    @else { <app-icon name="image" /> }
+                    @if (selectedItemId() === entry.snapshotId) { <span class="selection-marker">当前选中</span> }
+                  </span>
+                  <span class="image-pan">P {{ entry.snapshot.ptz.raw.Pan | number:'1.1-2' }}°</span>
+                  <span class="image-status">{{ entry.missing ? '原图已删除' : entry.ignored ? '已忽略' : '参与计算' }}</span>
+                </button>
+              } @empty { <p class="empty">{{ running() ? '识别结果将显示在这里。' : '暂无可复核截图。' }}</p> }
+              @if (nextItemOffset() !== null) { <button type="button" class="more" [disabled]="loading() || busy()" (click)="loadMore('items')">更多截图</button> }
+            </div>
+          </section>
+        </section>
+        <section class="result" aria-label="安装参数计算结果">
+          <div class="section-heading"><h2>安装参数</h2></div>
+          @if (task.result; as result) {
+            <p class="result-message" [class.error]="result.status !== 'estimated'">{{ result.message }}</p>
+            <dl class="result-metrics">
+              <div><dt>有效截图</dt><dd>{{ result.sourceSnapshotIds.length }}<small>张</small></dd></div>
+              <div><dt>P 覆盖</dt><dd>{{ result.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
+              @if (result.diagnostics; as quality) { <div class="residual"><dt>均方根误差</dt><dd>{{ quality.rmsResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div> }
+            </dl>
+            @if (result.installation; as installation) {
+              <table><thead><tr><th scope="col">参数</th><th scope="col">计算前</th><th scope="col">生成值</th></tr></thead><tbody>
+                @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ task.fitCamera?.[field.key] | number:'1.4-4' }}°</td><td>{{ installation[field.key] | number:'1.4-4' }}°</td></tr> }
+              </tbody></table>
+            }
+            <button type="button" class="primary apply-button" [disabled]="busy() || dirty() || result.status !== 'estimated' || task.appliedRevision === task.revision"
+              (click)="apply()"><app-icon [name]="task.appliedRevision === task.revision ? 'check' : 'save'" />{{ task.appliedRevision === task.revision ? '已应用' : '应用到摄像头' }}</button>
+            @for (warning of result.warnings || []; track $index) { <p class="note">{{ warning }}</p> }
+            @if (result.excluded.length) {
+              <details><summary>排除 {{ result.excluded.length }} 张截图</summary><ul>@for (excluded of result.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }</ul></details>
+            }
+          } @else {
+            <div class="result-empty"><app-icon name="target" /><p>{{ running() ? '识别完成后可生成安装参数' : '复核标注、忽略异常图片后，点击“生成安装参数”。' }}</p></div>
+          }
+          <p class="note">修改标注后需重新生成安装参数。</p>
+        </section>
+      </div>
+    } @else { <div class="detail-empty"><app-icon name="horizon" /><h2>{{ loading() ? '正在加载识别任务…' : '选择识别任务' }}</h2></div> }
+  </section>
+</div>

@@ -1,0 +1,47 @@
+<header class="tasks-heading"><h1>截图任务</h1><button type="button" [disabled]="loading() || acting()" (click)="refresh()">刷新</button></header>
+@if (problem()) { <p class="task-error" role="alert">{{ problem() }}</p> }
+<div class="tasks-layout">
+  <section class="task-list" aria-label="任务列表">
+    @for (task of tasks(); track task.id) {
+      <button type="button" class="task-row" [class.current]="selected()?.id === task.id" (click)="selectTask(task)">
+        <strong>{{ task.cameraName }}</strong><span>{{ task.createdAt | date:'MM-dd HH:mm:ss' }} · {{ statuses[task.status] }}</span>
+        <progress [value]="task.completedCount" [max]="task.sampleCount" [attr.aria-label]="'已采样 ' + task.completedCount + ' / ' + task.sampleCount"></progress>
+        <small>已采样 {{ task.completedCount }} / {{ task.sampleCount }} · 现存 {{ task.snapshotCount }} 张</small>
+      </button>
+    } @empty { <p class="task-empty">{{ loading() ? '正在读取任务…' : '暂无截图任务' }}</p> }
+    @if (nextTaskOffset() !== null) { <button type="button" class="load-more" [disabled]="loading()" (click)="loadMoreTasks()">更多任务</button> }
+  </section>
+  <section class="task-detail" aria-label="任务详情与截图">
+    @if (selected(); as task) {
+      <div class="detail-heading"><div><h2>{{ task.cameraName }}</h2><p>{{ statuses[task.status] }} · 已采样 {{ task.completedCount }} / {{ task.sampleCount }} · {{ task.completedCount / task.sampleCount * 100 | number:'1.0-1' }}%</p></div>
+        <div class="task-actions">
+          <button type="button" [disabled]="acting() || generatingPanorama() || !task.snapshotCount || task.status === 'running' || task.status === 'pausing'" (click)="createRecognition()">创建识别任务</button>
+          @if (task.status === 'running') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('pause')">暂停</button> }
+          @if (task.status === 'paused' || task.status === 'failed' || task.status === 'interrupted') {
+            <button type="button" [disabled]="acting() || generatingPanorama() || task.completedCount >= task.sampleCount" (click)="act('start')">{{ task.completedCount ? '继续' : '开始' }}</button>
+          }
+          @if (task.status === 'running' || task.status === 'pausing' || task.status === 'paused') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('cancel')">取消任务</button> }
+        </div>
+      </div>
+      <dl class="task-parameters"><div><dt>P 范围</dt><dd>{{ task.panMin }}° ～ {{ task.panMax }}°</dd></div><div><dt>基础 T / Z</dt><dd>{{ task.basePtz?.tilt }}° / {{ task.basePtz?.zoom }}</dd></div><div><dt>水平视场角 / 步长</dt><dd>{{ task.horizontalFieldAngle | number:'1.2-3' }}° / {{ task.panStep | number:'1.2-3' }}°</dd></div><div><dt>开始时间</dt><dd>{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</dd></div></dl>
+      @if (task.error) { <p class="task-error" role="alert">{{ task.error }}</p> }
+      <div class="snapshot-heading"><h3>任务截图（{{ task.snapshotCount }} 张）</h3><button type="button"
+        [disabled]="acting() || generatingPanorama() || task.snapshotCount < 2 || task.status === 'running' || task.status === 'pausing'"
+        [title]="task.status === 'running' || task.status === 'pausing' ? '请先暂停或等待任务完成' : '将本任务全部截图拼接为一张全景图'"
+        (click)="generatePanorama()">{{ generatingPanorama() ? '正在生成…' : '生成全景图' }}</button></div>
+      @if (generatingPanorama()) { <div class="panorama-progress" role="status"><span>{{ panoramaProgress() }}</span><button type="button" (click)="clearPanorama()">取消生成</button></div> }
+      @if (panoramaError()) { <p class="task-error" role="alert">{{ panoramaError() }}</p> }
+      @if (panorama(); as image) {
+        <figure class="panorama-preview"><figcaption><span>全景图 · {{ image.count }} 张 · {{ image.width }} × {{ image.height }}</span><div><a [href]="image.url" [download]="'全景_' + task.id + '.png'">下载 PNG</a><button type="button" (click)="clearPanorama()">收起</button></div></figcaption>
+          <div class="panorama-viewport" tabindex="0" role="region" aria-label="全景图片，可横向滚动查看"><img [src]="image.url" alt="当前任务截图拼接的全景图"></div>
+        </figure>
+      }
+      <div class="task-snapshots">
+        @for (snapshot of snapshots(); track snapshot.id) {
+          <app-snapshot-item [snapshot]="snapshot" [disabled]="acting()" [deleteDisabled]="generatingPanorama() || task.status === 'running' || task.status === 'pausing'" (opened)="opened.emit($event)" (removed)="deleteSnapshot($event)" />
+        } @empty { <p class="task-empty">暂无已保存截图</p> }
+      </div>
+      @if (nextSnapshotOffset() !== null) { <button type="button" class="load-more" [disabled]="loading()" (click)="loadMoreSnapshots()">更多截图</button> }
+    } @else { <p class="task-empty">选择任务查看进度和关联截图</p> }
+  </section>
+</div>

@@ -1,6 +1,6 @@
 # 海天线保持自动截图实现规格
 
-Status: in-progress
+Status: completed
 Integration branch: feat-horizon-aware-scan
 Base: ee332e4
 

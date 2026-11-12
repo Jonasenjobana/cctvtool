@@ -247,12 +247,13 @@ export class CameraStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
-  addRecognitionTask(task, items) {
+  addRecognitionTask(task, items, associateSource = false) {
     this.transaction(() => {
       this.db.prepare('INSERT INTO recognition_tasks VALUES (?, ?, ?, ?)')
         .run(task.id, task.cameraId, task.createdAt, JSON.stringify(task));
       const insert = this.db.prepare('INSERT INTO recognition_items VALUES (?, ?, ?, ?)');
       items.forEach((item, index) => insert.run(task.id, item.snapshotId, index, JSON.stringify(item)));
+      if (associateSource) this.updateSnapshotGroup(task.sourceTaskId, { recognitionTaskId: task.id, recognitionError: null });
     });
   }
 

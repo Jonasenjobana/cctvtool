@@ -13,7 +13,7 @@ import { SnapshotItemComponent } from './snapshot-item.component';
 import { SnapshotTasksComponent } from './snapshot-tasks.component';
 import { RecognitionTasksComponent } from './recognition-tasks.component';
 import { HoldPtzControl } from './hold-ptz-control';
-import { emptyCamera, snapshotTaskStatus } from './models';
+import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
 import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, Snapshot, SnapshotGroup } from './models';
 
 const editableKeys = ['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
@@ -45,9 +45,15 @@ export class AppComponent implements OnDestroy {
   readonly deletingSnapshot = signal(false);
   readonly page = signal<'scene' | 'tasks' | 'recognition'>('scene');
   readonly recognitionTaskId = signal('');
+  readonly snapshotTaskId = signal('');
   readonly taskStatuses = snapshotTaskStatus;
+  readonly taskName = snapshotTaskName;
+  readonly scanMode = signal<'fixed' | 'horizon'>('fixed');
   readonly scanPanMin = signal<number | null>(0);
   readonly scanPanMax = signal<number | null>(150);
+  readonly preScanZoom = signal<number | null>(1);
+  readonly scanTiltMin = signal<number | null>(0);
+  readonly scanTiltMax = signal<number | null>(360);
   readonly currentScan = computed(() => this.snapshotGroups().find((group) => group.kind === 'scan' && ['running', 'pausing'].includes(group.status))
     || this.snapshotGroups().find((group) => group.kind === 'scan') || null);
   readonly scanning = computed(() => ['running', 'pausing'].includes(this.currentScan()?.status || ''));
@@ -132,7 +138,13 @@ export class AppComponent implements OnDestroy {
   });
   readonly canCapture = computed(() => Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning() && this.formValid()));
   readonly canScan = computed(() => this.canCapture() && this.inRange(this.scanPanMin(), 0, 360)
-    && this.inRange(this.scanPanMax(), 0, 360) && this.scanPanMax()! > this.scanPanMin()!);
+    && this.inRange(this.scanPanMax(), 0, 360) && this.scanPanMax()! > this.scanPanMin()!
+    && (this.scanMode() === 'fixed' || (!this.stale() && !!this.reading()
+      && this.scanPanMax()! - this.scanPanMin()! >= 30
+      && this.inRange(this.preScanZoom(), 1, Number.MAX_VALUE) && this.preScanZoom()! < this.reading()!.raw.Zoom
+      && this.inRange(this.scanTiltMin(), 0, 360) && this.inRange(this.scanTiltMax(), 0, 360)
+      && this.scanTiltMin()! < this.scanTiltMax()!
+      && this.inRange(this.reading()!.raw.Tilt, this.scanTiltMin()!, this.scanTiltMax()!))));
   private readonly pollingPaused = computed(() => this.operating() === 'snapshot');
   private readonly holdControl = new HoldPtzControl(
     (id, command, speed, keepalive) => this.api.control(id, command, speed, keepalive),
@@ -248,6 +260,15 @@ export class AppComponent implements OnDestroy {
   openRecognition(id: string) {
     this.recognitionTaskId.set(id);
     this.page.set('recognition');
+    this.panel.set(null);
+  }
+
+  openSnapshotTask(group: SnapshotGroup) {
+    this.snapshotTaskId.set(group.id);
+    if (this.selectedId() === group.cameraId) {
+      this.snapshotGroups.update((groups) => [group, ...groups.filter((item) => item.id !== group.id)]);
+    }
+    this.page.set('tasks');
     this.panel.set(null);
   }
 
@@ -453,15 +474,24 @@ export class AppComponent implements OnDestroy {
     const calibration = this.calibration();
     const panMin = this.scanPanMin()!;
     const panMax = this.scanPanMax()!;
+    const horizon = this.scanMode() === 'horizon'
+      ? { preScanZoom: this.preScanZoom()!, tiltMin: this.scanTiltMin()!, tiltMax: this.scanTiltMax()! } : undefined;
     this.operating.set('scan');
     this.operationError.set('');
     this.operationMessage.set('');
     try {
       const reading = await firstValueFrom(this.api.ptz(id));
       const { Pan: pan, Tilt: tilt, Zoom: zoom } = reading.raw;
-      const group = await this.api.startSnapshotScan(id, { pan, tilt, zoom }, panMin, panMax, calibration);
+      if (horizon && (horizon.preScanZoom >= zoom || tilt < horizon.tiltMin || tilt > horizon.tiltMax)) {
+        this.operationError.set('当前回读已变化：预扫倍率须低于当前倍率，且当前 T 须位于允许范围内');
+        return;
+      }
+      const group = await this.api.startSnapshotScan(id, { pan, tilt, zoom }, panMin, panMax, calibration, horizon);
       this.snapshotGroups.update((groups) => [group, ...groups]);
-      this.operationMessage.set(`自动截图已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${zoom}`);
+      this.snapshotTaskId.set(group.id);
+      this.operationMessage.set(horizon
+        ? `海天线预扫描已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${horizon.preScanZoom}，正式目标 Z ${zoom}`
+        : `自动截图已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${zoom}`);
     } catch (error) { this.operationError.set(errorMessage(error)); }
     finally { this.operating.set(null); }
   }
@@ -474,7 +504,7 @@ export class AppComponent implements OnDestroy {
     try {
       const updated = await this.api.taskAction(group.id, action);
       this.snapshotGroups.update((groups) => groups.map((item) => item.id === updated.id ? updated : item));
-      this.operationMessage.set(`自动截图${this.taskStatuses[updated.status]}${action === 'start' ? '，沿用本任务原来的 T/Z' : ''}`);
+      this.operationMessage.set(`${this.taskName(updated)}${this.taskStatuses[updated.status]}${action === 'start' ? '，沿用本任务原采样计划' : ''}`);
     } catch (error) { this.operationError.set(errorMessage(error)); }
     finally { this.operating.set(null); }
   }

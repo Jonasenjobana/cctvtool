@@ -10,7 +10,7 @@
     <div class="task-rows">
       @for (task of tasks(); track task.id) {
         <button type="button" class="task-row" [class.current]="selected()?.id === task.id"
-          [attr.aria-current]="selected()?.id === task.id ? 'true' : null" [disabled]="busy()" (click)="loadTask(task.id)">
+          [attr.aria-current]="selected()?.id === task.id ? 'true' : null" [disabled]="busy() || loading()" (click)="loadTask(task.id)">
           <strong>{{ task.cameraName }}</strong>
           <span class="task-date">{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</span>
           <span class="task-progress"><span class="status" [attr.data-status]="task.status">{{ statuses[task.status] }}</span><small>{{ task.completedCount }} / {{ task.sampleCount }} 张</small></span>
@@ -25,14 +25,17 @@
       <div class="toolbar">
         <div class="task-title"><h2>{{ task.cameraName }}</h2><p><span class="status" [attr.data-status]="task.status">{{ statuses[task.status] }}</span><span>{{ task.completedCount }} / {{ task.sampleCount }} 张</span></p></div>
         <div class="actions">
-          @if (running()) { <button type="button" [disabled]="busy()" (click)="cancel()">取消识别</button> }
+          @if (running()) { <button type="button" [disabled]="busy() || loading()" (click)="cancel()">取消识别</button> }
           @else {
-            <button type="button" [disabled]="busy() || dirty()" (click)="recreate()">创建新一轮识别</button>
-            <button type="button" class="primary" [disabled]="busy()" (click)="generate()">{{ busy() ? '处理中…' : '生成安装参数' }}</button>
+            <button type="button" [disabled]="busy() || loading() || dirty()" (click)="recreate()">创建新一轮识别</button>
+            <button type="button" class="primary" [disabled]="busy() || loading()" (click)="generate()">{{ busy() ? '处理中…' : '生成安装参数' }}</button>
           }
         </div>
       </div>
       @if (task.error) { <p class="error" role="alert">{{ task.error }}</p> }
+      @if (sourceGroup()?.horizon; as horizon) {
+        <p class="stage-info">{{ horizon.phase === 'coarse' ? '低倍率预扫描识别 · 粗标定' : '高倍率正式扫描识别' }} · 正式目标 Z {{ horizon.targetZoom }} · 允许原始 T {{ horizon.tiltMin }}° ～ {{ horizon.tiltMax }}°</p>
+      }
       <div class="workbench">
         <section class="review" aria-label="截图复核">
           <section class="editor" aria-label="海天线编辑">
@@ -60,7 +63,7 @@
                 </div>
               }
               <div class="legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span><span>拖动两端调整海天线</span></div>
-              <fieldset [disabled]="busy() || running() || entry.missing">
+              <fieldset [disabled]="busy() || loading() || running() || entry.missing">
                 <div class="annotation-actions">
                   <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
                   <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
@@ -87,7 +90,7 @@
             <div class="images">
               @for (entry of items(); track entry.snapshotId) {
                 <button type="button" class="image-row" [class.current]="selectedItemId() === entry.snapshotId" [class.ignored]="entry.ignored || entry.missing" [class.missing]="entry.missing"
-                  [attr.aria-current]="selectedItemId() === entry.snapshotId ? 'true' : null" [disabled]="busy()" (click)="openItem(entry)">
+                  [attr.aria-current]="selectedItemId() === entry.snapshotId ? 'true' : null" [disabled]="busy() || loading()" (click)="openItem(entry)">
                   <span class="thumbnail">
                     @if (!entry.missing) { <img [src]="entry.snapshot.imageUrl" loading="lazy" alt="待复核截图"> }
                     @else { <app-icon name="image" /> }
@@ -102,21 +105,26 @@
           </section>
         </section>
         <section class="result" aria-label="安装参数计算结果">
-          <div class="section-heading"><h2>安装参数</h2></div>
+          <div class="section-heading"><h2>{{ coarse() ? '粗标定参数' : '安装参数' }}</h2></div>
           @if (task.result; as result) {
             <p class="result-message" [class.error]="result.status !== 'estimated'">{{ result.message }}</p>
             <dl class="result-metrics">
               <div><dt>有效截图</dt><dd>{{ result.sourceSnapshotIds.length }}<small>张</small></dd></div>
               <div><dt>P 覆盖</dt><dd>{{ result.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
-              @if (result.diagnostics; as quality) { <div class="residual"><dt>均方根误差</dt><dd>{{ quality.rmsResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div> }
+              @if (result.diagnostics; as quality) {
+                <div class="residual"><dt>均方根误差</dt><dd>{{ quality.rmsResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div>
+                @if (quality.rmsAngularResidualDegrees !== undefined) { <div class="residual"><dt>角度均方根残差</dt><dd>{{ quality.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div> }
+              }
             </dl>
             @if (result.installation; as installation) {
               <table><thead><tr><th scope="col">参数</th><th scope="col">计算前</th><th scope="col">生成值</th></tr></thead><tbody>
                 @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ task.fitCamera?.[field.key] | number:'1.4-4' }}°</td><td>{{ installation[field.key] | number:'1.4-4' }}°</td></tr> }
               </tbody></table>
             }
-            <button type="button" class="primary apply-button" [disabled]="busy() || dirty() || result.status !== 'estimated' || task.appliedRevision === task.revision"
-              (click)="apply()"><app-icon [name]="task.appliedRevision === task.revision ? 'check' : 'save'" />{{ task.appliedRevision === task.revision ? '已应用' : '应用到摄像头' }}</button>
+            @if (!coarse()) {
+              <button type="button" class="primary apply-button" [disabled]="busy() || loading() || dirty() || running() || !sourceGroup() || result.status !== 'estimated' || task.appliedRevision === task.revision"
+                (click)="apply()"><app-icon [name]="task.appliedRevision === task.revision ? 'check' : 'save'" />{{ task.appliedRevision === task.revision ? '已应用' : '应用到摄像头' }}</button>
+            }
             @for (warning of result.warnings || []; track $index) { <p class="note">{{ warning }}</p> }
             @if (result.excluded.length) {
               <details><summary>排除 {{ result.excluded.length }} 张截图</summary><ul>@for (excluded of result.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }</ul></details>
@@ -124,6 +132,18 @@
           } @else {
             <div class="result-empty"><app-icon name="target" /><p>{{ running() ? '识别完成后可生成安装参数' : '复核标注、忽略异常图片后，点击“生成安装参数”。' }}</p></div>
           }
+          @if (coarse()) {
+            <section class="horizon-scan" aria-label="复核后开始正式扫描">
+              <h3>高倍率正式扫描</h3>
+              <p class="note">粗标定仅用于预测各方向 T，不写入摄像头配置。请逐张复核海天线，忽略缺线或遮挡图；必要时重新预扫。</p>
+              <label class="review-confirmation"><input type="checkbox" [disabled]="!horizonReady()" [ngModel]="horizonReviewed()" (ngModelChange)="confirmHorizonReview($event)">我已复核当前结果使用的全部海天线标注</label>
+              <button type="button" class="primary apply-button" [disabled]="!horizonReady() || !horizonReviewed()" (click)="startHorizonScan()">开始高倍率扫描</button>
+              @if (dirty()) { <p class="note">请先保存标注并重新生成粗标定参数，再确认复核。</p> }
+              @if (sourceGroup()?.status !== 'completed') { <p class="note">预扫描完成后才能开始正式扫描。</p> }
+              <p class="note">使用预扫保存的目标倍率和 P 范围；启动时校验设备冲突及预测余量，创建后转到截图任务查看进度。</p>
+            </section>
+          }
+          @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，仍需逐图复核。</p> }
           <p class="note">修改标注后需重新生成安装参数。</p>
         </section>
       </div>

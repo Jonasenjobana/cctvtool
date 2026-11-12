@@ -18,7 +18,9 @@ Status: open
 
 ## Decisions so far
 
-尚未关闭决策票；已确认的使用约束见 Notes。
+- [低倍率预扫如何取得可靠的粗标定](issues/01-coarse-calibration.md)：显式低倍率、多方向采样，人工复核后使用临时粗结果。
+- [怎样计算并验证随 P 变化的高倍率 T](issues/02-tilt-prediction.md)：按椭球切线反求同一俯仰分支，结合实际视场与角度余量拒绝不可行计划。
+- [正式扫描怎样衔接最终拟合与中断恢复](issues/03-scan-and-fit-workflow.md)：关联两阶段任务、冻结控制依据，自动识别候选并由人工应用最终参数。
 
 ## Not yet specified
 

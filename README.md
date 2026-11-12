@@ -65,6 +65,7 @@ npm test
 | [server/playback.mjs](server/playback.mjs) | 所选设备的 WS-FLV 地址拼接 | 修改 CMS、sms_id 或摄像头切流时 |
 | [server/store.mjs](server/store.mjs) | SQLite 表结构与数据读写 | 修改持久化字段时 |
 | [自动截图](server/snapshot-scan.mjs)、[扫描回归](tests/snapshot-scan.test.mjs) | 扇区等分、精确定位、稳定回读、分组、暂停／继续及删除一致性 | 修改自动采样时 |
+| [海天线控制](server/horizon-control.mjs)、[几何回归](tests/horizon-control.test.mjs)、[两阶段流程回归](tests/horizon-scan.test.mjs) | 椭球切线 T 反求、低倍预扫、复核门禁及正式扫描余量与恢复 | 修改海天线自动采样或 T 补偿后 |
 | [MCP HTTP 入口](server/mcp-http.mjs)、[HTTP 服务](server/mcp-http-app.mjs)、[工具定义](server/calibration-mcp.mjs) | 局域网 Streamable HTTP、访问认证及四个只读标定工具 | 接入或修改 MCP 时 |
 | [倾斜拟合](server/tilt-calibration.mjs) | 海天线与 PTZ 的数值拟合、质量门槛及结果 | 修改标定计算时 |
 | [MCP 使用说明](docs/MCP使用说明.md)、[配置示例](mcp.config.example.json) | 局域网启动、客户端连接、AI 调用流程与排错 | 连接具备视觉能力的 AI 客户端时 |

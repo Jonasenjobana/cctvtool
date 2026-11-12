@@ -91,6 +91,26 @@ export interface SnapshotGroup {
   panMax?: number;
   horizontalFieldAngle?: number;
   panStep?: number;
+  horizon?: {
+    phase: 'coarse' | 'fine';
+    targetZoom: number;
+    tiltMin: number;
+    tiltMax: number;
+    targetHorizontalFov: number;
+    targetVerticalFov: number;
+    sourceRecognitionTaskId?: string;
+    sourceRevision?: number;
+    sourceResultId?: string;
+  };
+  recognitionTaskId?: string | null;
+  recognitionError?: string | null;
+}
+
+export interface HorizonScanOptions { preScanZoom: number; tiltMin: number; tiltMax: number }
+
+export function snapshotTaskName(group: SnapshotGroup): string {
+  return group.horizon ? group.horizon.phase === 'coarse' ? '海天线预扫描' : '高倍率正式扫描'
+    : group.kind === 'scan' ? '自动截图' : '单张截图';
 }
 
 export interface SnapshotGroupPage {
@@ -138,7 +158,7 @@ export interface InstallationEstimate {
   sourceSnapshotIds: string[];
   excluded: { snapshotId: string; reason: string }[];
   panCoverageDegrees: number;
-  diagnostics?: { rmsResidualPixels: number; converged: boolean; conditionNumber: number | null;
+  diagnostics?: { rmsResidualPixels: number; rmsAngularResidualDegrees?: number; converged: boolean; conditionNumber: number | null;
     perSnapshot: { snapshotId: string; rmsResidualPixels: number }[] };
   message: string;
   warnings?: string[];

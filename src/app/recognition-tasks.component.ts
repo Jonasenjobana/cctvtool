@@ -4,7 +4,7 @@ import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
-import type { Camera, HorizonPoint, RecognitionItem, RecognitionTask } from './models';
+import type { Camera, HorizonPoint, RecognitionItem, RecognitionTask, SnapshotGroup } from './models';
 
 @Component({
   selector: 'app-recognition-tasks', standalone: true,
@@ -14,9 +14,11 @@ import type { Camera, HorizonPoint, RecognitionItem, RecognitionTask } from './m
 export class RecognitionTasksComponent implements OnInit, OnDestroy {
   @Input() taskId = '';
   @Output() readonly applied = new EventEmitter<Camera>();
+  @Output() readonly scanCreated = new EventEmitter<SnapshotGroup>();
   private readonly api = inject(ApiService);
   readonly tasks = signal<RecognitionTask[]>([]);
   readonly selected = signal<RecognitionTask | null>(null);
+  readonly sourceGroup = signal<SnapshotGroup | null>(null);
   readonly items = signal<RecognitionItem[]>([]);
   readonly selectedItemId = signal('');
   readonly item = computed(() => this.items().find((item) => item.snapshotId === this.selectedItemId()) || null);
@@ -30,6 +32,16 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly nextTaskOffset = signal<number | null>(null);
   readonly nextItemOffset = signal<number | null>(null);
   readonly running = computed(() => ['queued', 'running'].includes(this.selected()?.status || ''));
+  readonly coarse = computed(() => this.sourceGroup()?.horizon?.phase === 'coarse');
+  readonly horizonReady = computed(() => this.coarse() && this.sourceGroup()?.status === 'completed'
+    && !this.running() && !this.busy() && !this.loading() && !this.dirty()
+    && this.selected()?.result?.status === 'estimated' && !!this.selected()?.resultId);
+  private readonly reviewConfirmation = signal<{ taskId: string; revision: number; resultId: string } | null>(null);
+  readonly horizonReviewed = computed(() => {
+    const task = this.selected(), confirmation = this.reviewConfirmation();
+    return !!task && !!confirmation && confirmation.taskId === task.id
+      && confirmation.revision === task.revision && confirmation.resultId === task.resultId;
+  });
   readonly fields = [
     { key: 'pAxisPitch', label: 'P 轴前后倾' }, { key: 'pAxisRoll', label: 'P 轴左右倾' },
     { key: 'tiltOffset', label: 'T 偏移' }, { key: 'imageRoll', label: '画面 Roll 修正' },
@@ -65,6 +77,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   async loadTask(id: string, save = true) {
     if (this.busy() || (save && !await this.save())) return;
     const revision = ++this.revision;
+    this.loading.set(true);
     this.problem.set('');
     try {
       const page = await this.api.recognitionItems(id);
@@ -73,10 +86,18 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.items.set(page.items);
       this.nextItemOffset.set(page.nextOffset);
       this.selectItem(page.items.find((item) => item.snapshotId === this.selectedItemId()) || page.items[0]);
+      const sourceGroup = await this.api.snapshotGroup(page.task.sourceTaskId);
+      if (!this.destroyed && revision === this.revision) this.sourceGroup.set(sourceGroup);
     } catch (error) { if (!this.destroyed && revision === this.revision) this.problem.set(errorMessage(error)); }
+    finally { if (revision === this.revision) this.loading.set(false); }
   }
 
   private setTask(task: RecognitionTask) {
+    const previous = this.selected();
+    if (previous?.id !== task.id || previous.revision !== task.revision || previous.resultId !== task.resultId) {
+      this.reviewConfirmation.set(null);
+    }
+    if (previous?.sourceTaskId !== task.sourceTaskId) this.sourceGroup.set(null);
     this.selected.set(task);
     this.tasks.update((tasks) => tasks.some((item) => item.id === task.id)
       ? tasks.map((item) => item.id === task.id ? task : item) : [task, ...tasks]);
@@ -90,7 +111,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.dragIndex = null;
   }
 
-  async openItem(item: RecognitionItem) { if (!this.busy() && await this.save()) this.selectItem(item); }
+  async openItem(item: RecognitionItem) { if (!this.busy() && !this.loading() && await this.save()) this.selectItem(item); }
   undo() { const item = this.item(); if (item) this.selectItem(item); }
 
   async loadMore(kind: 'tasks' | 'items') {
@@ -122,15 +143,17 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (value === null || !Number.isFinite(value) || value < 0 || value > 1) return;
     this.points.update((points) => points.map((point, i) => i === index ? { ...point, [axis]: value } : point));
     this.dirty.set(true);
+    this.reviewConfirmation.set(null);
     this.message.set('');
   }
-  setIgnored(value: boolean) { this.ignored.set(value); this.dirty.set(true); this.message.set(''); }
+  setIgnored(value: boolean) { this.ignored.set(value); this.dirty.set(true); this.reviewConfirmation.set(null); this.message.set(''); }
   resetLine() {
     this.points.set([{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }]);
     this.dirty.set(true);
+    this.reviewConfirmation.set(null);
   }
   startDrag(event: PointerEvent) {
-    if (this.running() || this.busy() || this.item()?.missing || this.points().length !== 2 || event.button !== 0) return;
+    if (this.running() || this.busy() || this.loading() || this.item()?.missing || this.points().length !== 2 || event.button !== 0) return;
     event.preventDefault();
     const svg = event.currentTarget as SVGSVGElement;
     const rect = svg.getBoundingClientRect();
@@ -169,10 +192,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
 
   async generate() {
-    if (this.busy() || this.running() || !await this.save()) return;
+    if (this.busy() || this.loading() || this.running() || !await this.save()) return;
     const task = this.selected();
     if (!task) return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
+    this.reviewConfirmation.set(null);
     try {
       const result = await this.api.generateInstallation(task.id, task.revision);
       if (!this.destroyed) this.setTask(result);
@@ -181,7 +205,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   async apply() {
     const task = this.selected();
-    if (!task || !task.resultId || this.busy() || this.dirty() || task.result?.status !== 'estimated') return;
+    if (!task || !task.resultId || this.busy() || this.loading() || this.dirty() || this.running()
+      || !this.sourceGroup() || this.coarse() || task.result?.status !== 'estimated') return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
     try {
       const result = await this.api.applyInstallation(task.id, task.revision, task.resultId);
@@ -192,9 +217,27 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
   }
+  confirmHorizonReview(reviewed: boolean) {
+    const task = this.selected();
+    this.reviewConfirmation.set(reviewed && this.horizonReady() && task?.resultId
+      ? { taskId: task.id, revision: task.revision, resultId: task.resultId } : null);
+  }
+  async startHorizonScan() {
+    if (this.busy() || this.loading() || this.running() || !await this.save()) return;
+    const task = this.selected();
+    if (!task?.resultId || !this.horizonReady() || !this.horizonReviewed()) return;
+    this.busy.set(true); this.problem.set(''); this.message.set('');
+    try {
+      const group = await this.api.startHorizonScan(task.id, task.revision, task.resultId);
+      if (this.destroyed) return;
+      this.reviewConfirmation.set(null);
+      this.scanCreated.emit(group);
+    } catch (error) { this.reviewConfirmation.set(null); this.problem.set(errorMessage(error)); }
+    finally { this.busy.set(false); }
+  }
   async cancel() {
     const task = this.selected();
-    if (!task || this.busy()) return;
+    if (!task || this.busy() || this.loading()) return;
     this.busy.set(true);
     try { this.setTask(await this.api.cancelRecognition(task.id)); }
     catch (error) { this.problem.set(errorMessage(error)); }
@@ -202,7 +245,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   async recreate() {
     const task = this.selected();
-    if (!task || this.busy() || !await this.save()) return;
+    if (!task || this.busy() || this.loading() || !await this.save()) return;
     this.busy.set(true); this.problem.set('');
     try {
       const created = await this.api.createRecognition(task.sourceTaskId);

@@ -16,7 +16,7 @@ Base: ee332e4
 ## 几何控制
 
 - 新增服务端公开模块 `server/horizon-control.mjs`，共用 `shared/camera-rotation.ts` 与 WGS84 零高程椭球。
-- `solveHorizonTilt(calibration, { pan, referenceTilt, tiltMin, tiltMax })` 返回指定原始 P 下、允许原始 T 区间内使中心射线与椭球相切的 T。选择最接近参考 T 的解；没有解时明确拒绝，不把越界解硬截到边界，不擅自把负值包装为 360°。
+- `solveHorizonTilt(calibration, { pan, referenceTilt, tiltMin, tiltMax })` 返回指定原始 P 下、允许原始 T 区间内使中心射线与椭球相切的 T。保持与参考 T 相同的俯仰分支，拒绝翻转约 180°后朝向反面的解，再选择最接近参考 T 的可达解；没有解时明确拒绝，不把越界解硬截到边界，不擅自把负值包装为 360°。
 - `horizonOffsetDegrees(calibration, rawPtz)` 返回中心射线相对理论海天线的有符号角度差。使用与拟合一致的椭球缩放空间切线条件，并验证前向可见的海天线分支。
 - 扫描目标以中心海天线居中为准，不要求消除画面 Roll 或让整条线水平。先验证全部计划目标存在可达 T，再开始正式扫描。
 - 将粗拟合的角度残差作为预测余量的依据之一；不能直接把低倍率的 5 像素阈值当作高倍率的精度保证。保守使用 `max(0.02°, 3 × 粗拟合角度 RMS)` 作为残差余量，并要求 `abs(中心角度差) + 余量 + 到位容差 < 0.35 × 实际 VFOV`。这只是模型余量检查，不是经标定的概率置信度。

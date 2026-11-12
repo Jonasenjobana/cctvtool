@@ -176,7 +176,7 @@
                 @if (task.recognitionError) { <p class="inline-error" role="alert">自动创建识别任务失败：{{ task.recognitionError }}。可在截图任务页手动创建。</p> }
                 @if (task.recognitionTaskId; as recognitionId) { <button type="button" (click)="openRecognition(recognitionId)">打开关联识别任务</button> }
                 @if (task.status === 'running') { <button type="button" [disabled]="!!operating()" (click)="scanAction('pause')">暂停</button> }
-                @if (task.status === 'paused' || task.status === 'interrupted' || task.status === 'failed') { <button type="button" [disabled]="!!operating() || scanning() || task.completedCount >= task.sampleCount" (click)="scanAction('start')">继续本次截图</button> }
+                @if (task.status === 'paused' || task.status === 'interrupted' || task.status === 'failed') { <button type="button" [disabled]="!!operating() || scanning()" (click)="scanAction('start')">{{ task.completedCount >= task.sampleCount ? '确认停止并完成' : '继续本次截图' }}</button> }
               </div>
             }
           </section>

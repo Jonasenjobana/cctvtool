@@ -394,8 +394,7 @@ export async function createApp({
   });
   app.post('/api/snapshot-tasks/:id/start', async (request, reply) => {
     const group = store.getSnapshotGroup(request.params.id);
-    if (group.kind !== 'scan' || !['paused', 'failed', 'interrupted'].includes(group.status)
-      || group.completedCount >= group.sampleCount) throw httpError(409, '该任务不能继续执行');
+    if (group.kind !== 'scan' || !['paused', 'failed', 'interrupted'].includes(group.status)) throw httpError(409, '该任务不能继续执行');
     if (isBusy(group.cameraId)) throw httpError(409, '该摄像头正在控制或截图，请先停止后重试');
     const camera = store.getCamera(group.cameraId);
     if (camera.serial !== group.serial || camera.code !== group.code) throw httpError(409, '摄像头通道已变更，不能继续原任务');

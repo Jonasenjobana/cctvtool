@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { Worker } from 'node:worker_threads';
 import { createApp } from '../server/app.mjs';
 import { httpError } from '../server/errors.mjs';
 import { syntheticSnapshots } from './calibration-fixtures.mjs';
@@ -16,7 +18,7 @@ const cameraInput = { name: '海天线扫描', serial: 'horizon-device', code: '
 async function fixture(t) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-horizon-scan-test-'));
   const state = { raw: { Pan: 60, Tilt: 8, Zoom: 12, HorizontalFieldAngle: 30, VerticalFieldAngle: 20 },
-    targets: [], stops: 0, onRead: null, onMove: null, onStop: null, checkError: null, runError: null, ignored: false };
+    targets: [], captures: 0, stops: 0, onRead: null, onMove: null, onStop: null, checkError: null, runError: null, ignored: false };
   let f;
   const livegbs = {
     configured: true,
@@ -37,6 +39,7 @@ async function fixture(t) {
       await state.onStop?.();
     },
     async snapshot() {
+      state.captures++;
       const now = new Date().toISOString();
       return { bytes: png, requestedAt: now, receivedAt: now, durationMs: 1, snapshotTime: null };
     },
@@ -408,6 +411,118 @@ test('正式扫描停止失败持续占用设备，手动 stop 成功后才可�
   assert.equal(completed.status, 'completed', completed.error);
   assert.equal(completed.snapshotCount, 5);
   assert.deepEqual(completed.targets, accepted.targets);
+});
+
+test('预扫拍满后停止失败，手动停止成功可只重试完成收尾并继续正式扫描', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = await fixture(t);
+  f.state.onStop = () => { throw httpError(502, '模拟停止失败'); };
+  const response = await startCoarse(f);
+  assert.equal(response.statusCode, 202, response.body);
+  const failed = await waitGroup(f, response.json().id);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.completedCount, failed.sampleCount);
+  assert.equal(failed.snapshotCount, failed.sampleCount);
+  assert.match(failed.error, /停止云台失败/);
+  assert.equal(failed.recognitionTaskId, undefined);
+  const { snapshots } = (await f.app.inject(`/api/snapshot-groups/${failed.id}/snapshots`)).json();
+  const moves = f.state.targets.length, captures = f.state.captures;
+  const resume = () => f.app.inject({ method: 'POST', url: `/api/snapshot-tasks/${failed.id}/start` });
+  assert.equal((await resume()).statusCode, 409, '停止失败仍占用设备');
+  f.state.onStop = null;
+  const stopped = await f.app.inject({ method: 'POST', url: `/api/cameras/${f.camera.id}/control`, payload: { command: 'stop' } });
+  assert.equal(stopped.statusCode, 200, stopped.body);
+  const resumed = await resume();
+  assert.equal(resumed.statusCode, 202, resumed.body);
+  const completed = await waitGroup(f, failed.id);
+  assert.equal(completed.status, 'completed', completed.error);
+  assert.equal(completed.error, null);
+  assert.equal(completed.completedCount, completed.sampleCount);
+  assert.equal(f.state.targets.length, moves, '收尾不重复精确定位');
+  assert.equal(f.state.captures, captures, '收尾不补拍');
+  assert.equal(f.state.stops, 3, '原收尾、手动停止及恢复收尾各执行一次停止');
+  assert.deepEqual((await f.app.inject(`/api/snapshot-groups/${failed.id}/snapshots`)).json().snapshots, snapshots);
+  const task = await waitRecognition(f, completed.recognitionTaskId);
+  assert.equal(task.result?.status, 'estimated', JSON.stringify(task.result));
+  assert.equal((await resume()).statusCode, 409, '已完成任务不能重复收尾');
+  const fine = await startFine(f, task);
+  assert.equal(fine.statusCode, 202, fine.body);
+  assert.equal((await waitGroup(f, fine.json().id)).status, 'completed');
+});
+
+test('预扫拍满后异常重启保留中断状态，手动收尾不再定位或补拍并可正式扫描', async (t) => {
+  const f = await fixture(t);
+  await f.app.close();
+  // 隔离执行并在最终 stop 挂起时终止线程，保留真实持久化进度，不改写任务状态。
+  const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(`
+    import { parentPort, workerData } from 'node:worker_threads';
+    import { createApp } from ${JSON.stringify(new URL('../server/app.mjs', import.meta.url).href)};
+    parentPort.on('message', () => {});
+    let raw = workerData.raw, groupId, statusCode, captures = 0;
+    const targets = [];
+    const app = await createApp({ dataDir: workerData.dataDir, webDir: workerData.webDir,
+      recognizer: { check() {}, async run() {} }, livegbs: {
+        configured: true,
+        async readPtz() {
+          const now = new Date().toISOString();
+          return { raw: { ...raw }, requestedAt: now, receivedAt: now, durationMs: 1 };
+        },
+        async preciseControl(_camera, target) {
+          targets.push(target);
+          raw = { ...raw, Pan: target.pan, Tilt: target.tilt, Zoom: target.zoom,
+            HorizontalFieldAngle: 80, VerticalFieldAngle: 45 };
+        },
+        async snapshot() {
+          captures++;
+          const now = new Date().toISOString();
+          return { bytes: Buffer.from(workerData.png), requestedAt: now, receivedAt: now, durationMs: 1, snapshotTime: null };
+        },
+        async continuousControl() {
+          const group = (await app.inject('/api/snapshot-groups/' + groupId)).json();
+          parentPort.postMessage({ group, statusCode, raw, targets, captures });
+          await new Promise(() => {});
+        },
+      } });
+    const response = await app.inject({ method: 'POST', url: '/api/cameras/' + workerData.cameraId + '/snapshot-scans',
+      payload: { basePtz: { pan: raw.Pan, tilt: raw.Tilt, zoom: raw.Zoom }, panMin: 0, panMax: 150,
+        settleMs: 0, moveTimeoutMs: 1000, horizon: { preScanZoom: 2, tiltMin: 0, tiltMax: 30 } } });
+    groupId = response.json().id;
+    statusCode = response.statusCode;
+    if (statusCode !== 202) parentPort.postMessage({ statusCode, error: response.body });
+  `)}`), { workerData: { dataDir: f.dataDir, webDir: f.options.webDir, cameraId: f.camera.id, raw: f.state.raw, png } });
+  let crashed;
+  try { [crashed] = await once(worker, 'message', { signal: AbortSignal.timeout(15000) }); }
+  finally { await worker.terminate(); }
+  assert.equal(crashed.statusCode, 202, crashed.error);
+  assert.equal(crashed.group.status, 'running');
+  assert.equal(crashed.group.completedCount, crashed.group.sampleCount);
+  assert.equal(crashed.group.snapshotCount, crashed.group.sampleCount);
+  assert.equal(crashed.captures, crashed.group.sampleCount);
+  assert.equal(crashed.targets.length, crashed.group.sampleCount);
+  f.state.raw = crashed.raw;
+  f.app = await createApp(f.options);
+  const interrupted = (await f.app.inject(`/api/snapshot-groups/${crashed.group.id}`)).json();
+  assert.equal(interrupted.status, 'interrupted');
+  assert.equal(interrupted.recognitionTaskId, undefined);
+  const { snapshots } = (await f.app.inject(`/api/snapshot-groups/${interrupted.id}/snapshots`)).json();
+  assert.equal(f.state.targets.length, 0, '重启不自动定位');
+  assert.equal(f.state.captures, 0, '重启不自动抓图');
+  assert.equal(f.state.stops, 0, '重启不自动驱动设备');
+  const resumed = await f.app.inject({ method: 'POST', url: `/api/snapshot-tasks/${interrupted.id}/start` });
+  assert.equal(resumed.statusCode, 202, resumed.body);
+  const completed = await waitGroup(f, interrupted.id);
+  assert.equal(completed.status, 'completed', completed.error);
+  assert.equal(completed.error, null);
+  assert.equal(completed.completedCount, completed.sampleCount);
+  assert.equal(f.state.targets.length, 0, '收尾不重复精确定位');
+  assert.equal(f.state.captures, 0, '收尾不补拍');
+  assert.equal(f.state.stops, 1, '手动恢复只重新确认停止');
+  assert.deepEqual((await f.app.inject(`/api/snapshot-groups/${interrupted.id}/snapshots`)).json().snapshots, snapshots);
+  const task = await waitRecognition(f, completed.recognitionTaskId);
+  assert.equal(task.result?.status, 'estimated', JSON.stringify(task.result));
+  const fine = await startFine(f, task);
+  assert.equal(fine.statusCode, 202, fine.body);
+  assert.equal((await waitGroup(f, fine.json().id)).status, 'completed');
 });
 
 test('窄视场使用实际 T 容差，保存真实读数而不以控制目标覆盖，并拒绝超容差偏差', async (t) => {

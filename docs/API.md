@@ -30,7 +30,7 @@
 | `GET /api/snapshot-groups/:id/snapshots` | 读取组内截图分页 |
 | `GET /api/snapshot-tasks` | 自动截图任务分页，可用 `cameraId` 筛选设备 |
 | `POST /api/snapshot-tasks/:id/pause` | 暂停任务，等待在途请求及 stop 完成后返回任务状态 |
-| `POST /api/snapshot-tasks/:id/start` | 继续暂停／失败／中断的未完成任务，HTTP 202 返回任务组 |
+| `POST /api/snapshot-tasks/:id/start` | 继续暂停／失败／中断的任务；已拍满时仅重试停止与完成收尾，HTTP 202 返回任务组 |
 | `POST /api/snapshot-tasks/:id/cancel` | 取消执行中或暂停的任务，已保存图片保留 |
 | `POST /api/recognition-tasks` | `{ sourceTaskId }` 从暂停或结束的截图任务创建本地识别任务，返回 HTTP 202 |
 | `GET /api/recognition-tasks` | 识别任务分页，返回 `{ tasks, total, offset, nextOffset }` |
@@ -112,7 +112,7 @@ Content-Type: application/json
 
 每个位置依次执行“精确 PTZ → 回读到位并稳定 → 截图前回读 → 抓图 → 截图后回读 → 保存”。截图期间姿态变化则本张不保存并终止任务。样本增加 `groupId`、从 0 开始的 `scanIndex`、`scanTarget`；实际 `ptz/ptzAfter`、图片尺寸、时间、标定副本等仍遵循单张截图契约，时间对应保持 `unverified`。图片元数据与任务进度在同一数据库事务中更新，文件写入失败不提交记录。
 
-任务状态为 `running`（执行）、`pausing`（等待暂停）、`paused`（暂停）、`completed`（完成）、`failed`（失败）、`cancelled`（取消）或 `interrupted`（异常重启中断）。暂停接口等待在途请求结束并停止云台，再返回 `paused`；继续接口从 `completedCount` 对应的下一点开始，使用原任务采样计划、FOV 和标定副本，普通及预扫阶段固定原 T/Z，正式阶段沿用冻结的逐点 T。新建普通或预扫任务才重新采用当前基础姿态。完成后停在最后采样位置。终止或暂停均保留已存截图，停止失败时保留设备锁，需用 `/control` 的 `stop` 重试；该 stop 会取消执行中的自动任务。通道标识改变后不能继续原任务。正常关机会取消活动任务，异常重启不自动恢复转动；一个数据目录只运行一个业务后端。
+任务状态为 `running`（执行）、`pausing`（等待暂停）、`paused`（暂停）、`completed`（完成）、`failed`（失败）、`cancelled`（取消）或 `interrupted`（异常重启中断）。暂停接口等待在途请求结束并停止云台，再返回 `paused`；继续接口从 `completedCount` 对应的下一点开始，使用原任务采样计划、FOV 和标定副本，普通及预扫阶段固定原 T/Z，正式阶段沿用冻结的逐点 T。暂停／失败／中断的任务若已拍满，`start` 仅重新发送 stop 并保存 `completed`，不重复定位或抓图；海天线任务随后自动关联识别，正式阶段仍要求 `completed` 来源。新建普通或预扫任务才重新采用当前基础姿态。完成后停在最后采样位置。终止或暂停均保留已存截图，停止失败时保留设备锁，需用 `/control` 的 `stop` 重试成功后才可继续或收尾；该 stop 会取消执行中的自动任务。通道标识改变后不能继续原任务。正常关机会取消活动任务，异常重启不自动恢复转动；一个数据目录只运行一个业务后端。
 
 分组、任务及组内截图接口均支持 `limit`（1～100）和 `offset`（从 0 开始）。任务／分组列表默认每页 30 条，返回 `{ total, groups, offset, nextOffset }`；组内图片默认 50 张，返回 `{ group, total, snapshots, offset, nextOffset }`。分组按时间倒序，组内图片按时间正序。`kind: "single"` 以单张截图 ID 作为组 ID，兼容旧数据，原始元数据不改写。旧 `/api/cameras/:id/snapshots` 保持兼容的完整列表，页面采用分组分页接口。
 

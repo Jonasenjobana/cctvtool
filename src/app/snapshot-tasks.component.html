@@ -20,7 +20,7 @@
           <button type="button" [disabled]="acting() || generatingPanorama() || !task.snapshotCount || task.status === 'running' || task.status === 'pausing'" (click)="createRecognition()">创建识别任务</button>
           @if (task.status === 'running') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('pause')">暂停</button> }
           @if (task.status === 'paused' || task.status === 'failed' || task.status === 'interrupted') {
-            <button type="button" [disabled]="acting() || generatingPanorama() || task.completedCount >= task.sampleCount" (click)="act('start')">{{ task.completedCount ? '继续' : '开始' }}</button>
+            <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('start')">{{ task.completedCount >= task.sampleCount ? '确认停止并完成' : task.completedCount ? '继续' : '开始' }}</button>
           }
           @if (task.status === 'running' || task.status === 'pausing' || task.status === 'paused') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('cancel')">取消任务</button> }
         </div>

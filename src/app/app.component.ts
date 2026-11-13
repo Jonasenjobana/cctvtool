@@ -27,6 +27,7 @@ import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotL
 
 const editableKeys = ['name', 'serial', 'code', 'maxZoom', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
 type NumericField = 'maxZoom' | 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
+interface PreparedPreciseTarget { target: PreciseTarget; message: string; sent?: () => void }
 
 @Component({
   selector: 'app-root',
@@ -666,40 +667,23 @@ export class AppComponent implements OnDestroy {
 
   async sendPrecise(point?: TemporaryMapPoint) {
     if (point ? !this.canTrackPoint() : !this.canPrecise()) return;
-    const revision = ++this.preciseRevision;
     const id = this.selectedId();
     const navigationRevision = this.plotNavigationRevision;
-    this.operating.set('precise');
-    this.operationError.set('');
-    this.operationMessage.set('');
-    try {
+    await this.executePrecise(async current => {
       let target: PreciseTarget;
       if (point) {
         // 点击后重新回读 Z/FOV；停止、切页或目标修改、删除后不发送迟到的定位。
         const reading = await firstValueFrom(this.api.ptz(id));
-        if (revision !== this.preciseRevision || this.selectedId() !== id || this.page() !== 'scene'
-          || navigationRevision !== this.plotNavigationRevision
-          || !this.temporaryPoints().some((item) => item === point)) return;
-        this.reading.set(reading);
-        this.stale.set(false);
-        this.liveError.set('');
-        const camera = this.draft(), saved = this.selectedCamera();
-        if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) {
-          throw new Error('请检查安装参数，并先保存设备通道修改后再追踪');
-        }
+        if (!current()) return null;
+        this.acceptPreciseReading(reading);
         target = this.calculatePointTarget(point, reading.raw).target;
-        this.preciseTarget.set(target);
       } else {
         const { pan, tilt, zoom } = this.preciseTarget();
         target = { pan: pan!, tilt: tilt!, zoom: zoom! };
       }
-      const result = await this.api.precise(id, target);
-      if (revision !== this.preciseRevision || this.selectedId() !== id) return;
-      this.controlTarget.set(result.target);
-      this.operationMessage.set(point ? `点 ${point.id} 追踪指令已发送，位置以回读为准` : '精确定位指令已发送，位置以回读为准');
-    } catch (error) {
-      if (revision === this.preciseRevision && this.selectedId() === id) this.operationError.set(errorMessage(error));
-    } finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }
+      return { target, message: point ? `点 ${point.id} 追踪指令已发送，位置以回读为准` : '精确定位指令已发送，位置以回读为准' };
+    }, () => !point || (this.page() === 'scene' && navigationRevision === this.plotNavigationRevision
+      && this.temporaryPoints().some(item => item === point)));
   }
 
   selectAisTarget(mmsi: string) {
@@ -711,34 +695,51 @@ export class AppComponent implements OnDestroy {
 
   async trackAis(mmsi: string) {
     if (!this.canTrackPoint() || this.ais.status() !== 'connected') return;
-    const revision = ++this.preciseRevision;
     const id = this.selectedId(), sourceId = this.ais.selectedId(), navigation = this.plotNavigationRevision;
-    const current = () => revision === this.preciseRevision && id === this.selectedId() && sourceId === this.ais.selectedId()
-      && this.page() === 'scene' && !this.selectedSnapshot() && navigation === this.plotNavigationRevision && mmsi === this.ais.selectedMmsi();
-    this.operating.set('precise');
-    this.operationError.set('');
-    this.operationMessage.set('');
-    try {
-      const [snapshot, reading] = await Promise.all([this.api.dataSourceSnapshot(sourceId), firstValueFrom(this.api.ptz(id))]);
-      if (!current()) return;
+    const selection = this.ais.selectionRevision();
+    await this.executePrecise(async current => {
+      const reading = await firstValueFrom(this.api.ptz(id));
+      if (!current()) return null;
+      // PTZ 回读可能较慢，完成后再取 AIS，避免瞄准回读前的旧位置。
+      const snapshot = await this.api.dataSourceSnapshot(sourceId);
+      if (!current()) return null;
       const ship = snapshot.targets.find(target => target.mmsi === mmsi), source = this.ais.selectedSource();
       if (!ship || !source || snapshot.status !== 'connected' || this.ais.status() !== 'connected') throw new Error('该 AIS 目标已失效或来源已断开');
-      const camera = this.draft(), saved = this.selectedCamera();
-      if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) throw new Error('请先检查安装参数并保存设备通道修改');
-      this.reading.set(reading);
-      this.stale.set(false);
-      this.liveError.set('');
+      const camera = this.acceptPreciseReading(reading);
       const geometry = vesselGeometry(ship, source.geometry);
       const point = geometry ? { ...geometry.point, height: source.geometry.heightMeters / 2 } : ship;
       const aim = pointTargetPtz(camera, reading.raw, point);
       const framing = geometry ? estimateVesselZoom(camera, reading.raw, geometry.point, geometry.vessel, aim, this.pointZoomMax()) : null;
       const target = framing ? { ...aim, zoom: framing.zoom } : aim;
-      this.preciseTarget.set(target);
-      const result = await this.api.precise(id, target);
+      return { target, message: `AIS ${mmsi} 单次追踪指令已发送，位置以回读为准`, sent: () => this.ais.trackedMmsi.set(mmsi) };
+    }, () => sourceId === this.ais.selectedId() && selection === this.ais.selectionRevision()
+      && this.page() === 'scene' && !this.selectedSnapshot() && navigation === this.plotNavigationRevision && mmsi === this.ais.selectedMmsi());
+  }
+
+  private acceptPreciseReading(reading: PtzReading): CameraDraft {
+    this.reading.set(reading);
+    this.stale.set(false);
+    this.liveError.set('');
+    const camera = this.draft(), saved = this.selectedCamera();
+    if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) throw new Error('请检查安装参数，并先保存设备通道修改后再追踪');
+    return camera;
+  }
+
+  private async executePrecise(prepare: (current: () => boolean) => Promise<PreparedPreciseTarget | null>, valid: () => boolean) {
+    const revision = ++this.preciseRevision, id = this.selectedId();
+    const current = () => revision === this.preciseRevision && id === this.selectedId() && valid();
+    this.operating.set('precise');
+    this.operationError.set('');
+    this.operationMessage.set('');
+    try {
+      const prepared = await prepare(current);
+      if (!prepared || !current()) return;
+      this.preciseTarget.set(prepared.target);
+      const result = await this.api.precise(id, prepared.target);
       if (!current()) return;
-      this.ais.trackedMmsi.set(mmsi);
+      prepared.sent?.();
       this.controlTarget.set(result.target);
-      this.operationMessage.set(`AIS ${mmsi} 单次追踪指令已发送，位置以回读为准`);
+      this.operationMessage.set(prepared.message);
     } catch (error) { if (current()) this.operationError.set(errorMessage(error)); }
     finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }
   }

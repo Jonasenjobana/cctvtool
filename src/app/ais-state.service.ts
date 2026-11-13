@@ -11,6 +11,7 @@ export class AisState implements OnDestroy {
   readonly targets = signal<readonly VesselTarget[]>([]);
   readonly selectedMmsi = signal('');
   readonly trackedMmsi = signal('');
+  readonly selectionRevision = signal(0);
   readonly status = signal<VesselSnapshot['status']>('idle');
   readonly problem = signal('');
   readonly preferenceError = signal('');
@@ -71,10 +72,12 @@ export class AisState implements OnDestroy {
         this.status.set(snapshot.status);
         this.problem.set(snapshot.error ?? '');
         this.targets.set(snapshot.status === 'connected' ? snapshot.targets : []);
-        if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectedMmsi.set('');
+        if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectTarget('');
         if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.trackedMmsi.set('');
       } catch (error) {
+        this.status.set('reconnecting');
         this.targets.set([]);
+        this.selectTarget('');
         this.clearTracking();
         this.problem.set(errorMessage(error));
       }
@@ -83,19 +86,24 @@ export class AisState implements OnDestroy {
       if (this.stream !== stream) return;
       this.status.set('reconnecting');
       this.targets.set([]);
+      this.selectTarget('');
       this.clearTracking();
       this.problem.set('AIS 页面连接已断开，正在重连');
     };
   }
 
-  selectTarget(mmsi: string) { this.selectedMmsi.set(mmsi); }
+  selectTarget(mmsi: string) {
+    if (mmsi !== this.selectedMmsi()) this.selectionRevision.update(revision => revision + 1);
+    this.selectedMmsi.set(mmsi);
+  }
   clearTracking() { this.trackedMmsi.set(''); }
 
   private disconnect() {
+    this.selectionRevision.update(revision => revision + 1);
     this.stream?.close();
     this.stream = undefined;
     this.targets.set([]);
-    this.selectedMmsi.set('');
+    this.selectTarget('');
     this.clearTracking();
     this.status.set('idle');
     this.problem.set('');

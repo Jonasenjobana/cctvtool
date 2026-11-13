@@ -17,6 +17,12 @@
 | `GET /api/cameras` | 返回数据库中的设备列表 |
 | `POST /api/cameras` | 注册设备，返回 HTTP 201 及保存后的完整记录 |
 | `PUT /api/cameras/:id` | 完整保存当前设备配置，返回数据库记录 |
+| `GET /api/plot-layers` | 返回全部标绘图层摘要，不携带 GeoJSON 原文 |
+| `GET /api/plot-layers/:id` | 返回标绘图层详情及原始 `geojsonText` |
+| `POST /api/plot-layers` | `{ name, sourceFileName, geojsonText, cameraIds }` 导入独立图层，HTTP 201 返回详情 |
+| `PUT /api/plot-layers/:id` | `{ name, cameraIds }` 保存共享名称和完整关联集合，返回摘要 |
+| `PUT /api/plot-layers/:id/cameras/:cameraId` | `{ visible }` 保存已有摄像头关联的显隐，返回 `{ cameraId, visible }` |
+| `DELETE /api/plot-layers/:id` | 删除图层原文、元数据和全部摄像头关联，成功返回 HTTP 204 |
 | `GET /api/cameras/:id/ptz` | 返回 `{ raw, requestedAt, receivedAt, durationMs }`；`raw` 为上游 PTZ 业务值 |
 | `POST /api/cameras/:id/control` | 接收 `{ command, speed? }`，转发连续控制或停止，返回 `{ command, speed, sentAt }` |
 | `POST /api/cameras/:id/precise` | 接收完整 `{ pan, tilt, zoom }`，下发精确定位，返回 `{ target, sentAt }` |
@@ -77,6 +83,22 @@
 同一设备的连续控制、精确定位、截图及配置保存互斥，连续控制保持占用直到 stop 成功。停止请求独立接收并排在同一设备尚未结束的控制请求之后；启动失败也不阻止 stop，停止失败保留连续控制占用，允许重试停止。并发 stop 共用一次在途停止请求。参数无效返回 400、设备或图片不存在返回 404、重复通道或操作冲突返回 409、上游失败返回 502、上游超时返回 504、未配置上游认证信息返回 503。本工具错误体为 `{ "message": "错误说明" }`。
 
 后端使用 `URLToken`，在临近有效期前重新登录；并发登录合并，上游 401 后重新登录并重试一次。网络错误和超时不自动重发控制请求，前端不持有或传递上游 token。
+
+### GeoJSON 标绘接口
+
+一个 `.geojson` 或 `.json` 文件对应一个图层，扩展名不区分大小写。导入请求的 `name` 去除首尾空白后须为 1～200 个字符，`sourceFileName` 为 1～255 个字符的来源元数据，不作为后端磁盘路径。`geojsonText` 是 UTF-8 文件解码后的原文，允许开头的 UTF-8 BOM；BOM 仅在解析副本中去除。重复导入创建新的图层 ID，不覆盖旧图层。
+
+摘要返回 `id`、`name`、`sourceFileName`、`byteLength`、`featureCount`、`geometryTypes`、`createdAt`、`updatedAt` 和 `associations`。`byteLength` 为 UTF-8 原文字节数；`featureCount` 为 FeatureCollection 中的 Feature 数，单个 Feature 或顶层几何对象记为 1；`geometryTypes` 为实际出现的几何类型去重列表，包含遇到的 GeometryCollection。`associations` 每项为 `{ cameraId, visible }`。详情额外返回 `geojsonText`，其格式、未知属性、样式和扩展均保持导入时的原文。业务类型见[标绘模型](../src/app/plot-layer.models.ts)。
+
+接受 Feature、FeatureCollection，以及 Point、MultiPoint、LineString、MultiLineString、Polygon、MultiPolygon、GeometryCollection。Feature 的 `properties` 必须为对象或 null，`geometry` 可为 null。允许空集合和空坐标数组；没有有效几何时由地图明确提示无法定位。坐标须为有限数值，经度 -180°～180°、纬度 -90°～90°，每个位置只能有二维或三维；同一个非集合几何内维度一致，图层和几何集合可以包含不同维度的几何。第三维按米制 WGS84 椭球高度原样保存。
+
+非空线至少两个位置，非空面环至少四个位置并首尾闭合；面有非空内环时必须有非空外环。校验类型、数组层级及坐标，不执行完整拓扑修复或空间分析。CRS 可省略；声明时采用 `{ "type": "name", "properties": { "name": "EPSG:4326" } }` 形式，接受 WGS84、CRS84、EPSG:4326 及对应 OGC URN／标准 URL 名称。其他 CRS、空声明及外部链接声明均拒绝，不猜测坐标系或自动转换。
+
+原文最多 10 MiB，最多 50,000 个 Feature、500,000 个位置、32 层 GeometryCollection 嵌套。超出原文字节上限返回 413，其他结构或处理数量超限返回 400。只有 `POST /api/plot-layers` 的请求体上限扩大为 60 MiB + 64 KiB，以容纳 JSON 字符串转义后的封装；其他接口仍为 65,536 字节，请求体超限同样返回 413。这些上限是处理边界，不代表真实业务文件性能已验收。
+
+`cameraIds` 是完整关联集合，按摄像头 ID 去重，允许为空。导入和关联编辑先确认全部摄像头存在，再通过事务一次提交；失败不产生部分图层，也不改写原有名称、关联或显隐。新关联默认显示，编辑保留交集关联的显隐；解除关联只影响移出的摄像头，不删除原文。显隐按摄像头分别保存，修改名称对全部关联摄像头生效。显隐接口只修改已有关系，不隐式建立关联；删除图层移除全部关联，不影响其他图层或摄像头记录。
+
+图层及关联保存在 SQLite 的 `plot_layers`、`plot_layer_cameras` 表。可写启动时自动建立新表；只读 MCP 不执行迁移，也不依赖新表读取已有业务。名称、关联和显隐的修改都不回写 GeoJSON properties。未知图层、摄像头或未建立的关联返回 404；无效输入返回 400；错误体统一为 `{ "message": "错误说明" }`，不返回导入原文或内部堆栈。HTTP 公开边界回归见[标绘接口测试](../tests/plot-layers.test.mjs)。
 
 ### 自动扇区截图与任务接口
 

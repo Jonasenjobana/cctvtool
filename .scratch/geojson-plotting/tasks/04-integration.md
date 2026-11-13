@@ -1,8 +1,8 @@
 # 集成验证并审查标绘功能
 
 Type: implementation
-Status: open
-Assignee: unassigned
+Status: in_progress
+Assignee: /root
 Parent: [GeoJSON 标绘管理](../spec.md)
 Blocked by: [实现标绘持久化与 HTTP API](01-api.md), [接入 Cesium 标绘加载与定位](02-scene.md), [实现标绘管理页与地图图层面板](03-management.md)
 

@@ -113,8 +113,7 @@ function geojsonMetadata(text) {
     if (!Array.isArray(data.features)) throw httpError(400, '要素集合的 features 必须为数组');
     if (data.features.length > 50000) throw httpError(400, 'GeoJSON 最多包含 50,000 个 Feature');
     data.features.forEach(feature);
-  }
-  else if (data.type === 'Feature') feature(data);
+  } else if (data.type === 'Feature') feature(data);
   else geometry(data);
   return { byteLength,
     featureCount: data.type === 'FeatureCollection' ? data.features.length : 1,
@@ -140,4 +139,3 @@ export function registerPlotLayerRoutes(app, store) {
     return reply.code(204).send();
   });
 }
-

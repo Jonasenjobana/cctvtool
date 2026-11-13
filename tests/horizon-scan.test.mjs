@@ -133,8 +133,10 @@ test('预扫拒绝无效倍率、T 区间、方向覆盖和目标 FOV，校验�
     { preScanZoom: 12, tiltMin: 0, tiltMax: 30 }, { preScanZoom: 20, tiltMin: 0, tiltMax: 30 },
     { preScanZoom: 2, tiltMin: 10, tiltMax: 30 }, { preScanZoom: 2, tiltMin: 0, tiltMax: 7 },
     { preScanZoom: 2, tiltMin: 30, tiltMax: 0 }, { preScanZoom: 2, tiltMin: 8, tiltMax: 8 },
+    { preScanZoom: 2, tiltMin: -91, tiltMax: 30 }, { preScanZoom: 2, tiltMin: -90, tiltMax: 91 },
   ]) assert.equal((await startCoarse(f, { horizon })).statusCode, 400, JSON.stringify(horizon));
   assert.equal((await startCoarse(f, { panMax: 29 })).statusCode, 400);
+  assert.equal((await startCoarse(f, { panMin: 347, panMax: 39 })).statusCode, 400);
   f.state.raw.VerticalFieldAngle = null;
   assert.equal((await startCoarse(f)).statusCode, 502);
   assert.equal(f.state.targets.length, 0);

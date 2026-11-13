@@ -35,38 +35,51 @@ test('不可达的同分支海天线拒绝截边、负角包装与反向切线�
   const calibration = { ...fixtureCamera, pAxisPitch: -5 };
   assert.equal(hitsSea(calibration, 0, 0), true);
   assert.equal(hitsSea(calibration, 0, 90), true);
-  for (const tiltMax of [90, 360]) {
+  for (const tiltMax of [1, 90]) {
     assert.throws(() => solveHorizonTilt(calibration, {
       pan: 0, referenceTilt: 0, tiltMin: 0, tiltMax,
     }), (error) => error.statusCode === 400 && /不可达/.test(error.message));
   }
 });
 
-test('完整 T 范围内选择参考俯仰分支的最近切线', () => {
-  const forward = solveHorizonTilt(fixtureCamera, { pan: 70, referenceTilt: 1, tiltMin: 0, tiltMax: 360 });
-  const reversed = solveHorizonTilt(fixtureCamera, { pan: 70, referenceTilt: 179, tiltMin: 0, tiltMax: 360 });
-  assert.ok(forward > 0 && forward < 1);
-  assert.ok(reversed > 179 && reversed < 180);
-  assert.equal(hitsSea(fixtureCamera, 70, reversed - 0.0001), true);
-  assert.equal(hitsSea(fixtureCamera, 70, reversed + 0.0001), false);
+test('有符号 T 范围内选择参考俯仰分支的最近切线', () => {
+  const calibration = { ...fixtureCamera, tiltOffset: fixtureCamera.tiltOffset - 90 };
+  const forward = solveHorizonTilt(calibration, { pan: 70, referenceTilt: -89, tiltMin: -90, tiltMax: 90 });
+  const reversed = solveHorizonTilt(calibration, { pan: 70, referenceTilt: 89, tiltMin: -90, tiltMax: 90 });
+  assert.ok(forward > -90 && forward < -89);
+  assert.ok(reversed > 89 && reversed < 90);
+  assert.equal(hitsSea(calibration, 70, reversed - 0.0001), true);
+  assert.equal(hitsSea(calibration, 70, reversed + 0.0001), false);
 });
 
 test('深俯视参考 T 周围存在两条可见切线时选择最近值', () => {
-  for (const [referenceTilt, sky, sea] of [[89.95, 0, 10], [90.05, 180, 170]]) {
-    const expected = rayHorizonTilt(fixtureCamera, 70, sky, sea);
-    const tilt = solveHorizonTilt(fixtureCamera, { pan: 70, referenceTilt, tiltMin: 0, tiltMax: 360 });
+  const calibration = { ...fixtureCamera, tiltOffset: fixtureCamera.tiltOffset - 90 };
+  for (const [referenceTilt, sky, sea] of [[-0.05, -90, -80], [0.05, 90, 80]]) {
+    const expected = rayHorizonTilt(calibration, 70, sky, sea);
+    const tilt = solveHorizonTilt(calibration, { pan: 70, referenceTilt, tiltMin: -90, tiltMax: 90 });
     assert.ok(Math.abs(tilt - expected) < 1e-7, `${referenceTilt}: ${tilt} / ${expected}`);
   }
 });
 
 test('同俯仰分支按光轴方向保持，不能借另一分支绕过原始 T 边界', () => {
-  assert.throws(() => solveHorizonTilt(fixtureCamera, {
-    pan: 70, referenceTilt: 89.95, tiltMin: 89, tiltMax: 360,
+  assert.throws(() => solveHorizonTilt({ ...fixtureCamera, tiltOffset: fixtureCamera.tiltOffset - 90 }, {
+    pan: 70, referenceTilt: -0.05, tiltMin: -1, tiltMax: 90,
   }), (error) => error.statusCode === 400 && /不可达/.test(error.message));
   const calibration = { ...fixtureCamera, height: 100000, tiltOffset: 89 };
   const expected = rayHorizonTilt(calibration, 70, 0, 120);
-  const tilt = solveHorizonTilt(calibration, { pan: 70, referenceTilt: 0, tiltMin: 0, tiltMax: 120 });
-  assert.ok(tilt > 90 && Math.abs(tilt - expected) < 1e-7);
+  assert.ok(expected > 90);
+  assert.throws(() => solveHorizonTilt(calibration, { pan: 70, referenceTilt: 0, tiltMin: 0, tiltMax: 90 }),
+    (error) => error.statusCode === 400 && /不可达/.test(error.message));
+});
+
+test('允许区间包含负 T 时直接返回上抬负角，收窄区间则拒绝越界', () => {
+  const calibration = { ...fixtureCamera, pAxisPitch: -5 };
+  const expected = rayHorizonTilt(calibration, 0, -10, 0);
+  const tilt = solveHorizonTilt(calibration, { pan: 0, referenceTilt: 0, tiltMin: -90, tiltMax: 90 });
+  assert.ok(tilt < 0 && tilt > -10);
+  assert.ok(Math.abs(tilt - expected) < 1e-7);
+  assert.throws(() => solveHorizonTilt(calibration, { pan: 0, referenceTilt: 0, tiltMin: -1, tiltMax: 90 }),
+    (error) => error.statusCode === 400 && /不可达/.test(error.message));
 });
 
 test('中心角差在海天分界为零、朝天为正，背向相切直线不作为可见海天线', () => {
@@ -97,7 +110,7 @@ test('几何控制公开边界拒绝缺失标定、非有限角度及无效原�
       (error) => error.statusCode === 400 && /标定/.test(error.message));
   }
   for (const patch of [{ pan: NaN }, { pan: 361 }, { referenceTilt: null }, { referenceTilt: 100 },
-    { tiltMin: -1 }, { tiltMax: 361 }, { tiltMin: 90 }, { tiltMax: NaN }]) {
+    { tiltMin: -91 }, { tiltMax: 91 }, { tiltMax: 360 }, { tiltMin: 90 }, { tiltMax: NaN }]) {
     assert.throws(() => solveHorizonTilt(fixtureCamera, { ...target, ...patch }),
       (error) => error.statusCode === 400 && /T|P/.test(error.message));
   }

@@ -43,8 +43,8 @@ export function horizonOffsetDegrees(calibration, rawPtz) {
 export function solveHorizonTilt(calibration, options) {
   const { pan, referenceTilt, tiltMin, tiltMax } = options ?? {};
   if (![pan, referenceTilt, tiltMin, tiltMax].every(Number.isFinite) || pan < 0 || pan > 360
-    || tiltMin < 0 || tiltMax > 360 || tiltMax <= tiltMin || referenceTilt < tiltMin || referenceTilt > tiltMax) {
-    throw httpError(400, 'P 必须位于 0～360°，参考 T 必须位于有效的允许 T 区间内');
+    || tiltMin < -90 || tiltMax > 90 || tiltMax <= tiltMin || referenceTilt < tiltMin || referenceTilt > tiltMax) {
+    throw httpError(400, 'P 必须位于 0～360°，参考 T 必须位于 -90～90° 内的允许区间');
   }
   const geometry = horizonGeometry(calibration);
   if (Math.abs(centerOffset(calibration, geometry, { Pan: pan, Tilt: referenceTilt })) < 1e-9) return referenceTilt;
@@ -79,7 +79,7 @@ export function solveHorizonTilt(calibration, options) {
         Cartesian3.multiplyByScalar(sideways, sign * across, new Cartesian3()), new Cartesian3());
       Cartesian3.multiplyComponents(direction, Ellipsoid.WGS84.radii, direction);
       const tilt = Math.atan2(Cartesian3.dot(direction, down), Cartesian3.dot(direction, forward)) / rad;
-      candidates.push(tilt, tilt + 360);
+      candidates.push(tilt);
     }
   }
   // 以真实 ENU 上方向划分俯仰分支；参考光轴恰在竖直极值时不能决定应翻向哪边。

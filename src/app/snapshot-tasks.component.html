@@ -25,7 +25,7 @@
           @if (task.status === 'running' || task.status === 'pausing' || task.status === 'paused') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('cancel')">取消任务</button> }
         </div>
       </div>
-      <dl class="task-parameters"><div><dt>P 范围</dt><dd>{{ task.panMin }}° ～ {{ task.panMax }}°</dd></div><div><dt>基础 T / Z</dt><dd>{{ task.basePtz?.tilt }}° / {{ task.basePtz?.zoom }}</dd></div><div><dt>水平视场角 / 步长</dt><dd>{{ task.horizontalFieldAngle | number:'1.2-3' }}° / {{ task.panStep | number:'1.2-3' }}°</dd></div><div><dt>开始时间</dt><dd>{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</dd></div></dl>
+      <dl class="task-parameters"><div><dt>P 范围</dt><dd>{{ task.panMin }}° → {{ task.panMax }}°</dd></div><div><dt>基础 T / Z</dt><dd>{{ task.basePtz?.tilt }}° / {{ task.basePtz?.zoom }}</dd></div><div><dt>水平视场角 / 步长</dt><dd>{{ task.horizontalFieldAngle | number:'1.2-3' }}° / {{ task.panStep | number:'1.2-3' }}°</dd></div><div><dt>开始时间</dt><dd>{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</dd></div></dl>
       @if (task.horizon; as horizon) {
         <dl class="task-parameters"><div><dt>采样阶段</dt><dd>{{ taskName(task) }}</dd></div><div><dt>正式目标倍率</dt><dd>Z {{ horizon.targetZoom }}</dd></div><div><dt>允许原始 T</dt><dd>{{ horizon.tiltMin }}° ～ {{ horizon.tiltMax }}°</dd></div><div><dt>T 控制</dt><dd>{{ horizon.phase === 'fine' ? '按冻结计划逐点调整' : '固定初始 T 低倍率预扫' }}</dd></div></dl>
       }

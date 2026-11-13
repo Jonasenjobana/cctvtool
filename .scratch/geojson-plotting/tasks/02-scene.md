@@ -1,8 +1,8 @@
 # 接入 Cesium 标绘加载与定位
 
 Type: implementation
-Status: open
-Assignee: unassigned
+Status: in_progress
+Assignee: /root/plot_scene
 Parent: [GeoJSON 标绘管理](../spec.md)
 Blocked by:
 

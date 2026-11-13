@@ -21,6 +21,10 @@ interface Feature {
 interface FeatureCollection { type: 'FeatureCollection'; features: Feature[]; }
 
 const plotColor = Color.fromCssColorString('#3687ff');
+const simpleStyleProperties = [
+  'marker-size', 'marker-symbol', 'marker-color',
+  'stroke', 'stroke-opacity', 'stroke-width', 'fill', 'fill-opacity',
+];
 
 function* positions(coordinates: Coordinates): Generator<Position> {
   if (!coordinates.length) return;
@@ -76,8 +80,14 @@ function displayData(text: string) {
     }
     if (!dimension) return;
     const target = dimension === 2 ? ground : elevated;
+    // 业务字段可能与 Cesium 的属性方法同名；展示副本只传绘制样式，完整属性仍留在原文和缓存。
+    const properties = feature?.properties;
+    const displayProperties = properties ? Object.fromEntries(
+      simpleStyleProperties.filter((key) => Object.hasOwn(properties, key))
+        .map((key) => [key, properties[key]]),
+    ) : null;
     target.features.push({
-      type: 'Feature', id: feature?.id, properties: feature?.properties ?? null, geometry: displayGeometry,
+      type: 'Feature', id: feature?.id, properties: displayProperties, geometry: displayGeometry,
     });
   };
   if (document.type === 'FeatureCollection') {

@@ -4,7 +4,7 @@ export const vesselProject = {
   sources: [{
     id: 'tianjin-lock-ais', name: '天津船闸 AIS', adapter: 'seaoil-ais',
     url: 'ws://192.168.1.20:4323/websocket', timeOffsetMinutes: 480,
-    expireAfterMs: 10 * 60 * 1000, maxDistanceMeters: 10000,
+    expireAfterMs: 10 * 60 * 1000, maxDistanceMeters: 2000,
     geometry: { antennaFromSternRatio: 0.1, antennaFromPortRatio: 0.5, heightMeters: 10 },
   }],
 };

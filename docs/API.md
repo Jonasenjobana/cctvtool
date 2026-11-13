@@ -100,7 +100,7 @@
   "sources": [{
     "id": "tianjin-lock-ais", "name": "天津船闸 AIS", "type": "ais",
     "geometry": { "antennaFromSternRatio": 0.1, "antennaFromPortRatio": 0.5, "heightMeters": 10 },
-    "maxDistanceMeters": 10000, "expireAfterMs": 600000
+    "maxDistanceMeters": 2000, "expireAfterMs": 600000
   }]
 }
 ```

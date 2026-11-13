@@ -1,6 +1,6 @@
 <header class="heading">
   <div class="page-title"><app-icon name="horizon" /><h1>海天线识别任务</h1></div>
-  <button type="button" [disabled]="busy() || loading() || dirty()" (click)="refresh()"><app-icon name="refresh" />刷新</button>
+  <button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama()" (click)="refresh()"><app-icon name="refresh" />刷新</button>
 </header>
 @if (problem()) { <p class="error page-feedback" role="alert">{{ problem() }}</p> }
 @if (message()) { <p class="message page-feedback" role="status">{{ message() }}</p> }
@@ -27,8 +27,8 @@
         <div class="actions">
           @if (running()) { <button type="button" [disabled]="busy() || loading()" (click)="cancel()">取消识别</button> }
           @else {
-            <button type="button" [disabled]="busy() || loading() || dirty()" (click)="recreate()">创建新一轮识别</button>
-            <button type="button" class="primary" [disabled]="busy() || loading()" (click)="generate()">{{ busy() ? '处理中…' : '生成安装参数' }}</button>
+            <button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama()" (click)="recreate()">创建新一轮识别</button>
+            <button type="button" class="primary" [disabled]="busy() || loading() || generatingPanorama()" (click)="generate()">{{ busy() ? '处理中…' : '生成安装参数' }}</button>
           }
         </div>
       </div>
@@ -38,6 +38,77 @@
       }
       <div class="workbench">
         <section class="review" aria-label="截图复核">
+          <section class="panorama-panel" aria-label="海天线全景复核">
+            <div class="section-heading"><h3>全景复核</h3><button type="button"
+              [disabled]="busy() || loading() || running() || generatingPanorama() || task.sampleCount < 2"
+              (click)="generatePanorama()">{{ generatingPanorama() ? '正在生成…' : panorama() ? '重新生成全景图' : '生成全景图' }}</button></div>
+            @if (generatingPanorama()) {
+              <div class="panorama-progress" role="status"><span>{{ panoramaProgress() }}</span><button type="button" (click)="clearPanorama()">取消生成</button></div>
+            }
+            @if (panoramaError()) { <p class="error" role="alert">{{ panoramaError() }}</p> }
+            @if (panorama(); as image) {
+              <figure class="panorama-preview">
+                <figcaption><span>{{ image.count }} 张 · {{ image.width }} × {{ image.height }}@if (image.missing) { · 已删除 {{ image.missing }} 张 }</span>
+                  <div class="actions">
+                    @if (dirty()) { <span class="panorama-unsaved">未保存</span> }
+                    <button type="button" [disabled]="busy() || loading() || running() || !dirty()" (click)="undo()">撤销修改</button>
+                    <button type="button" class="primary" [disabled]="busy() || loading() || running() || !dirty()" (click)="save()">保存标注</button>
+                    <button type="button" [attr.aria-pressed]="panoramaExpanded()" (click)="panoramaExpanded.set(!panoramaExpanded())">{{ panoramaExpanded() ? '适应宽度' : '放大查看' }}</button><button type="button" (click)="clearPanorama()">收起</button>
+                  </div>
+                </figcaption>
+                <div #panoramaViewport class="panorama-viewport" tabindex="0" role="region" aria-label="全景图片，左右方向键选择端点，上下方向键微调"
+                  aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown Control+s Meta+s"
+                  (click)="focusPanorama()" (keydown)="panoramaKeydown($event)">
+                  <div class="panorama-stage" [style.width.px]="panoramaExpanded() ? image.width * (image.height > 360 ? 360 / image.height : 1) : null"
+                    (pointermove)="dragPanorama($event)" (pointerup)="endPanoramaDrag($event)" (pointercancel)="endPanoramaDrag($event)" (lostpointercapture)="endPanoramaDrag($event)">
+                    <img [src]="image.url" alt="识别任务全部现存截图拼接的全景图" (load)="focusPanorama()">
+                    @if (showPanoramaLines()) {
+                      <svg [attr.viewBox]="'0 0 ' + image.width + ' ' + image.height" aria-label="各图当前海天线，点击线段选择对应截图">
+                        @if (panoramaOutline(); as outline) {
+                          <defs><clipPath id="recognition-panorama-focus" clipPathUnits="userSpaceOnUse">
+                            <path [attr.d]="panoramaFocusClip()" clip-rule="evenodd" />
+                          </clipPath></defs>
+                          <polygon class="panorama-focus" [attr.points]="outline" />
+                        }
+                        @for (line of panoramaLines(); track line.snapshotId) {
+                          <g [class.ignored]="line.ignored" [class.current]="selectedItemId() === line.snapshotId" role="button" tabindex="0"
+                            [attr.clip-path]="line.snapshotId !== selectedItemId() && panoramaOutline() ? 'url(#recognition-panorama-focus)' : null"
+                            [attr.aria-label]="'复核 P ' + line.pan + '° 截图' + (line.ignored ? '，已忽略' : '')"
+                            (click)="openPanoramaItem(line.snapshotId)" (keydown.enter)="openPanoramaItem(line.snapshotId)"
+                            (keydown.space)="$event.preventDefault(); openPanoramaItem(line.snapshotId)">
+                            <title>P {{ line.pan | number:'1.1-2' }}° · {{ line.ignored ? '已忽略' : '参与计算' }}</title>
+                            <polyline class="panorama-hit" [attr.points]="line.points" />
+                            <polyline class="panorama-line" [attr.points]="line.points" />
+                          </g>
+                        }
+                      </svg>
+                      @if (focusedPanoramaLine(); as line) {
+                        @for (point of line.endpoints; track $index; let index = $index) {
+                          <button type="button" class="panorama-handle" [class.active]="activePanoramaEndpoint() === index" [attr.data-panorama-endpoint]="index"
+                            role="slider" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="1"
+                            [attr.aria-label]="'P ' + line.pan + '° 截图' + (index === 0 ? '左端点' : '右端点')"
+                            [attr.aria-valuenow]="line.sourcePoints[index].y" [style.left.%]="point.x / image.width * 100" [style.top.%]="point.y / image.height * 100"
+                            [disabled]="busy() || loading() || running() || generatingPanorama() || item()?.missing"
+                            (focus)="activePanoramaEndpoint.set(index)" (pointerdown)="startPanoramaDrag($event, index)"></button>
+                        }
+                      }
+                    }
+                  </div>
+                </div>
+              </figure>
+              <div class="legend panorama-legend"><label><input type="checkbox" [ngModel]="showPanoramaLines()" (ngModelChange)="endPanoramaDrag(); showPanoramaLines.set($event)">显示标注</label><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span><span><i class="ignored-swatch" aria-hidden="true"></i>已忽略</span>
+                @if (focusedPanoramaLine(); as line) {
+                  <span class="panorama-selection">聚焦 P {{ line.pan | number:'1.1-2' }}°</span>
+                  <div class="panorama-endpoints" role="group" aria-label="键盘微调端点">
+                    <button type="button" [class.active]="activePanoramaEndpoint() === 0" [attr.aria-pressed]="activePanoramaEndpoint() === 0"
+                      [disabled]="busy() || loading() || running() || generatingPanorama() || !showPanoramaLines()" (click)="focusPanorama(0)">左端点</button>
+                    <button type="button" [class.active]="activePanoramaEndpoint() === 1" [attr.aria-pressed]="activePanoramaEndpoint() === 1"
+                      [disabled]="busy() || loading() || running() || generatingPanorama() || !showPanoramaLines()" (click)="focusPanorama(1)">右端点</button>
+                  </div>
+                }
+              </div>
+            }
+          </section>
           <section class="editor" aria-label="海天线编辑">
             <div class="section-heading"><h3>海天线复核</h3>
               @if (item(); as entry) { <span class="annotation-source" [class.unsaved]="dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ dirty() ? ' · 未保存' : '' }}</span> }
@@ -63,7 +134,7 @@
                 </div>
               }
               <div class="legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span><span>拖动两端调整海天线</span></div>
-              <fieldset [disabled]="busy() || loading() || running() || entry.missing">
+              <fieldset [disabled]="busy() || loading() || running() || generatingPanorama() || entry.missing">
                 <div class="annotation-actions">
                   <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
                   <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
@@ -100,7 +171,7 @@
                   <span class="image-status">{{ entry.missing ? '原图已删除' : entry.ignored ? '已忽略' : '参与计算' }}</span>
                 </button>
               } @empty { <p class="empty">{{ running() ? '识别结果将显示在这里。' : '暂无可复核截图。' }}</p> }
-              @if (nextItemOffset() !== null) { <button type="button" class="more" [disabled]="loading() || busy()" (click)="loadMore('items')">更多截图</button> }
+              @if (nextItemOffset() !== null) { <button type="button" class="more" [disabled]="loading() || busy() || generatingPanorama()" (click)="loadMore('items')">更多截图</button> }
             </div>
           </section>
         </section>
@@ -122,7 +193,7 @@
               </tbody></table>
             }
             @if (!coarse()) {
-              <button type="button" class="primary apply-button" [disabled]="busy() || loading() || dirty() || running() || !sourceGroup() || result.status !== 'estimated' || task.appliedRevision === task.revision"
+              <button type="button" class="primary apply-button" [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || !sourceGroup() || result.status !== 'estimated' || task.appliedRevision === task.revision"
                 (click)="apply()"><app-icon [name]="task.appliedRevision === task.revision ? 'check' : 'save'" />{{ task.appliedRevision === task.revision ? '已应用' : '应用到摄像头' }}</button>
             }
             @for (warning of result.warnings || []; track $index) { <p class="note">{{ warning }}</p> }

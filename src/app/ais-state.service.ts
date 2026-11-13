@@ -12,7 +12,7 @@ export class AisState implements OnDestroy {
   readonly selectedMmsi = signal('');
   readonly trackedMmsi = signal('');
   readonly selectionRevision = signal(0);
-  readonly status = signal<VesselSnapshot['status']>('idle');
+  readonly status = signal<VesselSnapshot['status'] | 'error'>('idle');
   readonly problem = signal('');
   readonly preferenceError = signal('');
   readonly loading = signal(false);
@@ -62,34 +62,41 @@ export class AisState implements OnDestroy {
     const id = this.selectedId();
     if (!this.active || !id || this.stream) return;
     this.status.set('connecting');
-    const stream = new EventSource(`/api/data-sources/${encodeURIComponent(id)}/events`);
-    this.stream = stream;
-    stream.onmessage = event => {
-      if (this.stream !== stream || this.selectedId() !== id) return;
-      try {
-        const snapshot: VesselSnapshot = JSON.parse(event.data);
-        if (snapshot.sourceId !== id) throw new Error('数据源响应不匹配');
-        this.status.set(snapshot.status);
-        this.problem.set(snapshot.error ?? '');
-        this.targets.set(snapshot.status === 'connected' ? snapshot.targets : []);
-        if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectTarget('');
-        if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.trackedMmsi.set('');
-      } catch (error) {
+    try {
+      const stream = new EventSource(`/api/data-sources/${encodeURIComponent(id)}/events`);
+      this.stream = stream;
+      // 注入脚本可能代理 EventSource，事件属性 setter 会因 receiver 不是原生实例而失败。
+      stream.addEventListener('message', event => {
+        if (this.stream !== stream || this.selectedId() !== id) return;
+        try {
+          const snapshot: VesselSnapshot = JSON.parse(event.data);
+          if (snapshot.sourceId !== id) throw new Error('数据源响应不匹配');
+          this.status.set(snapshot.status);
+          this.problem.set(snapshot.error ?? '');
+          this.targets.set(snapshot.status === 'connected' ? snapshot.targets : []);
+          if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectTarget('');
+          if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.trackedMmsi.set('');
+        } catch (error) {
+          this.status.set('reconnecting');
+          this.targets.set([]);
+          this.selectTarget('');
+          this.clearTracking();
+          this.problem.set(errorMessage(error));
+        }
+      });
+      stream.addEventListener('error', () => {
+        if (this.stream !== stream) return;
         this.status.set('reconnecting');
         this.targets.set([]);
         this.selectTarget('');
         this.clearTracking();
-        this.problem.set(errorMessage(error));
-      }
-    };
-    stream.onerror = () => {
-      if (this.stream !== stream) return;
-      this.status.set('reconnecting');
-      this.targets.set([]);
-      this.selectTarget('');
-      this.clearTracking();
-      this.problem.set('AIS 页面连接已断开，正在重连');
-    };
+        this.problem.set('AIS 页面连接已断开，正在重连');
+      });
+    } catch (error) {
+      this.disconnect();
+      this.status.set('error');
+      this.problem.set(`AIS 订阅初始化失败：${error instanceof Error ? error.message : errorMessage(error)}`);
+    }
   }
 
   selectTarget(mmsi: string) {

@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { build } from 'esbuild';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createApp } from '../server/app.mjs';
@@ -163,3 +166,28 @@ test('多个页面通过 SSE 获得完整最新快照并共享来源，断线与
   assert.equal(await nextFirst(), null);
   assert.equal(await nextSecond(), null);
 });
+
+for (const initializationFailure of [false, true]) {
+  test(initializationFailure ? '页面订阅初始化失败时显示真实异常并允许重新连接' : '页面在 EventSource 被代理时仍可通过 HTTP/SSE 连接并取得目标', { timeout: 20000 }, async (t) => {
+    const f = await fixture(t);
+    await f.snapshot();
+    f.sockets[0].open();
+    f.sockets[0].message({ api: 1, datas: [row] });
+    await f.app.listen({ host: '127.0.0.1', port: 0 });
+    const cache = resolve('node_modules/.cache');
+    await mkdir(cache, { recursive: true });
+    const folder = await mkdtemp(join(cache, 'ais-http-client-'));
+    t.after(async () => {
+      if (dirname(resolve(folder)) !== cache || !basename(folder).startsWith('ais-http-client-')) throw new Error('客户端测试清理路径超出缓存目录');
+      await rm(folder, { recursive: true, force: true });
+    });
+    const file = join(folder, 'client.mjs');
+    await build({ entryPoints: ['tests/fixtures/ais-http-client.ts'], outfile: file, bundle: true, platform: 'node',
+      format: 'esm', packages: 'external', tsconfig: 'tsconfig.json', logLevel: 'silent' });
+    const result = await promisify(execFile)(process.execPath, ['--experimental-eventsource', file], {
+      cwd: process.cwd(), timeout: 12000, windowsHide: true,
+      env: { ...process.env, AIS_TEST_ORIGIN: `http://127.0.0.1:${f.app.server.address().port}`, AIS_TEST_INIT_FAILURE: initializationFailure ? '1' : '0' },
+    });
+    assert.match(result.stdout, /AIS HTTP consumer PASS/);
+  });
+}

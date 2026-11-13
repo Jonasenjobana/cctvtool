@@ -21,7 +21,7 @@ export class AisPanelComponent {
   @Output() readonly closed = new EventEmitter<void>();
   readonly search = signal('');
   readonly lookupError = signal('');
-  readonly statusText = computed(() => ({ idle: '未订阅', connecting: '正在连接', connected: '已连接', reconnecting: '正在重连' })[this.ais.status()]);
+  readonly statusText = computed(() => ({ idle: '未订阅', connecting: '正在连接', connected: '已连接', reconnecting: '正在重连', error: '连接失败' })[this.ais.status()]);
   readonly geometry = computed(() => {
     const target = this.ais.selectedTarget(), source = this.ais.selectedSource();
     return target && source ? vesselGeometry(target, source.geometry) : null;

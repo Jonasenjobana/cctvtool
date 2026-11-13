@@ -7,6 +7,7 @@
   </select>
   <div class="status" role="status">{{ ais.catalog()?.project?.name }} · {{ statusText() }} · 有效目标 {{ ais.targets().length }}</div>
   @if (ais.problem()) { <p class="error" role="alert">{{ ais.problem() }}</p> }
+  @if (ais.status() === 'error') { <button type="button" [disabled]="busy" (click)="ais.selectSource(ais.selectedId())">重新连接</button> }
   @if (ais.preferenceError()) { <p class="error" role="alert">{{ ais.preferenceError() }}</p> }
   @if (!ais.catalog() && !ais.loading()) { <button type="button" (click)="ais.load()">重新读取数据源</button> }
   <form (ngSubmit)="find()">

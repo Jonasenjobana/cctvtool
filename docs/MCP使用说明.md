@@ -95,7 +95,7 @@ node --input-type=module -e "import { randomBytes } from 'node:crypto'; console.
 
 1. 调用 `list_cameras`，使用返回的本地 `id` 作为 `cameraId`；确认用户要求的摄像头和时间段。
 2. 调用 `query_snapshots`。时间必须带时区，开始包含、结束不包含，按截图 `createdAt` 筛选。例如北京时间 `2026-11-09T11:00:00+08:00`。若分析一次自动扫描，传入任务的 `groupId`，结果中的每张图也带分组 ID。有 `nextOffset` 时继续分页。自动采集从实时右侧表单或 [HTTP 扫描接口](API.md#自动扇区截图与任务接口)发起，MCP 继续只读。
-3. 选择至少 3 张停稳截图、3 个不同 P 方向，圆周覆盖至少 30°，建议 90°以上。跳过 `poseChanged`、海天线不可见或遮挡严重的图片。
+3. 选择停稳且海天线可确认的截图，跳过 `poseChanged`、海天线不可见或遮挡严重的图片。拟合质量由实际收敛、可辨识性和残差决定；样本较少或方向集中时，对标注及固定参数误差更敏感。
 4. 对每张候选图调用 `get_snapshot`，实际查看其 MCP 图片内容。每图至少标注两个海天线点，横向跨度至少为图宽 10%。
 5. 将标注归一化：左上角为原点，`x=像素横坐标/图片宽度`，`y=像素纵坐标/图片高度`，范围均为 0～1。调用拟合工具时不自行提交或替换 PTZ/FOV。
 6. 调用 `estimate_p_axis_tilt`，向用户说明结果和限制。复核后，由用户在网页填写前后倾、左右倾并保存。
@@ -132,7 +132,7 @@ node --input-type=module -e "import { randomBytes } from 'node:crypto'; console.
 | 字段或状态 | 含义 |
 | --- | --- |
 | `status=estimated` | 数值检查通过，`installation` 返回可复核的估计 |
-| `status=insufficient_data` | 有效样本、不同 P 方向或覆盖范围不足，安装角度为 `null` |
+| `status=insufficient_data` | 没有有效的停稳截图和海天线标注，安装角度为 `null` |
 | `status=unreliable` | 未收敛、不可辨识或均方根误差超过 5 像素，安装角度为 `null` |
 | `installation.pAxisPitch/pAxisRoll` | 前后倾、左右倾，单位度 |
 | `diagnostics` | 总体和逐图残差、收敛情况等 |

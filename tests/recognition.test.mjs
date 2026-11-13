@@ -7,13 +7,13 @@ import { CameraStore } from '../server/store.mjs';
 import { createApp } from '../server/app.mjs';
 import { fixtureCamera, syntheticSnapshots } from './calibration-fixtures.mjs';
 
-async function fixture(t, customRecognizer) {
+async function fixture(t, customRecognizer, sampleOptions = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-recognition-test-'));
   const store = new CameraStore(dataDir);
   const input = Object.fromEntries(['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'].map((key) => [key, fixtureCamera[key]]));
   const camera = store.saveCamera(input);
   const actual = { ...camera, tiltOffset: 1.1, imageRoll: -0.8 };
-  const { snapshots, observations } = syntheticSnapshots({ camera: actual });
+  const { snapshots, observations } = syntheticSnapshots({ camera: actual, ...sampleOptions });
   store.addSnapshotGroup({ id: 'source-task', cameraId: camera.id, cameraName: camera.name, kind: 'scan', status: 'completed',
     createdAt: snapshots[0].createdAt, sampleCount: snapshots.length, completedCount: 0 });
   snapshots.forEach((snapshot, scanIndex) => store.addSnapshot({ ...snapshot, groupId: 'source-task', scanIndex,
@@ -98,6 +98,31 @@ test('识别任务持久化、手动标注和忽略、重新计算、一键应�
     payload: { revision: 2, resultId: previousResultId } });
   assert.equal(staleApply.statusCode, 409);
   assert.equal((await post(f, task.id, 'apply', 2)).statusCode, 200);
+});
+
+test('网页识别允许 22° 跨零样本生成并应用参数，单张不可辨识结果拒绝应用', async (t) => {
+  for (const pans of [[347, 358, 9], [0]]) {
+    const f = await fixture(t, undefined, { pans,
+      ptzOverrides: { Tilt: 2, Zoom: 8.8, HorizontalFieldAngle: 24, VerticalFieldAngle: 13.5 } });
+    const task = await createAndWait(f);
+    const response = await post(f, task.id, 'generate', 0);
+    assert.equal(response.statusCode, 200, response.body);
+    const result = response.json().result;
+    const apply = await post(f, task.id, 'apply', 0);
+    if (pans.length === 3) {
+      assert.equal(result.status, 'estimated', JSON.stringify(result));
+      assert.equal(result.panCoverageDegrees, 22);
+      assert.equal(apply.statusCode, 200, apply.body);
+      for (const [key, value] of Object.entries({ pAxisPitch: 1.25, pAxisRoll: -2.1, tiltOffset: 1.1, imageRoll: -0.8 })) {
+        assert.ok(Math.abs(apply.json().camera[key] - value) < 1e-4, key);
+      }
+    } else {
+      assert.equal(result.status, 'unreliable', JSON.stringify(result));
+      assert.equal(result.installation, null);
+      assert.equal(apply.statusCode, 409);
+      assert.deepEqual((await f.app.inject('/api/cameras')).json().find((camera) => camera.id === f.camera.id), f.camera);
+    }
+  }
 });
 
 test('配置变化和源截图删除阻止应用旧结果', async (t) => {

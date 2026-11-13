@@ -3,8 +3,6 @@ import { createLocalRigRotation } from '#camera-rotation';
 import { httpError } from './errors.mjs';
 
 const rad = Math.PI / 180;
-const minimumSamples = 3;
-const minimumPanCoverage = 30;
 const maximumRmsPixels = 5;
 
 export function calibrationRange(startTime, endTime) {
@@ -194,10 +192,9 @@ export function estimatePAxisTilt(camera, snapshots, observations, requestedRang
     sourceSnapshotIds: samples.map((sample) => sample.snapshot.id),
     observations: observations.map(({ snapshotId, points }) => ({ snapshotId, points })), excluded, ...coverage,
   };
-  if (samples.length < minimumSamples || coverage.distinctPanCount < minimumSamples || coverage.panCoverageDegrees < minimumPanCoverage) {
+  if (!samples.length) {
     return { ...base, status: 'insufficient_data', installation: null,
-      requirements: { minimumSamples, minimumDistinctPanDirections: minimumSamples, minimumPanCoverageDegrees: minimumPanCoverage },
-      message: '至少需要 3 张停稳截图、3 个不同 P 方向，P 方向覆盖至少 30°；建议覆盖 90°以上' };
+      message: '没有有效的停稳截图和海天线标注，无法进行拟合' };
   }
   const starts = [[0, 0]];
   if ([camera.pAxisPitch, camera.pAxisRoll].every((value) => Number.isFinite(value) && Math.abs(value) < 89)) {
@@ -241,7 +238,7 @@ export function estimatePAxisTilt(camera, snapshots, observations, requestedRang
       'T 偏移与画面 Roll 修正作为固定输入，本次不估计这两项；设置不准会影响 P 轴倾斜结果',
       '截图与 PTZ 未确认严格同步；海天线不能验证安装高度或绝对朝向',
       '倾向方位基于当前保存的 P 偏移，不代表独立测得的绝对朝向',
-      ...(coverage.panCoverageDegrees < 90 ? ['P 方向覆盖不足 90°，结果对标注和固定画面偏差更敏感，建议补拍更多方向'] : [])],
+      '样本较少或采样方向集中时，结果对标注和固定参数误差更敏感'],
     message: accepted ? '已生成 P 轴倾斜估计，未修改摄像头配置'
       : '拟合未通过收敛、可辨识性或残差检查；请复核海天线、同步情况及已保存的 T 偏移和画面 Roll 修正',
   };
@@ -330,9 +327,9 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
     fixedCalibration: { longitude: camera.longitude, latitude: camera.latitude, height: camera.height,
       panOffset: camera.panOffset, cameraUpdatedAt: camera.updatedAt },
   };
-  if (samples.length < minimumSamples || coverage.distinctPanCount < minimumSamples || coverage.panCoverageDegrees < minimumPanCoverage) {
+  if (!samples.length) {
     return { ...base, status: 'insufficient_data', installation: null,
-      message: '至少需要 3 张停稳截图、3 个不同 P 方向，覆盖至少 30°；建议覆盖 90°以上' };
+      message: '没有有效的停稳截图和海天线标注，无法进行拟合' };
   }
   const current = [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
   const starts = [[0, 0, 0, 0]];
@@ -364,7 +361,7 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
     warnings: ['必须复核真实海天线；稳定的岸线误识别也可能得到较小残差',
       '经纬度、高度与默认朝向采用当前配置，海天线不能独立标定安装高度或绝对朝向',
       '截图与 PTZ 尚未确认严格同步；未建模潮汐、折射、畸变或稳像裁剪',
-      ...(coverage.panCoverageDegrees < 90 ? ['P 方向覆盖不足 90°，建议补充更多方向后复核'] : [])],
+      '样本较少或采样方向集中时，结果对标注和固定参数误差更敏感'],
     message: accepted ? '已生成四项安装参数，请复核后点击应用' : '拟合未通过收敛、可辨识性或 5 像素残差检查，请调整标注或忽略误识别图片',
   };
 }

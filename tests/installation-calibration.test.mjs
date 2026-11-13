@@ -71,9 +71,48 @@ test('四参数拟合角度 RMS 来自参与图像的真实观测射线残差', 
     JSON.stringify({ actual: result.diagnostics.rmsAngularResidualDegrees, expected }));
 });
 
-test('四参数拟合拒绝不足或狭窄方向，错误标注不能得到可应用结果', () => {
-  const narrow = syntheticSnapshots({ pans: [0, 5, 10] });
-  assert.equal(estimateInstallation(fixtureCamera, narrow.snapshots, narrow.observations, fixtureRange).status, 'insufficient_data');
+test('四参数拟合接受两张或跨 0° 的 22° 样本，仍要求可辨识并恢复真实参数', () => {
+  const actual = { ...fixtureCamera, tiltOffset: 1.1, imageRoll: -0.8 };
+  for (const pans of [[0, 120], [347, 358, 9]]) {
+    const data = syntheticSnapshots({ camera: actual, pans,
+      ptzOverrides: { Tilt: 2, Zoom: 8.8, HorizontalFieldAngle: 24, VerticalFieldAngle: 13.5 } });
+    data.observations.forEach((observation) => { observation.points.splice(1, 1); });
+    const before = JSON.stringify(data);
+    const result = estimateInstallation(fixtureCamera, data.snapshots, data.observations, fixtureRange);
+    assert.equal(result.status, 'estimated', JSON.stringify({ pans, result }));
+    for (const [key, value] of Object.entries({ pAxisPitch: 1.25, pAxisRoll: -2.1, tiltOffset: 1.1, imageRoll: -0.8 })) {
+      assert.ok(Math.abs(result.installation[key] - value) < 1e-4, key);
+    }
+    assert.ok(result.diagnostics.conditionNumber < 1e8);
+    assert.equal(JSON.stringify(data), before);
+  }
+});
+
+test('四参数拟合对单张或重复姿态保留不可辨识检查，不输出可应用参数', () => {
+  for (const pans of [[0], [0, 0, 0]]) {
+    const data = syntheticSnapshots({ pans,
+      ptzOverrides: { Tilt: 2, Zoom: 8.8, HorizontalFieldAngle: 24, VerticalFieldAngle: 13.5 } });
+    data.observations.forEach((observation) => { observation.points.splice(1, 1); });
+    const result = estimateInstallation(fixtureCamera, data.snapshots, data.observations, fixtureRange);
+    assert.equal(result.status, 'unreliable', JSON.stringify({ pans, result }));
+    assert.equal(result.installation, null);
+    assert.ok(result.diagnostics.conditionNumber === null || result.diagnostics.conditionNumber >= 1e8);
+  }
+});
+
+test('四参数拟合没有有效停稳样本时返回数据不足', () => {
+  const data = syntheticSnapshots();
+  const empty = estimateInstallation(fixtureCamera, data.snapshots, [], fixtureRange);
+  assert.equal(empty.status, 'insufficient_data');
+  assert.equal(empty.installation, null);
+  data.snapshots.forEach((snapshot) => { snapshot.poseChanged = true; });
+  const excluded = estimateInstallation(fixtureCamera, data.snapshots, data.observations, fixtureRange);
+  assert.equal(excluded.status, 'insufficient_data');
+  assert.equal(excluded.installation, null);
+  assert.equal(excluded.excluded.length, data.snapshots.length);
+});
+
+test('四参数拟合的错误标注不能得到可应用结果', () => {
   const { snapshots, observations } = syntheticSnapshots();
   observations[2].points = [{ x: 0.1, y: 0.05 }, { x: 0.9, y: 0.95 }];
   const result = estimateInstallation(fixtureCamera, snapshots, observations, fixtureRange);

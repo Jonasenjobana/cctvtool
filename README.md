@@ -48,6 +48,7 @@ npm test
 | [AGENTS.md](AGENTS.md) | 项目规则、文档入口与验证约束 | 开始项目工作时 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 仓库、分支命名、提交信息与合并流程 | 创建分支、提交、推送或合并前 |
 | [云台调试与标绘术语](GLOSSARY.md) | 预扫描、粗标定、正式扫描、海天线居中与标绘的含义 | 讨论分阶段采样、倾斜标定或图层管理时 |
+| [GeoJSON 标绘实施规格](.scratch/geojson-plotting/spec.md) | 导入边界、多个摄像头关联、独立显隐与页面交互契约 | 修改标绘管理、导入或摄像头关联时 |
 | [app.component.ts](src/app/app.component.ts) | 设备选择、表单草稿、轮询、控制及历史状态 | 修改页面行为时 |
 | [app.component.html](src/app/app.component.html) | 图标菜单、云台控件和安装表单 | 修改布局与字段时 |
 | [截图任务页面](src/app/snapshot-tasks.component.ts)、[任务模板](src/app/snapshot-tasks.component.html)、[截图条目](src/app/snapshot-item.component.ts) | 任务进度、暂停／继续、关联图片、右键删除和全景预览 | 修改任务页或截图交互时 |

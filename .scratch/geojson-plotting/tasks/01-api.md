@@ -1,7 +1,7 @@
 # 实现标绘持久化与 HTTP API
 
 Type: implementation
-Status: in-progress
+Status: in_progress
 Assignee: /root/plot_api
 Parent: [GeoJSON 标绘管理](../spec.md)
 Blocked by:

@@ -15,7 +15,7 @@ const instructions = `这是截图标定 MCP，所有工具只读，不移动摄
 只标注真实可见的远处海天线；不要将岸线、船体、养殖网、近处波浪或文字当作海天线。
 海天线不可见、遮挡或无法确认时跳过该图，不编造标注。
 每张图给出至少两个海天线点，覆盖尽可能宽的画面；x/y 为原图宽高归一化到 0～1 的坐标，原点在左上角。
-至少选择 3 张停稳截图和 3 个不同 P 方向，覆盖至少 30°，推荐 90°以上；poseChanged 的截图不用于拟合。
+选择停稳且海天线可确认的截图，poseChanged 的截图不用于拟合；按实际收敛、可辨识性及残差判断结果是否可靠。
 estimate_p_axis_tilt 从数据库读取原始 PTZ 和 FOV，调用者只提供截图 ID 和海天线点。
 返回 estimated 才有可复核的安装参数；unreliable 或 insufficient_data 不得宣称标定完成。
 返回的前后倾和左右倾与现有页面字段一致。经纬度、高度、P/T 偏移和画面 Roll 修正使用当前保存值；本工具只拟合 P 轴两个倾角，不估计 T 偏移或画面 Roll，不能由海天线推断绝对朝向或高度。
@@ -71,8 +71,7 @@ export function createCalibrationMcp(dataDir) {
     return dataResult({
       cameraId, ...range, timeField: 'createdAt', endExclusive: true, total: page.total,
       offset, nextOffset: offset + page.snapshots.length < page.total ? offset + page.snapshots.length : null,
-      pageSampling: { stableSnapshotCount: stable.length, ...panCoverage(stable.map((snapshot) => snapshot.ptz.raw.Pan)),
-        minimumSamples: 3, minimumDistinctPanDirections: 3, minimumPanCoverageDegrees: 30 },
+      pageSampling: { stableSnapshotCount: stable.length, ...panCoverage(stable.map((snapshot) => snapshot.ptz.raw.Pan)) },
       snapshots: page.snapshots.map((snapshot) => ({
         id: snapshot.id, cameraId: snapshot.cameraId, cameraName: snapshot.cameraName,
         groupId: snapshot.groupId ?? snapshot.id, scanIndex: snapshot.scanIndex,
@@ -101,7 +100,7 @@ export function createCalibrationMcp(dataDir) {
   }));
 
   server.registerTool('estimate_p_axis_tilt', {
-    description: '用指定截图的海天线归一化标注和数据库中的采样 PTZ/FOV 拟合 P 轴前后倾、左右倾。固定采用当前保存的经纬度、高度、P/T 偏移及画面 Roll 修正，不拟合这些固定项。至少 3 张停稳图、3 个不同 P，覆盖至少 30°。只生成结果，不修改配置；根据残差返回 estimated/unreliable/insufficient_data。',
+    description: '用指定停稳截图的海天线归一化标注和数据库中的采样 PTZ/FOV 拟合 P 轴前后倾、左右倾。固定采用当前保存的经纬度、高度、P/T 偏移及画面 Roll 修正，不拟合这些固定项。按实际收敛、可辨识性及残差判断质量。只生成结果，不修改配置；返回 estimated/unreliable/insufficient_data。',
     inputSchema: z.object({ ...rangeShape,
       observations: z.array(z.object({
         snapshotId: z.string().min(1),

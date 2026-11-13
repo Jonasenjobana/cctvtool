@@ -49,13 +49,33 @@ test('P 轴拟合固定采用当前 T 偏移和画面 Roll，非零修正不会�
   assert.throws(() => estimatePAxisTilt({ ...camera, tiltOffset: NaN }, data.snapshots, data.observations, fixtureRange), /T 偏移/);
 });
 
-test('样本不足、P 方向集中、移动样本和无效原始数据明确报告', () => {
+test('P 轴拟合接受单张、重复方向及跨 0° 的小范围样本，按实际质量决定结果', () => {
+  for (const pans of [[0], [0, 120], [15, 15, 15], [347, 358, 9], [359, 1, 4]]) {
+    const data = syntheticSnapshots({ pans });
+    const before = JSON.stringify(data);
+    const result = estimatePAxisTilt(fixtureCamera, data.snapshots, data.observations, fixtureRange);
+    assert.equal(result.status, 'estimated', JSON.stringify({ pans, result }));
+    assert.ok(Math.abs(result.installation.pAxisPitch - 1.25) < 1e-5);
+    assert.ok(Math.abs(result.installation.pAxisRoll + 2.1) < 1e-5);
+    assert.ok(result.diagnostics.conditionNumber < 1e8);
+    assert.equal(JSON.stringify(data), before);
+  }
+});
+
+test('没有有效停稳样本时明确返回数据不足', () => {
   const data = syntheticSnapshots();
-  const one = estimatePAxisTilt(fixtureCamera, data.snapshots, data.observations.slice(0, 1), fixtureRange);
-  assert.equal(one.status, 'insufficient_data');
-  assert.equal(one.installation, null);
-  const narrow = syntheticSnapshots({ pans: [359, 1, 4] });
-  assert.equal(estimatePAxisTilt(fixtureCamera, narrow.snapshots, narrow.observations, fixtureRange).status, 'insufficient_data');
+  const empty = estimatePAxisTilt(fixtureCamera, data.snapshots, [], fixtureRange);
+  assert.equal(empty.status, 'insufficient_data');
+  assert.equal(empty.installation, null);
+  data.snapshots.forEach((snapshot) => { snapshot.poseChanged = true; });
+  const excluded = estimatePAxisTilt(fixtureCamera, data.snapshots, data.observations, fixtureRange);
+  assert.equal(excluded.status, 'insufficient_data');
+  assert.equal(excluded.installation, null);
+  assert.equal(excluded.excluded.length, data.snapshots.length);
+});
+
+test('移动样本和无效原始数据被排除，其余样本仍能拟合', () => {
+  const data = syntheticSnapshots();
   data.snapshots[0].poseChanged = true;
   data.snapshots[1].ptz.raw.HorizontalFieldAngle = null;
   data.snapshots[2].serial = 'another-device';

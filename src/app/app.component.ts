@@ -1,28 +1,34 @@
 import { DatePipe, DecimalPipe } from '@angular/common';
-import { ChangeDetectionStrategy, Component, HostListener, ViewChild, computed, effect, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, HostListener, ViewChild, computed, effect, inject, signal, untracked } from '@angular/core';
 import type { OnDestroy } from '@angular/core';
+import { toObservable } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
-import { EMPTY, catchError, exhaustMap, firstValueFrom, timer } from 'rxjs';
+import { EMPTY, catchError, exhaustMap, firstValueFrom, switchMap, timer } from 'rxjs';
 import type { Subscription } from 'rxjs';
 import { ApiService, errorMessage } from './api.service';
 import { CameraSceneComponent } from './camera-scene.component';
+import type { TemporaryMapPoint } from './camera-scene.component';
+import { estimateVesselZoom, pointTargetPtz, vesselCorners } from './camera-math';
 import { IconComponent } from './icon.component';
 import { LiveVideoComponent } from './live-video.component';
 import { CalibrationHelpComponent } from './calibration-help.component';
 import { SnapshotItemComponent } from './snapshot-item.component';
 import { SnapshotTasksComponent } from './snapshot-tasks.component';
 import { RecognitionTasksComponent } from './recognition-tasks.component';
+import { PlotLayersComponent } from './plot-layers.component';
+import { PlotLayerState } from './plot-layer-state.service';
 import { HoldPtzControl } from './hold-ptz-control';
-import { emptyCamera, snapshotTaskStatus } from './models';
-import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, Snapshot, SnapshotGroup } from './models';
+import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
+import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
+import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
-const editableKeys = ['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
-type NumericField = 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
+const editableKeys = ['name', 'serial', 'code', 'maxZoom', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
+type NumericField = 'maxZoom' | 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent],
+  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent, PlotLayersComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './app.component.html',
   styleUrl: './app.component.css',
@@ -31,10 +37,12 @@ export class AppComponent implements OnDestroy {
   @ViewChild(CameraSceneComponent) scene?: CameraSceneComponent;
   @ViewChild(RecognitionTasksComponent) recognition?: RecognitionTasksComponent;
   private readonly api = inject(ApiService);
+  readonly plots = inject(PlotLayerState);
   readonly cameras = signal<Camera[]>([]);
   readonly selectedId = signal('');
   readonly draft = signal<CameraDraft>(emptyCamera());
   readonly reading = signal<PtzReading | null>(null);
+  readonly ptzPollingIntervalSeconds = signal(10);
   readonly stale = signal(true);
   readonly snapshots = signal<Snapshot[]>([]);
   readonly snapshotGroups = signal<SnapshotGroup[]>([]);
@@ -43,11 +51,43 @@ export class AppComponent implements OnDestroy {
   readonly nextSnapshotOffset = signal<number | null>(null);
   readonly groupLoading = signal(false);
   readonly deletingSnapshot = signal(false);
-  readonly page = signal<'scene' | 'tasks' | 'recognition'>('scene');
+  readonly page = signal<'scene' | 'tasks' | 'recognition' | 'plotting'>('scene');
+  readonly showPlotPanel = signal(false);
+  readonly showTemporaryPoints = signal(false);
+  readonly temporaryPoints = signal<readonly TemporaryMapPoint[]>([]);
+  readonly pointLongitude = signal<number | null>(null);
+  readonly pointLatitude = signal<number | null>(null);
+  readonly pointLength = signal<number | null>(null);
+  readonly pointWidth = signal<number | null>(null);
+  readonly pointHeading = signal<number | null>(0);
+  readonly pointHeight = signal<number | null>(null);
+  readonly editingPointId = signal<number | null>(null);
+  readonly pointError = signal('');
+  private nextTemporaryPointId = 0;
+  readonly plotPreparing = signal(false);
+  readonly plotFocusRequest = signal<PlotLayerFocusRequest | null>(null);
+  readonly cameraPlotLayers = computed(() => {
+    const id = this.selectedId();
+    return id ? this.plots.layers().filter((layer) => layer.associations.some((association) => association.cameraId === id)) : [];
+  });
+  readonly plotRenderLayers = computed<readonly PlotLayerRenderInput[]>(() => {
+    const texts = this.plots.texts(), cameraId = this.selectedId();
+    return this.cameraPlotLayers().flatMap((layer) => {
+      const text = texts.get(layer.id);
+      return text === undefined ? [] : [{ id: layer.id, name: layer.name, geojsonText: text,
+        visible: layer.associations.find((association) => association.cameraId === cameraId)!.visible }];
+    });
+  });
   readonly recognitionTaskId = signal('');
+  readonly snapshotTaskId = signal('');
   readonly taskStatuses = snapshotTaskStatus;
+  readonly taskName = snapshotTaskName;
+  readonly scanMode = signal<'fixed' | 'horizon'>('fixed');
   readonly scanPanMin = signal<number | null>(0);
   readonly scanPanMax = signal<number | null>(150);
+  readonly preScanZoom = signal<number | null>(1);
+  readonly scanTiltMin = signal<number | null>(-90);
+  readonly scanTiltMax = signal<number | null>(90);
   readonly currentScan = computed(() => this.snapshotGroups().find((group) => group.kind === 'scan' && ['running', 'pausing'].includes(group.status))
     || this.snapshotGroups().find((group) => group.kind === 'scan') || null);
   readonly scanning = computed(() => ['running', 'pausing'].includes(this.currentScan()?.status || ''));
@@ -88,12 +128,14 @@ export class AppComponent implements OnDestroy {
   private pressedButton: HTMLButtonElement | null = null;
   private keyboardHeld = false;
   readonly selectedCamera = computed(() => this.cameras().find((camera) => camera.id === this.selectedId()) || null);
+  readonly pointZoomMax = computed(() => this.selectedCamera()?.maxZoom ?? 73);
   readonly currentReading = computed(() => this.selectedSnapshot()?.ptz || this.reading());
   readonly sceneReading = computed(() => this.selectedSnapshot()?.ptz || (this.stale() ? null : this.reading()));
   readonly formValue = computed<CameraDraft>(() => {
     const snapshot = this.selectedSnapshot();
     return snapshot ? {
-      name: snapshot.cameraName, serial: snapshot.serial, code: snapshot.code, ...snapshot.calibration,
+      name: snapshot.cameraName, serial: snapshot.serial, code: snapshot.code,
+      maxZoom: this.selectedCamera()?.maxZoom, ...snapshot.calibration,
     } : this.draft();
   });
   readonly sceneCamera = computed(() => this.selectedId() ? this.formValue() : null);
@@ -114,6 +156,7 @@ export class AppComponent implements OnDestroy {
   readonly formValid = computed(() => {
     const draft = this.draft();
     return [draft.name, draft.serial, draft.code].every((value) => value.trim().length > 0)
+      && this.inRange(draft.maxZoom ?? null, 1, Number.MAX_VALUE)
       && this.inRange(draft.longitude, -180, 180, true)
       && this.inRange(draft.latitude, -90, 90, true)
       && this.inRange(draft.height, 0, 100000, true)
@@ -128,11 +171,31 @@ export class AppComponent implements OnDestroy {
   readonly canPrecise = computed(() => {
     const target = this.preciseTarget();
     return Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning()
-      && this.inRange(target.pan, 0, 360) && this.inRange(target.tilt, 0, 360) && this.inRange(target.zoom, 1, Number.MAX_VALUE));
+      && this.inRange(target.pan, 0, 360) && this.inRange(target.tilt, -90, 90) && this.inRange(target.zoom, 1, this.pointZoomMax()));
   });
   readonly canCapture = computed(() => Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning() && this.formValid()));
-  readonly canScan = computed(() => this.canCapture() && this.inRange(this.scanPanMin(), 0, 360)
-    && this.inRange(this.scanPanMax(), 0, 360) && this.scanPanMax()! > this.scanPanMin()!);
+  readonly canTrackPoint = computed(() => this.page() === 'scene' && this.canCapture() && !this.stale() && !!this.reading()
+    && this.draft().serial === this.selectedCamera()?.serial && this.draft().code === this.selectedCamera()?.code);
+  readonly pointTargets = computed(() => {
+    const reading = this.reading();
+    return this.temporaryPoints().map((point) => {
+      if (!this.selectedId() || !reading || this.stale() || this.selectedSnapshot()) return { point, target: null, framing: null, error: '' };
+      try { return { point, ...this.calculatePointTarget(point, reading.raw), error: '' }; }
+      catch (error) { return { point, target: null, framing: null, error: errorMessage(error) }; }
+    });
+  });
+  readonly canScan = computed(() => {
+    const panMin = this.scanPanMin()!;
+    const panMax = this.scanPanMax()!;
+    const panSpan = panMax - panMin + (panMax < panMin ? 360 : 0);
+    return this.canCapture() && this.inRange(panMin, 0, 360) && this.inRange(panMax, 0, 360) && panSpan > 0
+      && (this.scanMode() === 'fixed' || (!this.stale() && !!this.reading()
+        && panMax - panMin >= 30
+        && this.inRange(this.preScanZoom(), 1, Number.MAX_VALUE) && this.preScanZoom()! < this.reading()!.raw.Zoom
+        && this.inRange(this.scanTiltMin(), -90, 90) && this.inRange(this.scanTiltMax(), -90, 90)
+        && this.scanTiltMin()! < this.scanTiltMax()!
+        && this.inRange(this.reading()!.raw.Tilt, this.scanTiltMin()!, this.scanTiltMax()!)));
+  });
   private readonly pollingPaused = computed(() => this.operating() === 'snapshot');
   private readonly holdControl = new HoldPtzControl(
     (id, command, speed, keepalive) => this.api.control(id, command, speed, keepalive),
@@ -148,18 +211,38 @@ export class AppComponent implements OnDestroy {
   private groupRevision = 0;
   private preciseRevision = 0;
   private playbackSubscription?: Subscription;
+  private plotNavigationRevision = 0;
+  private plotRequestId = 0;
 
   constructor() {
+    const ptzPollingInterval = toObservable(this.ptzPollingIntervalSeconds);
+    effect(() => {
+      const id = this.selectedId(), page = this.page();
+      if ((page === 'scene' && id) || page === 'plotting') untracked(() => { void this.plots.refresh(); });
+    });
+    effect(() => {
+      const layers = this.cameraPlotLayers(), page = this.page(), loading = this.plots.loading();
+      if (page === 'scene' && !loading && layers.length) untracked(() => { void this.plots.loadDetails(layers.map((layer) => layer.id)); });
+    });
+    effect(() => {
+      const problem = this.plots.problem(), errors = this.plots.layerErrors();
+      const hasLayerError = this.cameraPlotLayers().some((layer) => errors.has(layer.id));
+      if (this.page() === 'scene' && (problem || hasLayerError)) this.showPlotPanel.set(true);
+    });
     effect((onCleanup) => {
       const id = this.selectedId();
       if (!id || this.pollingPaused()) return;
-      const subscription = timer(0, 1000).pipe(exhaustMap(() => this.api.ptz(id).pipe(
-        catchError((error: unknown) => {
-          this.stale.set(true);
-          this.liveError.set(errorMessage(error));
-          return EMPTY;
-        }),
-      ))).subscribe((reading) => {
+      // 只重建定时器，保留 exhaustMap 内的在途请求，避免调整间隔时重复回读。
+      const subscription = ptzPollingInterval.pipe(
+        switchMap((seconds) => timer(0, seconds * 1000)),
+        exhaustMap(() => this.api.ptz(id).pipe(
+          catchError((error: unknown) => {
+            this.stale.set(true);
+            this.liveError.set(errorMessage(error));
+            return EMPTY;
+          }),
+        )),
+      ).subscribe((reading) => {
         this.reading.set(reading);
         this.stale.set(false);
         this.liveError.set('');
@@ -179,6 +262,10 @@ export class AppComponent implements OnDestroy {
 
   private inRange(value: number | null, min: number, max: number, nullable = false) {
     return value === null ? nullable : Number.isFinite(value) && value >= min && value <= max;
+  }
+
+  setPtzPollingInterval(input: HTMLInputElement) {
+    if (input.reportValidity()) this.ptzPollingIntervalSeconds.set(input.valueAsNumber);
   }
 
   loadPlayback() {
@@ -211,8 +298,10 @@ export class AppComponent implements OnDestroy {
   }
 
   private activate(camera: Camera) {
-    const { name, serial, code, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
-    this.draft.set({ name, serial, code, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll });
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
+    const { name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
+    this.draft.set({ name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll });
     this.selectedId.set(camera.id);
     this.reading.set(null);
     this.stale.set(true);
@@ -239,22 +328,168 @@ export class AppComponent implements OnDestroy {
   }
 
   selectCamera(camera: Camera) {
-    if (this.operating() || this.saving()) return;
-    if (this.isDirty() && !window.confirm('当前参数尚未保存，确定切换并放弃修改？')) return;
+    if (this.operating() || this.saving()) return false;
+    if (this.isDirty() && !window.confirm('当前参数尚未保存，确定切换并放弃修改？')) return false;
     this.activate(camera);
     this.panel.set(null);
+    return true;
   }
 
   openRecognition(id: string) {
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.recognitionTaskId.set(id);
     this.page.set('recognition');
     this.panel.set(null);
   }
 
-  async openPage(page: 'scene' | 'tasks' | 'recognition') {
-    if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return;
-    this.page.set(page);
+  openSnapshotTask(group: SnapshotGroup) {
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
+    this.snapshotTaskId.set(group.id);
+    if (this.selectedId() === group.cameraId) {
+      this.snapshotGroups.update((groups) => [group, ...groups.filter((item) => item.id !== group.id)]);
+    }
+    this.page.set('tasks');
     this.panel.set(null);
+  }
+
+  async openPage(page: 'scene' | 'tasks' | 'recognition' | 'plotting') {
+    const revision = ++this.plotNavigationRevision;
+    if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return false;
+    if (revision !== this.plotNavigationRevision) return false;
+    this.plotFocusRequest.set(null);
+    this.page.set(page);
+    this.showTemporaryPoints.set(false);
+    this.panel.set(null);
+    return true;
+  }
+
+  togglePlotPanel() {
+    this.showPlotPanel.update((show) => !show);
+    this.showTemporaryPoints.set(false);
+    this.panel.set(null);
+    if (this.showPlotPanel() && this.selectedId()) void this.plots.refresh();
+  }
+
+  toggleTemporaryPoints() {
+    this.showTemporaryPoints.update((show) => !show);
+    this.showPlotPanel.set(false);
+    this.panel.set(null);
+  }
+
+  addTemporaryPoint() {
+    const longitude = this.pointLongitude(), latitude = this.pointLatitude();
+    if (longitude === null || latitude === null || !Number.isFinite(longitude) || !Number.isFinite(latitude)
+      || Math.abs(longitude) > 180 || Math.abs(latitude) > 90) {
+      this.pointError.set('请输入有效经纬度：经度 -180～180，纬度 -90～90');
+      return;
+    }
+    const hasVessel = this.pointLength() !== null || this.pointWidth() !== null || this.pointHeight() !== null || this.pointHeading() !== 0;
+    const vessel = hasVessel ? { length: this.pointLength()!, width: this.pointWidth()!, heading: this.pointHeading()!,
+      height: this.pointHeight() ?? undefined } : undefined;
+    const id = this.editingPointId();
+    const point: TemporaryMapPoint = { id: id ?? this.nextTemporaryPointId + 1, longitude, latitude, vessel };
+    try { if (vessel) vesselCorners(point, vessel); }
+    catch (error) { this.pointError.set(errorMessage(error)); return; }
+    if (id !== null) this.temporaryPoints.update((points) => points.map((item) => item.id === id ? point : item));
+    else {
+      this.nextTemporaryPointId = point.id;
+      this.temporaryPoints.update((points) => [...points, point]);
+    }
+    this.editingPointId.set(null);
+    this.pointError.set('');
+  }
+
+  editTemporaryPoint(point: TemporaryMapPoint) {
+    this.editingPointId.set(point.id);
+    this.pointLongitude.set(point.longitude);
+    this.pointLatitude.set(point.latitude);
+    this.pointLength.set(point.vessel?.length ?? null);
+    this.pointWidth.set(point.vessel?.width ?? null);
+    this.pointHeading.set(point.vessel?.heading ?? 0);
+    this.pointHeight.set(point.vessel?.height ?? null);
+    this.pointError.set('');
+  }
+
+  resetTemporaryPointForm() {
+    this.editingPointId.set(null);
+    this.pointLongitude.set(null);
+    this.pointLatitude.set(null);
+    this.pointLength.set(null);
+    this.pointWidth.set(null);
+    this.pointHeading.set(0);
+    this.pointHeight.set(null);
+    this.pointError.set('');
+  }
+
+  clearTemporaryPoints() {
+    this.temporaryPoints.set([]);
+    this.resetTemporaryPointForm();
+  }
+
+  removeTemporaryPoint(id: number) {
+    this.temporaryPoints.update((points) => points.filter((point) => point.id !== id));
+    if (this.editingPointId() === id) this.resetTemporaryPointForm();
+  }
+
+  private calculatePointTarget(point: TemporaryMapPoint, reading: RawPtz) {
+    const camera = this.draft();
+    const target = pointTargetPtz(camera, reading, point);
+    const framing = point.vessel ? estimateVesselZoom(camera, reading, point, point.vessel, target, this.pointZoomMax()) : null;
+    return { target: framing ? { ...target, zoom: framing.zoom } : target, framing };
+  }
+
+  focusTemporaryPoint(point: TemporaryMapPoint) {
+    this.plotFocusRequest.set(null);
+    this.following.set(false);
+    this.scene?.focusTemporaryPoint(point);
+  }
+
+  plotVisibility(layerId: string) {
+    return this.plots.layers().find((layer) => layer.id === layerId)?.associations.find((association) => association.cameraId === this.selectedId())?.visible;
+  }
+
+  async togglePlotVisibility(layerId: string) {
+    const visible = this.plotVisibility(layerId);
+    if (visible !== undefined && !this.plotPreparing()) await this.plots.setVisibility(layerId, this.selectedId(), !visible);
+  }
+
+  async focusPlotLayer(request: { layerId: string; cameraId: string }) {
+    if (this.plotPreparing() || this.plots.busy() || this.plots.loading() || this.operating() || this.saving()) return;
+    const camera = this.cameras().find((item) => item.id === request.cameraId);
+    const association = this.plots.layers().find((layer) => layer.id === request.layerId)?.associations.find((item) => item.cameraId === request.cameraId);
+    if (!camera || !association) { this.plots.problem.set('请先将图层关联到目标摄像头'); return; }
+    const revision = this.plotNavigationRevision;
+    this.plotPreparing.set(true);
+    this.plotFocusRequest.set(null);
+    this.plots.problem.set('');
+    try {
+      if (!association.visible && !await this.plots.setVisibility(request.layerId, request.cameraId, true)) return;
+      if (revision !== this.plotNavigationRevision) return;
+      if (!await this.plots.loadDetails([request.layerId]) || revision !== this.plotNavigationRevision) return;
+      if (this.operating() || this.saving()) { this.plots.problem.set('当前操作尚未结束，请稍后定位'); return; }
+      if (this.selectedId() !== camera.id && !this.selectCamera(camera)) {
+        this.plots.problem.set('摄像头未切换，已取消定位');
+        return;
+      }
+      if (!await this.openPage('scene')) { this.plots.problem.set('当前页面未能离开，已取消定位'); return; }
+      if (this.selectedId() !== camera.id || this.page() !== 'scene') return;
+      // activate 会恢复跟随；仅在切换摄像头和切页都成功后关闭，定位只改变地图观察。
+      this.following.set(false);
+      this.showPlotPanel.set(true);
+      this.plotFocusRequest.set({ layerId: request.layerId, requestId: ++this.plotRequestId });
+    } finally { this.plotPreparing.set(false); }
+  }
+
+  onPlotLayerError(error: PlotLayerError) {
+    if (this.page() === 'scene' && this.cameraPlotLayers().some((layer) => layer.id === error.layerId)) this.plots.reportLayerError(error);
+  }
+
+  onPlotFocusResult(result: PlotLayerFocusResult) {
+    if (result.requestId !== this.plotFocusRequest()?.requestId || this.page() !== 'scene') return;
+    this.plotFocusRequest.set(null);
+    if (!result.success) this.plots.problem.set(result.message || '图层定位失败，请刷新后重试');
   }
 
   installationApplied(camera: Camera) {
@@ -269,6 +504,8 @@ export class AppComponent implements OnDestroy {
   newCamera() {
     if (this.operating() || this.saving()) return;
     if (this.isDirty() && !window.confirm('当前参数尚未保存，确定放弃修改并注册设备？')) return;
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.selectedId.set('');
     this.draft.set(emptyCamera());
     this.reading.set(null);
@@ -318,6 +555,7 @@ export class AppComponent implements OnDestroy {
     const id = this.selectedId();
     const input: CameraInput = {
       name: this.draft().name.trim(), serial: this.draft().serial.trim(), code: this.draft().code.trim(),
+      maxZoom: this.draft().maxZoom!,
       ...this.calibration(),
     };
     const channelChanged = this.selectedCamera()?.serial !== input.serial || this.selectedCamera()?.code !== input.code;
@@ -411,19 +649,39 @@ export class AppComponent implements OnDestroy {
     if (raw && !this.stale()) this.preciseTarget.set({ pan: raw.Pan, tilt: raw.Tilt, zoom: raw.Zoom });
   }
 
-  async sendPrecise() {
-    if (!this.canPrecise()) return;
+  async sendPrecise(point?: TemporaryMapPoint) {
+    if (point ? !this.canTrackPoint() : !this.canPrecise()) return;
     const revision = ++this.preciseRevision;
     const id = this.selectedId();
+    const navigationRevision = this.plotNavigationRevision;
     this.operating.set('precise');
     this.operationError.set('');
     this.operationMessage.set('');
-    const { pan, tilt, zoom } = this.preciseTarget();
     try {
-      const result = await this.api.precise(id, { pan: pan!, tilt: tilt!, zoom: zoom! });
+      let target: PreciseTarget;
+      if (point) {
+        // 点击后重新回读 Z/FOV；停止、切页或目标修改、删除后不发送迟到的定位。
+        const reading = await firstValueFrom(this.api.ptz(id));
+        if (revision !== this.preciseRevision || this.selectedId() !== id || this.page() !== 'scene'
+          || navigationRevision !== this.plotNavigationRevision
+          || !this.temporaryPoints().some((item) => item === point)) return;
+        this.reading.set(reading);
+        this.stale.set(false);
+        this.liveError.set('');
+        const camera = this.draft(), saved = this.selectedCamera();
+        if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) {
+          throw new Error('请检查安装参数，并先保存设备通道修改后再追踪');
+        }
+        target = this.calculatePointTarget(point, reading.raw).target;
+        this.preciseTarget.set(target);
+      } else {
+        const { pan, tilt, zoom } = this.preciseTarget();
+        target = { pan: pan!, tilt: tilt!, zoom: zoom! };
+      }
+      const result = await this.api.precise(id, target);
       if (revision !== this.preciseRevision || this.selectedId() !== id) return;
       this.controlTarget.set(result.target);
-      this.operationMessage.set('精确定位指令已发送，位置以回读为准');
+      this.operationMessage.set(point ? `点 ${point.id} 追踪指令已发送，位置以回读为准` : '精确定位指令已发送，位置以回读为准');
     } catch (error) {
       if (revision === this.preciseRevision && this.selectedId() === id) this.operationError.set(errorMessage(error));
     } finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }
@@ -453,15 +711,24 @@ export class AppComponent implements OnDestroy {
     const calibration = this.calibration();
     const panMin = this.scanPanMin()!;
     const panMax = this.scanPanMax()!;
+    const horizon = this.scanMode() === 'horizon'
+      ? { preScanZoom: this.preScanZoom()!, tiltMin: this.scanTiltMin()!, tiltMax: this.scanTiltMax()! } : undefined;
     this.operating.set('scan');
     this.operationError.set('');
     this.operationMessage.set('');
     try {
       const reading = await firstValueFrom(this.api.ptz(id));
       const { Pan: pan, Tilt: tilt, Zoom: zoom } = reading.raw;
-      const group = await this.api.startSnapshotScan(id, { pan, tilt, zoom }, panMin, panMax, calibration);
+      if (horizon && (horizon.preScanZoom >= zoom || tilt < horizon.tiltMin || tilt > horizon.tiltMax)) {
+        this.operationError.set('当前回读已变化：预扫倍率须低于当前倍率，且当前 T 须位于允许范围内');
+        return;
+      }
+      const group = await this.api.startSnapshotScan(id, { pan, tilt, zoom }, panMin, panMax, calibration, horizon);
       this.snapshotGroups.update((groups) => [group, ...groups]);
-      this.operationMessage.set(`自动截图已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${zoom}`);
+      this.snapshotTaskId.set(group.id);
+      this.operationMessage.set(horizon
+        ? `海天线预扫描已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${horizon.preScanZoom}，正式目标 Z ${zoom}`
+        : `自动截图已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${zoom}`);
     } catch (error) { this.operationError.set(errorMessage(error)); }
     finally { this.operating.set(null); }
   }
@@ -474,7 +741,7 @@ export class AppComponent implements OnDestroy {
     try {
       const updated = await this.api.taskAction(group.id, action);
       this.snapshotGroups.update((groups) => groups.map((item) => item.id === updated.id ? updated : item));
-      this.operationMessage.set(`自动截图${this.taskStatuses[updated.status]}${action === 'start' ? '，沿用本任务原来的 T/Z' : ''}`);
+      this.operationMessage.set(`${this.taskName(updated)}${this.taskStatuses[updated.status]}${action === 'start' ? '，沿用本任务原采样计划' : ''}`);
     } catch (error) { this.operationError.set(errorMessage(error)); }
     finally { this.operating.set(null); }
   }
@@ -559,19 +826,24 @@ export class AppComponent implements OnDestroy {
       if (this.isDirty() && !window.confirm('当前参数尚未保存，确定切换并放弃修改？')) return;
       this.activate(camera);
     }
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.page.set('scene');
     this.viewSnapshot(snapshot);
   }
 
   async togglePanel(panel: 'devices' | 'snapshots') {
-    if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return;
-    this.page.set('scene');
-    this.panel.set(this.panel() === panel ? null : panel);
+    const previous = this.panel();
+    if (!await this.openPage('scene')) return;
+    this.showPlotPanel.set(false);
+    this.panel.set(previous === panel ? null : panel);
     if (this.panel() === 'snapshots') void this.loadSnapshots();
   }
 
   viewSnapshot(snapshot: Snapshot) {
     if (this.operating() || this.saving()) return;
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.selectedSnapshot.set(snapshot);
     this.hidePreview.set(false);
     this.following.set(true);
@@ -582,6 +854,7 @@ export class AppComponent implements OnDestroy {
   bestView() { this.scene?.focus(); }
   overview() { this.following.set(false); this.scene?.overview(); }
   ngOnDestroy() {
+    this.plotNavigationRevision++;
     this.playbackSubscription?.unsubscribe();
     void this.holdControl.release(true);
   }

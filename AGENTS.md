@@ -17,6 +17,7 @@
 | [docs/MCP使用说明.md](docs/MCP使用说明.md) | MCP 配置、认证、模型调用与排错 | 修改 MCP 或 ESSLD 接入时 |
 | [GLOSSARY.md](GLOSSARY.md) | 海天线采样与标定术语 | 讨论预扫描、粗标定和正式扫描时 |
 | [.scratch/horizon-aware-scan/map.md](.scratch/horizon-aware-scan/map.md) | 高倍率采样方案的决策地图与本地决策票 | 继续该方案研究时；其中候选方案不代表当前产品行为 |
+| [.scratch/horizon-vertical-drift/map.md](.scratch/horizon-vertical-drift/map.md) | 海天线变倍与转向垂直偏差的证据、验证与修正决策 | 排查低倍对齐后高倍或转向出现上下错位时 |
 
 ## 环境与验证
 

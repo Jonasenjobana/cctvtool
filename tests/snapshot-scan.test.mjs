@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server/app.mjs';
 import { CameraStore } from '../server/store.mjs';
-import { createScanPlan, scanTarget } from '../server/snapshot-scan.mjs';
+import { createScanPlan, ptzMatches, scanTarget } from '../server/snapshot-scan.mjs';
 import { httpError } from '../server/errors.mjs';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK1sAAAAASUVORK5CYII=', 'base64');
@@ -87,9 +87,94 @@ test('扇区按 HFOV 向上取整并等分取中心，150°/30°产生 5 个位�
   assert.ok(uneven.panStep < 30);
   assert.ok(scanTarget(uneven, 0).pan > 100 && scanTarget(uneven, 5).pan < 251);
   assert.equal(createScanPlan({ basePtz, panMin: 0, panMax: 150 }, 0.5).sampleCount, 300);
-  assert.throws(() => createScanPlan({ basePtz, panMin: 150, panMax: 0 }, 30), /最大 P/);
+  assert.throws(() => createScanPlan({ basePtz, panMin: 150, panMax: 150 }, 30), /P.*跨度/);
   for (const fov of [0, null, NaN, 180]) assert.throws(() => createScanPlan({ basePtz, panMin: 0, panMax: 150 }, fov), /视场角/);
   assert.throws(() => createScanPlan({ basePtz, panMin: 0, panMax: 360 }, 0.001), /10000/);
+  for (const tilt of [-91, 91, 359.9275]) {
+    assert.throws(() => createScanPlan({ basePtz: { ...basePtz, tilt }, panMin: 0, panMax: 30 }, 30), /基础 T/);
+  }
+});
+
+test('P 按环形角比较，T 直接比较有符号差值，不接受 359 度包装成负角', () => {
+  const raw = { Pan: 359.95, Tilt: -0.0725, Zoom: 8 };
+  const target = { pan: 0.05, tilt: -0.0725, zoom: 8 };
+  assert.equal(ptzMatches(raw, target), true);
+  assert.equal(ptzMatches({ ...raw, Tilt: 359.9275 }, target), false);
+  assert.equal(ptzMatches({ ...raw, Tilt: 0.2 }, target), false);
+});
+
+test('普通扫描接受负 T，并在控制、快照与任务记录中保留原值', async (t) => {
+  const f = await fixture(t);
+  f.state.raw.Tilt = -2.8;
+  const response = await startScan(f, { panMax: 30 });
+  assert.equal(response.statusCode, 202, response.body);
+  const group = await waitForGroup(f, response.json().id);
+  assert.equal(group.status, 'completed', group.error);
+  assert.equal(group.basePtz.tilt, -2.8);
+  assert.deepEqual(f.state.targets, [{ pan: 15, tilt: -2.8, zoom: 15 }]);
+  const { snapshots } = (await f.app.inject(`/api/snapshot-groups/${group.id}/snapshots`)).json();
+  assert.equal(snapshots[0].ptz.raw.Tilt, -2.8);
+  assert.equal(snapshots[0].scanTarget.tilt, -2.8);
+});
+
+test('普通截图从大 P 跨 0° 到小 P，347° 到 9° 只采样 22° 且固定 T/Z', () => {
+  const basePtz = { pan: 347, tilt: 2.8, zoom: 15 };
+  const plan = createScanPlan({ basePtz, panMin: 347, panMax: 9 }, 8);
+  assert.equal(plan.panMin, 347);
+  assert.equal(plan.panMax, 9);
+  assert.equal(plan.sampleCount, 3);
+  assert.equal(plan.panStep, 22 / 3);
+  assert.deepEqual(Array.from({ length: plan.sampleCount }, (_, index) => scanTarget(plan, index)),
+    [350.666667, 358, 5.333333].map((pan) => ({ pan, tilt: 2.8, zoom: 15 })));
+});
+
+test('普通截图正确处理 0°/360° 边界，保留全周扫描并拒绝零跨度', () => {
+  const basePtz = { pan: 347, tilt: 2.8, zoom: 15 };
+  const zeroCenter = createScanPlan({ basePtz, panMin: 347, panMax: 13 }, 30);
+  assert.equal(zeroCenter.sampleCount, 1);
+  assert.equal(scanTarget(zeroCenter, 0).pan, 0);
+  const from360 = createScanPlan({ basePtz, panMin: 360, panMax: 9 }, 3);
+  assert.deepEqual(Array.from({ length: from360.sampleCount }, (_, index) => scanTarget(from360, index).pan), [1.5, 4.5, 7.5]);
+  const toZero = createScanPlan({ basePtz, panMin: 350, panMax: 0 }, 5);
+  assert.deepEqual(Array.from({ length: toZero.sampleCount }, (_, index) => scanTarget(toZero, index).pan), [352.5, 357.5]);
+  assert.equal(createScanPlan({ basePtz, panMin: 0, panMax: 360 }, 30).sampleCount, 12);
+  for (const [panMin, panMax] of [[9, 9], [0, 0], [360, 360], [360, 0]]) {
+    assert.throws(() => createScanPlan({ basePtz, panMin, panMax }, 30), /P.*范围|P.*跨度/);
+  }
+});
+
+test('跨 0° 任务保存短扇区，重启后从未完成位置继续并保留原始 T/Z', async (t) => {
+  const f = await fixture(t);
+  f.state.raw = { ...f.state.raw, Pan: 347, HorizontalFieldAngle: 8 };
+  f.state.failAt = 3;
+  t.mock.method(console, 'error', () => {});
+  const response = await startScan(f, { panMin: 347, panMax: 9 });
+  assert.equal(response.statusCode, 202, response.body);
+  const accepted = response.json();
+  assert.equal(accepted.sampleCount, 3);
+  assert.equal(accepted.panStep, 22 / 3);
+  const failed = await waitForGroup(f, accepted.id);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.completedCount, 2);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  const restored = (await f.app.inject(`/api/snapshot-groups/${accepted.id}`)).json();
+  assert.equal(restored.panMin, 347);
+  assert.equal(restored.panMax, 9);
+  assert.equal(restored.panStep, 22 / 3);
+  f.state.failAt = 0;
+  f.state.raw = { ...f.state.raw, Tilt: 8, Zoom: 40 };
+  const resumed = await f.app.inject({ method: 'POST', url: `/api/snapshot-tasks/${accepted.id}/start` });
+  assert.equal(resumed.statusCode, 202, resumed.body);
+  const completed = await waitForGroup(f, accepted.id);
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.completedCount, 3);
+  const images = (await f.app.inject(`/api/snapshot-groups/${accepted.id}/snapshots`)).json().snapshots;
+  assert.deepEqual(images.map((image) => image.scanIndex), [0, 1, 2]);
+  assert.deepEqual(images.map((image) => image.scanTarget),
+    [350.666667, 358, 5.333333].map((pan) => ({ pan, tilt: 2.8, zoom: 15 })));
+  assert.deepEqual(images.map((image) => image.ptz.raw.Pan), [350.666667, 358, 5.333333]);
+  assert.ok(images.every((image) => image.ptz.raw.Tilt === 2.8 && image.ptz.raw.Zoom === 15));
 });
 
 test('扫描立即返回任务组，逐点精确定位后保存真实前后 PTZ，任务与组内图片均分页', async (t) => {
@@ -255,7 +340,8 @@ test('取消任务等待在途请求后停止，重启不自动驱动设备，pa
 test('无效基础 PTZ、范围、FOV、分页参数不会驱动设备；未到位超时和截图时姿态变化不会存坏样本', async (t) => {
   const f = await fixture(t);
   assert.equal((await startScan(f, { basePtz: { pan: 60, tilt: 2.8, zoom: 10 } })).statusCode, 409);
-  assert.equal((await startScan(f, { panMin: 150, panMax: 0 })).statusCode, 400);
+  assert.equal((await startScan(f, { panMin: 150, panMax: 150 })).statusCode, 400);
+  assert.equal((await startScan(f, { panMin: 360, panMax: 0 })).statusCode, 400);
   assert.equal((await startScan(f, { panMax: 361 })).statusCode, 400);
   f.state.raw.HorizontalFieldAngle = null;
   assert.equal((await startScan(f)).statusCode, 502);

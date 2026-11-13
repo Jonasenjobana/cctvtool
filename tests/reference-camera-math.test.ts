@@ -10,7 +10,7 @@ interface ReferenceCase {
   name: string;
   camera: CameraDraft;
   ptz: RawPtz;
-  expected: Record<'position' | 'direction' | 'right' | 'up' | 'panAxis' | 'videoPlane' | 'uvScale', number[]> & {
+  expected: Record<'position' | 'direction' | 'right' | 'up' | 'panAxis' | 'videoPlane', number[]> & {
     horizon: { x: number; y: number }[];
     observationFov: { aspect: number; value: number }[];
   };
@@ -53,10 +53,8 @@ test('同一 PTZ 与安装参数的海天线、视频截面和最佳观察与参
   for (const fixture of cases) {
     const pose = createCameraPose(fixture.camera, fixture.ptz);
     for (const point of fixture.expected.horizon) near(horizonY(pose, point.x), point.y, 1e-7, `${fixture.name}/horizon-${point.x}`);
-    const plane = videoFovPlane(pose, 500, 16 / 9);
+    const plane = videoFovPlane(pose, 500);
     fixture.expected.videoPlane.forEach((value, index) => near(plane.matrix[index], value, 1e-8, `${fixture.name}/plane-${index}`));
-    near(plane.uvScale.x, fixture.expected.uvScale[0], 1e-12, `${fixture.name}/uv-x`);
-    near(plane.uvScale.y, fixture.expected.uvScale[1], 1e-12, `${fixture.name}/uv-y`);
     for (const observation of fixture.expected.observationFov) near(observationFov(pose, observation.aspect), observation.value, 1e-12, `${fixture.name}/fov`);
   }
 });

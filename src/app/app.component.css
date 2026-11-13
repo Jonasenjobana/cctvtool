@@ -1,6 +1,6 @@
 :host{display:block;height:100dvh;min-height:0}
 .workspace{height:100%;display:grid;grid-template-columns:56px minmax(0,1fr) 340px;overflow:hidden}
-.workspace.recognition-page{grid-template-columns:56px minmax(0,1fr)}.right-panel[hidden]{display:none}
+.workspace.recognition-page,.workspace.plotting-page{grid-template-columns:56px minmax(0,1fr)}.right-panel[hidden]{display:none}
 .icon-rail{background:#f9fafb;border-right:1px solid #e2e6eb;display:flex;align-items:center;flex-direction:column;gap:8px;padding:18px 7px 20px;z-index:5}
 .brand{height:44px;width:40px;display:flex;align-items:center;justify-content:center;color:#3675dd;margin-bottom:14px}
 .brand app-icon{width:25px;height:25px}
@@ -10,16 +10,24 @@
 .service-dot{margin-top:auto;width:7px;height:7px;background:#aab1ba;border-radius:50%}
 .service-dot.connected{background:#57a888}
 .map-area{position:relative;min-width:0;min-height:0;background:#dce4ed}
-.map-toolbar{position:absolute;left:16px;right:16px;top:16px;display:flex;align-items:center;gap:12px;justify-content:space-between;z-index:2;pointer-events:none}
+.map-toolbar{position:absolute;left:16px;right:16px;top:16px;display:flex;align-items:center;flex-wrap:wrap;gap:12px;justify-content:space-between;z-index:2;pointer-events:none}
 .map-toolbar button,.history-badge{pointer-events:auto;background:#fff;min-height:36px;border:1px solid #e2e6eb;border-radius:4px;padding:0 11px;white-space:nowrap;font-size:12px}
 .map-toolbar button:hover{background:#f4f7fc}
 .device-picker{min-width:142px;max-width:260px;justify-content:flex-start;font-size:13px!important}
 .device-picker>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .device-picker>app-icon:first-child{color:#68778c;width:17px}
 .device-picker>app-icon:last-child{margin-left:auto;width:13px}
-.view-actions{display:flex;align-items:center;gap:7px}
+.view-actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
 .view-actions app-icon{width:15px;height:15px}
 .view-actions button.selected{color:#2c69d0;border-color:#c3d5f6}
+.temporary-point-container{flex-basis:100%;display:flex;justify-content:flex-end;min-width:0}
+.temporary-point-panel{width:330px;max-width:100%;max-height:calc(100dvh - 180px);display:flex;flex-direction:column;gap:12px;padding:12px 14px;overflow:auto;background:#fff;border:1px solid #e1e5eb;border-radius:4px;pointer-events:auto}
+.temporary-point-heading{display:flex;align-items:center;justify-content:space-between}.temporary-point-heading h2{font-size:14px;font-weight:500}
+.temporary-point-fields{display:grid;grid-template-columns:1fr 1fr;gap:10px}.temporary-point-fields label{display:flex;flex-direction:column;gap:6px;min-width:0;font-size:12px}.temporary-point-fields input{width:100%;height:32px;padding:0 7px;font-variant-numeric:tabular-nums}
+.temporary-vessel-fields{margin-top:12px;font-size:12px}.temporary-vessel-fields summary{cursor:pointer}.temporary-vessel-fields[open] summary{margin-bottom:10px}.temporary-vessel-limits{margin-top:8px;font-size:11px;color:#68778c}
+.temporary-point-actions{display:flex;gap:8px;margin-top:10px}.temporary-point-actions button,.temporary-point-row>button{min-height:30px;padding:0 8px;border:1px solid #dce3ed;border-radius:3px;font-size:12px}
+.temporary-point-list{flex-shrink:0}.temporary-point-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px 0;border-top:1px solid #edf0f3}.temporary-point-row>div{flex:1 0 100%;min-width:0;display:flex;flex-direction:column;gap:5px}.temporary-point-row strong{font-size:12px;font-weight:500}.temporary-point-row span{font-size:11px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.plot-panel{position:absolute;right:16px;top:64px;width:330px;max-width:calc(100% - 32px);max-height:calc(100% - 100px);display:flex;flex-direction:column;padding:12px 14px;background:#fff;border:1px solid #e1e5eb;border-radius:4px;z-index:3}.plot-panel-heading{display:flex;align-items:center;justify-content:space-between}.plot-panel h2{font-size:14px;font-weight:500}.plot-context{font-size:11px;color:#7c8796;overflow-wrap:anywhere}.plot-panel-actions{display:flex;gap:8px;margin:12px 0}.plot-panel-actions button,.plot-layer-row button{padding:6px 8px;border:1px solid #dce3ed;border-radius:3px;font-size:11px}.plot-panel-actions app-icon{width:14px;height:14px}.plot-panel-list{overflow:auto;min-height:0}.plot-layer-row{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:12px 0;border-top:1px solid #edf0f3}.plot-layer-row strong{font-size:12px;font-weight:500;flex:1;overflow-wrap:anywhere}.plot-layer-row>div{display:flex;gap:6px}.plot-layer-row p{flex-basis:100%;margin:0}.plot-empty{font-size:12px;color:#8b94a1;padding:16px 0}
 .history-badge{display:flex;align-items:center;color:#986c25;background:#fff8e8}
 .icon-button{width:30px;height:30px;padding:0!important;border-radius:3px}
 .icon-button:hover{background:#f1f4f8}
@@ -86,6 +94,9 @@
 .control-speed{display:flex;justify-content:space-between;gap:8px;align-items:center;color:#8b94a1;font-size:10px;margin:9px 0 12px}
 .control-speed label{display:flex;align-items:center;gap:5px;white-space:nowrap}
 .control-speed input{width:48px;height:27px;padding:2px 4px;text-align:center;font-size:11px}
+.ptz-polling{display:flex;align-items:center;gap:8px;color:#768394;font-size:11px;margin-bottom:12px}
+.ptz-polling input{width:64px;height:27px;padding:2px 6px;font-size:11px}
+.ptz-polling input:invalid{border-color:#b65345}
 .stop-control{height:27px;padding:0 9px;border:1px solid #d8dfe9;border-radius:3px;color:#a34e42;font-size:11px}
 .precise-control{margin:0 0 14px;font-size:11px;color:#7b8797}
 .precise-control summary{cursor:pointer;line-height:1.6}.precise-control[open] summary{margin-bottom:10px}
@@ -124,6 +135,7 @@
 .form-section label:last-child{margin-bottom:0}
 .form-section label>span{color:#a4acb8}
 .form-section input{display:block;flex-basis:100%;width:100%;height:34px;padding:0 9px;font-size:12px;font-variant-numeric:tabular-nums}
+.scan-form select{flex-basis:100%;width:100%;height:34px;padding:0 7px;border:1px solid #dce3ed;border-radius:3px;background:#fff;color:inherit;font-size:12px}.scan-form .scan-baseline{line-height:1.7}
 .field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 .field-grid label{margin-bottom:0}
 .device-fields input{font-size:11px}

@@ -1,20 +1,29 @@
 import {
-  ChangeDetectionStrategy, Component, ElementRef, Input, NgZone, ViewChild, inject, signal,
+  ChangeDetectionStrategy, Component, ElementRef, EventEmitter, Input, NgZone, Output, ViewChild, inject, signal,
 } from '@angular/core';
 import type { AfterViewInit, OnChanges, OnDestroy, SimpleChanges } from '@angular/core';
 import {
-  Cartesian3, Color, ConstantPositionProperty, Ellipsoid, EllipsoidalOccluder, Entity, GeometryInstance,
-  LabelStyle, Material, MaterialAppearance, Matrix4, PerspectiveFrustum, PlaneGeometry, PolylineCollection, Primitive, Viewer,
+  ArcType, Cartesian2, Cartesian3, Color, ConstantPositionProperty, Ellipsoid, EllipsoidalOccluder, Entity, GeometryInstance,
+  HeadingPitchRange, LabelStyle, Material, MaterialAppearance, Matrix4, PerspectiveFrustum, PlaneGeometry, PolylineCollection, Primitive, Viewer,
 } from 'cesium';
 import type { Polyline } from 'cesium';
-import { createCameraPose, footprintSegments, frustumCorners, observationFov, videoFovPlane } from './camera-math';
-import type { CameraPose } from './camera-math';
+import { createCameraPose, footprintSegments, frustumCorners, observationFov, vesselCorners, videoFovPlane } from './camera-math';
+import type { CameraPose, VesselDimensions } from './camera-math';
 import type { CameraDraft, PtzReading } from './models';
 import { createAmapImagery } from './amap-imagery';
 import { startVideoFrameLoop } from './video-frame-loop';
 import { createVideoMaterial } from './video-material';
+import { PlotLayerScene } from './plot-layer-scene';
+import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
 const videoPlaneDistance = 500;
+
+export interface TemporaryMapPoint {
+  id: number;
+  longitude: number;
+  latitude: number;
+  vessel?: VesselDimensions;
+}
 
 /** 纹理上传失败时关闭画面截面，让底图和控制界面继续工作。 */
 class VideoPlanePrimitive extends Primitive {
@@ -51,12 +60,18 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @Input() video: HTMLVideoElement | null = null;
   @Input() snapshotUrl: string | null = null;
   @Input() videoOpacity = 1;
+  @Input() plotLayers: readonly PlotLayerRenderInput[] = [];
+  @Input() plotFocus: PlotLayerFocusRequest | null = null;
+  @Input() temporaryPoints: readonly TemporaryMapPoint[] = [];
+  @Output() readonly plotLayerError = new EventEmitter<PlotLayerError>();
+  @Output() readonly plotFocusResult = new EventEmitter<PlotLayerFocusResult>();
   readonly problem = signal('');
   readonly videoProblem = signal('');
   private readonly zone = inject(NgZone);
   private viewer?: Viewer;
   private lines?: PolylineCollection;
   private readonly lineMap = new Map<string, Polyline>();
+  private readonly temporaryPointEntities = new Map<number, { entity: Entity; position: Cartesian3; input: TemporaryMapPoint }>();
   private marker?: Entity;
   private pose?: CameraPose;
   private observer?: ResizeObserver;
@@ -70,6 +85,8 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   private videoFailed = false;
   private stopVideoFrames?: () => void;
   private stopVisibility?: () => void;
+  private plotScene?: PlotLayerScene;
+  private sceneFailed = false;
   private readonly occluder = new EllipsoidalOccluder(Ellipsoid.WGS84);
 
   ngAfterViewInit() {
@@ -86,9 +103,11 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         this.viewer.scene.globe.depthTestAgainstTerrain = false;
         this.viewer.scene.screenSpaceCameraController.minimumZoomDistance = 0.1;
         this.stopVisibility = this.viewer.scene.preRender.addEventListener(() => {
-          if (!this.videoPlane || !this.pose) return;
           this.occluder.cameraPosition = this.viewer!.camera.positionWC;
-          this.videoPlane.show = !this.videoFailed && this.occluder.isPointVisible(this.pose.position);
+          if (this.videoPlane && this.pose) this.videoPlane.show = !this.videoFailed && this.occluder.isPointVisible(this.pose.position);
+          for (const { entity, position } of this.temporaryPointEntities.values()) {
+            entity.show = this.occluder.isPointVisible(position);
+          }
         });
         this.lines = this.viewer.scene.primitives.add(new PolylineCollection());
         this.marker = this.viewer.entities.add({
@@ -104,9 +123,17 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
           this.viewer.scene.requestRender();
         });
         this.observer.observe(this.container.nativeElement);
+        this.syncTemporaryPoints();
         this.update();
+        this.plotScene = new PlotLayerScene(this.viewer,
+          (error) => this.zone.run(() => this.plotLayerError.emit(error)),
+          (result) => this.zone.run(() => this.plotFocusResult.emit(result)));
+        this.plotScene.sync(this.plotLayers);
+        this.plotScene.focus(this.plotFocus);
       } catch (error) {
+        this.sceneFailed = true;
         this.problem.set('三维场景初始化失败，请检查显卡与 WebGL 支持');
+        this.rejectPlotFocus();
         console.error('Cesium 初始化失败', error);
       }
     });
@@ -118,6 +145,20 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       this.releaseVideo();
     }
     this.update();
+    if (changes['temporaryPoints']) this.syncTemporaryPoints();
+    if (changes['plotLayers']) this.plotScene?.sync(this.plotLayers);
+    if (changes['plotFocus']) {
+      this.plotScene?.focus(this.plotFocus);
+      if (this.sceneFailed) this.rejectPlotFocus();
+    }
+  }
+
+  private rejectPlotFocus() {
+    if (!this.plotFocus) return;
+    const requestId = this.plotFocus.requestId;
+    this.zone.run(() => this.plotFocusResult.emit({
+      requestId, success: false, message: '三维场景初始化失败，无法定位标绘图层',
+    }));
   }
 
   onSnapshotLoad(event: Event) {
@@ -139,6 +180,38 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     }
     line!.positions = positions;
     line!.show = true;
+  }
+
+  private syncTemporaryPoints() {
+    const viewer = this.viewer;
+    if (!viewer || viewer.isDestroyed()) return;
+    const ids = new Set(this.temporaryPoints.map((point) => point.id));
+    for (const [id, { entity }] of this.temporaryPointEntities) {
+      if (!ids.has(id)) {
+        viewer.entities.remove(entity);
+        this.temporaryPointEntities.delete(id);
+      }
+    }
+    for (const point of this.temporaryPoints) {
+      const previous = this.temporaryPointEntities.get(point.id);
+      if (previous?.input === point) continue;
+      if (previous) viewer.entities.remove(previous.entity);
+      const position = Cartesian3.fromDegrees(point.longitude, point.latitude, 0);
+      const footprint = point.vessel ? vesselCorners(point, point.vessel).slice(0, 4) : null;
+      // 点和标签在视频截面上方可见；地球背面仍由同一椭球遮挡判断隐藏。
+      const entity = viewer.entities.add({
+        id: `temporary-point-${point.id}`, position,
+        point: { pixelSize: 10, color: Color.YELLOW, outlineColor: Color.BLACK, outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        label: { text: `点 ${point.id}`, font: '12px sans-serif', pixelOffset: new Cartesian2(0, -18),
+          fillColor: Color.WHITE, outlineColor: Color.BLACK, outlineWidth: 2, style: LabelStyle.FILL_AND_OUTLINE,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        polyline: footprint ? { positions: [...footprint, footprint[0]], width: 2, arcType: ArcType.NONE,
+          material: Color.YELLOW, depthFailMaterial: Color.YELLOW, clampToGround: false } : undefined,
+      });
+      this.temporaryPointEntities.set(point.id, { entity, position, input: point });
+    }
+    viewer.scene.requestRender();
   }
 
   private update() {
@@ -194,7 +267,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       return;
     }
     const dimensions = `${width}x${height}`;
-    const plane = videoFovPlane(this.pose, videoPlaneDistance, width / height);
+    const plane = videoFovPlane(this.pose, videoPlaneDistance);
     if (source !== this.boundMedia || dimensions !== this.videoDimensions) {
       this.releaseVideo();
       this.boundMedia = source;
@@ -275,6 +348,16 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     this.viewer.scene.requestRender();
   }
 
+  focusTemporaryPoint(point: TemporaryMapPoint) {
+    if (!this.viewer) return;
+    const camera = this.viewer.camera;
+    (camera.frustum as PerspectiveFrustum).fov = Math.PI / 3;
+    camera.cancelFlight();
+    camera.lookAt(Cartesian3.fromDegrees(point.longitude, point.latitude, 0), new HeadingPitchRange(0, -Math.PI / 3, 1500));
+    camera.lookAtTransform(Matrix4.IDENTITY);
+    this.viewer.scene.requestRender();
+  }
+
   overview() {
     if (!this.viewer || !this.camera || this.camera.longitude === null || this.camera.latitude === null) return;
     const frustum = this.viewer.camera.frustum as PerspectiveFrustum;
@@ -287,10 +370,13 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   ngOnDestroy() {
+    this.plotScene?.destroy();
+    this.plotScene = undefined;
     this.observer?.disconnect();
     this.stopVisibility?.();
     this.releaseVideo();
     if (this.viewer && !this.viewer.isDestroyed()) this.viewer.destroy();
     this.lineMap.clear();
+    this.temporaryPointEntities.clear();
   }
 }

@@ -99,7 +99,7 @@ export function createEssldRecognizer() {
   };
 }
 
-export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer = createEssldRecognizer() }) {
+export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHorizonScan, recognizer = createEssldRecognizer() }) {
   store.interruptRecognitionTasks();
   const queued = [];
   let current = null, closing = false;
@@ -108,6 +108,42 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const task = store.getRecognitionTask(id);
     if (activeStatuses.includes(task.status)) throw httpError(409, '请等待识别结束或取消后再编辑');
     if (task.revision !== revision) throw httpError(409, '识别任务已被修改，请刷新后重试');
+    return task;
+  }
+
+  function installationChanges(task) {
+    const camera = store.getCamera(task.cameraId);
+    const items = store.recognitionItems(task.id);
+    const selected = items.filter((item) => !item.ignored && !item.missing && validPoints(item.points));
+    const snapshots = selected.map((item) => item.snapshot);
+    const dates = items.map((item) => +new Date(item.snapshot.createdAt));
+    const result = estimateInstallation(camera, snapshots, selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
+      startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
+    });
+    result.excluded.push(...items.filter((item) => item.ignored || item.missing).map((item) => ({ snapshotId: item.snapshotId,
+      reason: item.missing ? '源截图已删除' : item.ignoreReason })));
+    return { result, resultId: randomUUID(), resultRevision: task.revision, appliedAt: null, appliedRevision: null,
+      fitCamera: { ...calibrationOf(camera), serial: camera.serial, code: camera.code, updatedAt: camera.updatedAt } };
+  }
+
+  function createTask(sourceTaskId, { autoGenerate = false } = {}) {
+    if (closing) throw httpError(503, '识别服务正在关闭，请稍后手动创建识别任务');
+    recognizer.check?.();
+    const group = store.getSnapshotGroup(sourceTaskId);
+    if (group.kind !== 'scan' || activeStatuses.includes(group.status) || group.status === 'pausing') {
+      throw httpError(409, '请先暂停截图任务或等待采样结束');
+    }
+    const source = store.listGroupSnapshots(group.id, { limit: 10000, offset: 0 }).snapshots;
+    if (!source.length) throw httpError(400, '截图任务中没有可识别的图片');
+    const now = new Date().toISOString();
+    const task = { id: randomUUID(), sourceTaskId: group.id, cameraId: group.cameraId, cameraName: group.cameraName,
+      status: 'queued', createdAt: now, updatedAt: now, finishedAt: null, sampleCount: source.length, completedCount: 0,
+      revision: 0, result: null, resultId: null, error: null, appliedAt: null, appliedRevision: null, model: 'ESSLD',
+      ...(autoGenerate ? { autoGenerate: true } : {}) };
+    store.addRecognitionTask(task, source.map((snapshot) => ({ snapshotId: snapshot.id, snapshot,
+      detectedPoints: [], points: [], source: 'model', ignored: true, ignoreReason: '等待模型识别', detection: null })), autoGenerate);
+    queued.push(task.id);
+    setImmediate(() => void pump());
     return task;
   }
 
@@ -148,7 +184,16 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
           const reason = item.snapshot.poseChanged ? '截图前后姿态发生变化' : rejected.get(item.snapshotId);
           if (reason) store.updateRecognitionItem(id, item.snapshotId, { ignored: true, ignoreReason: reason });
         }
-        store.updateRecognitionTask(id, { status: 'completed', finishedAt: new Date().toISOString() });
+        let candidate = {};
+        const task = store.getRecognitionTask(id);
+        if (task.autoGenerate) {
+          try { candidate = installationChanges(task); } catch (error) {
+            console.error('自动生成安装候选失败', error);
+            candidate = { error: `识别已完成，候选计算失败：${error.statusCode ? error.message : '请检查后端日志'}` };
+          }
+        }
+        // 候选与完成状态一起保存，轮询终态的页面无需等待第二次更新。
+        store.updateRecognitionTask(id, { ...candidate, status: 'completed', finishedAt: new Date().toISOString() });
       } catch (error) {
         if (!controller.signal.aborted) console.error('识别任务失败', error);
         store.updateRecognitionTask(id, { status: controller.signal.aborted ? (closing ? 'interrupted' : 'cancelled') : 'failed',
@@ -172,22 +217,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks', { schema: { body: { type: 'object', additionalProperties: false,
     required: ['sourceTaskId'], properties: { sourceTaskId: { type: 'string', minLength: 1 } },
   } } }, async (request, reply) => {
-    recognizer.check?.();
-    const group = store.getSnapshotGroup(request.body.sourceTaskId);
-    if (group.kind !== 'scan' || activeStatuses.includes(group.status) || group.status === 'pausing') {
-      throw httpError(409, '请先暂停截图任务或等待采样结束');
-    }
-    const source = store.listGroupSnapshots(group.id, { limit: 10000, offset: 0 }).snapshots;
-    if (!source.length) throw httpError(400, '截图任务中没有可识别的图片');
-    const now = new Date().toISOString();
-    const task = { id: randomUUID(), sourceTaskId: group.id, cameraId: group.cameraId, cameraName: group.cameraName,
-      status: 'queued', createdAt: now, updatedAt: now, finishedAt: null, sampleCount: source.length, completedCount: 0,
-      revision: 0, result: null, resultId: null, error: null, appliedAt: null, appliedRevision: null, model: 'ESSLD' };
-    store.addRecognitionTask(task, source.map((snapshot) => ({ snapshotId: snapshot.id, snapshot,
-      detectedPoints: [], points: [], source: 'model', ignored: true, ignoreReason: '等待模型识别', detection: null })));
-    queued.push(task.id);
-    setImmediate(() => void pump());
-    return reply.code(202).send(task);
+    return reply.code(202).send(createTask(request.body.sourceTaskId));
   });
   app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => store.listRecognitionTasks(pageOptions(request.query)));
   app.get('/api/recognition-tasks/:id', async (request) => store.getRecognitionTask(request.params.id));
@@ -227,19 +257,37 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   });
   app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
+    return store.updateRecognitionTask(task.id, installationChanges(task));
+  });
+  app.post('/api/recognition-tasks/:id/horizon-scan', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'resultId', 'reviewed'], properties: { ...bodyWithRevision.properties,
+      resultId: { type: 'string', minLength: 1 }, reviewed: { type: 'boolean' } },
+  } } }, async (request, reply) => {
+    const task = editable(request.params.id, request.body.revision);
+    if (!request.body.reviewed) throw httpError(409, '请先人工复核当前版本与计算结果的海天线标注');
+    if (task.result?.status !== 'estimated' || task.resultRevision !== task.revision) {
+      throw httpError(409, '请先生成通过质量检查的最新粗标定结果');
+    }
+    if (task.resultId !== request.body.resultId) throw httpError(409, '计算结果已重新生成，请刷新并复核最新结果');
+    const source = store.getSnapshotGroup(task.sourceTaskId);
+    if (source.kind !== 'scan' || source.status !== 'completed' || source.horizon?.phase !== 'coarse') {
+      throw httpError(409, '只能从已完成的低倍率海天线预扫启动正式扫描');
+    }
     const camera = store.getCamera(task.cameraId);
+    if ([...calibrationKeys, 'serial', 'code', 'updatedAt'].some((key) => camera[key] !== task.fitCamera?.[key])
+      || source.serial !== camera.serial || source.code !== camera.code) {
+      throw httpError(409, '摄像头配置或通道已变化，请重新生成并复核粗标定');
+    }
     const items = store.recognitionItems(task.id);
-    const selected = items.filter((item) => !item.ignored && !item.missing && validPoints(item.points));
-    const snapshots = selected.map((item) => item.snapshot);
-    const dates = items.map((item) => +new Date(item.snapshot.createdAt));
-    const result = estimateInstallation(camera, snapshots, selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
-      startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
-    });
-    result.excluded.push(...items.filter((item) => item.ignored || item.missing).map((item) => ({ snapshotId: item.snapshotId,
-      reason: item.missing ? '源截图已删除' : item.ignoreReason })));
-    return store.updateRecognitionTask(task.id, { result, resultId: randomUUID(), resultRevision: task.revision,
-      appliedAt: null, appliedRevision: null,
-      fitCamera: { ...calibrationOf(camera), serial: camera.serial, code: camera.code } });
+    const directory = resolve(dataDir, 'snapshots');
+    if (task.result.sourceSnapshotIds.some((id) => {
+      const item = items.find((value) => value.snapshotId === id);
+      if (!item || item.missing) return true;
+      const path = resolve(directory, item.snapshot.fileName);
+      return dirname(path) !== directory || !existsSync(path);
+    })) throw httpError(409, '参与粗标定的源截图或图片文件已删除，请重新生成并复核');
+    const group = startHorizonScan(source, task);
+    return reply.code(202).header('Location', `/api/snapshot-groups/${group.id}`).send(group);
   });
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },
@@ -264,5 +312,6 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       return { task: updated, camera: updatedCamera };
     });
   });
-  return { async close() { closing = true; if (current) { const running = current; running.controller.abort(); await running.task; } } };
+  return { createTask,
+    async close() { closing = true; if (current) { const running = current; running.controller.abort(); await running.task; } } };
 }

@@ -39,7 +39,7 @@ export async function renderTaskPanorama(snapshots: Snapshot[], signal: AbortSig
     const blob = await new Promise<Blob>((accept, reject) => canvas.toBlob(
       (result) => result ? accept(result) : reject(new Error('全景图片编码失败，请缩小截图范围后重试')), 'image/png'));
     signal.throwIfAborted();
-    return { blob, width: plan.width, height: plan.height, count: snapshots.length };
+    return { blob, width: plan.width, height: plan.height, count: snapshots.length, plan };
   } finally {
     sourceCanvas.width = sourceCanvas.height = 0;
     canvas.width = canvas.height = 0;

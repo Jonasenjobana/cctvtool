@@ -5,6 +5,7 @@
     @for (task of tasks(); track task.id) {
       <button type="button" class="task-row" [class.current]="selected()?.id === task.id" (click)="selectTask(task)">
         <strong>{{ task.cameraName }}</strong><span>{{ task.createdAt | date:'MM-dd HH:mm:ss' }} · {{ statuses[task.status] }}</span>
+        <small>{{ taskName(task) }}@if (task.horizon; as horizon) { · 目标 Z {{ horizon.targetZoom }} }</small>
         <progress [value]="task.completedCount" [max]="task.sampleCount" [attr.aria-label]="'已采样 ' + task.completedCount + ' / ' + task.sampleCount"></progress>
         <small>已采样 {{ task.completedCount }} / {{ task.sampleCount }} · 现存 {{ task.snapshotCount }} 张</small>
       </button>
@@ -15,16 +16,21 @@
     @if (selected(); as task) {
       <div class="detail-heading"><div><h2>{{ task.cameraName }}</h2><p>{{ statuses[task.status] }} · 已采样 {{ task.completedCount }} / {{ task.sampleCount }} · {{ task.completedCount / task.sampleCount * 100 | number:'1.0-1' }}%</p></div>
         <div class="task-actions">
+          @if (task.recognitionTaskId; as recognitionId) { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="recognitionCreated.emit(recognitionId)">打开关联识别任务</button> }
           <button type="button" [disabled]="acting() || generatingPanorama() || !task.snapshotCount || task.status === 'running' || task.status === 'pausing'" (click)="createRecognition()">创建识别任务</button>
           @if (task.status === 'running') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('pause')">暂停</button> }
           @if (task.status === 'paused' || task.status === 'failed' || task.status === 'interrupted') {
-            <button type="button" [disabled]="acting() || generatingPanorama() || task.completedCount >= task.sampleCount" (click)="act('start')">{{ task.completedCount ? '继续' : '开始' }}</button>
+            <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('start')">{{ task.completedCount >= task.sampleCount ? '确认停止并完成' : task.completedCount ? '继续' : '开始' }}</button>
           }
           @if (task.status === 'running' || task.status === 'pausing' || task.status === 'paused') { <button type="button" [disabled]="acting() || generatingPanorama()" (click)="act('cancel')">取消任务</button> }
         </div>
       </div>
-      <dl class="task-parameters"><div><dt>P 范围</dt><dd>{{ task.panMin }}° ～ {{ task.panMax }}°</dd></div><div><dt>基础 T / Z</dt><dd>{{ task.basePtz?.tilt }}° / {{ task.basePtz?.zoom }}</dd></div><div><dt>水平视场角 / 步长</dt><dd>{{ task.horizontalFieldAngle | number:'1.2-3' }}° / {{ task.panStep | number:'1.2-3' }}°</dd></div><div><dt>开始时间</dt><dd>{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</dd></div></dl>
+      <dl class="task-parameters"><div><dt>P 范围</dt><dd>{{ task.panMin }}° → {{ task.panMax }}°</dd></div><div><dt>基础 T / Z</dt><dd>{{ task.basePtz?.tilt }}° / {{ task.basePtz?.zoom }}</dd></div><div><dt>水平视场角 / 步长</dt><dd>{{ task.horizontalFieldAngle | number:'1.2-3' }}° / {{ task.panStep | number:'1.2-3' }}°</dd></div><div><dt>开始时间</dt><dd>{{ task.createdAt | date:'MM-dd HH:mm:ss' }}</dd></div></dl>
+      @if (task.horizon; as horizon) {
+        <dl class="task-parameters"><div><dt>采样阶段</dt><dd>{{ taskName(task) }}</dd></div><div><dt>正式目标倍率</dt><dd>Z {{ horizon.targetZoom }}</dd></div><div><dt>允许原始 T</dt><dd>{{ horizon.tiltMin }}° ～ {{ horizon.tiltMax }}°</dd></div><div><dt>T 控制</dt><dd>{{ horizon.phase === 'fine' ? '按冻结计划逐点调整' : '固定初始 T 低倍率预扫' }}</dd></div></dl>
+      }
       @if (task.error) { <p class="task-error" role="alert">{{ task.error }}</p> }
+      @if (task.recognitionError) { <p class="task-error" role="alert">自动创建识别任务失败：{{ task.recognitionError }}。已保存截图保留，可点击“创建识别任务”重试。</p> }
       <div class="snapshot-heading"><h3>任务截图（{{ task.snapshotCount }} 张）</h3><button type="button"
         [disabled]="acting() || generatingPanorama() || task.snapshotCount < 2 || task.status === 'running' || task.status === 'pausing'"
         [title]="task.status === 'running' || task.status === 'pausing' ? '请先暂停或等待任务完成' : '将本任务全部截图拼接为一张全景图'"

@@ -57,6 +57,7 @@ test('stdio MCP 互通：选摄像头和时段、读取原图、拟合输出，�
   const page = await call('query_snapshots', { ...selection, limit: 2 });
   assert.equal(page.structuredContent.total, 7);
   assert.equal(page.structuredContent.nextOffset, 2);
+  assert.deepEqual(page.structuredContent.pageSampling, { stableSnapshotCount: 2, distinctPanCount: 2, panCoverageDegrees: 60 });
   const firstMinute = await call('query_snapshots', {
     cameraId: camera.id, startTime: '2026-11-09T08:00:00+08:00', endTime: '2026-11-09T08:01:00+08:00',
   });
@@ -73,7 +74,13 @@ test('stdio MCP 互通：选摄像头和时段、读取原图、拟合输出，�
   assert.equal(fit.structuredContent.applied, false);
   assert.equal(fit.structuredContent.fixedCalibration.tiltOffset, 1.64);
   assert.equal(fit.structuredContent.fixedCalibration.imageRoll, 0.73);
-  const insufficient = await call('estimate_p_axis_tilt', { ...selection, observations: data.observations.slice(0, 1) });
+  const single = await call('estimate_p_axis_tilt', { ...selection, observations: data.observations.slice(0, 1) });
+  assert.equal(single.structuredContent.status, 'estimated', JSON.stringify(single));
+  assert.ok(Math.abs(single.structuredContent.installation.pAxisPitch - 1.25) < 1e-5);
+  assert.ok(Math.abs(single.structuredContent.installation.pAxisRoll + 2.1) < 1e-5);
+  const insufficient = await call('estimate_p_axis_tilt', { ...selection, observations: [
+    { snapshotId: 'synthetic-0', points: [{ x: 0.1, y: 0.5 }, { x: 0.15, y: 0.5 }] },
+  ] });
   assert.equal(insufficient.structuredContent.status, 'insufficient_data');
   assert.equal(insufficient.structuredContent.installation, null);
   const badTime = await call('query_snapshots', {

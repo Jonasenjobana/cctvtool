@@ -1,9 +1,9 @@
 import { DatePipe, DecimalPipe } from '@angular/common';
-import { ChangeDetectionStrategy, Component, EventEmitter, Output, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, EventEmitter, Input, Output, inject, signal } from '@angular/core';
 import type { OnDestroy, OnInit } from '@angular/core';
 import { ApiService, errorMessage } from './api.service';
 import { SnapshotItemComponent } from './snapshot-item.component';
-import { snapshotTaskStatus } from './models';
+import { snapshotTaskName, snapshotTaskStatus } from './models';
 import { renderTaskPanorama } from './task-panorama';
 import type { Snapshot, SnapshotGroup } from './models';
 
@@ -16,6 +16,7 @@ import type { Snapshot, SnapshotGroup } from './models';
   styleUrl: './snapshot-tasks.component.css',
 })
 export class SnapshotTasksComponent implements OnInit, OnDestroy {
+  @Input() taskId = '';
   @Output() readonly opened = new EventEmitter<Snapshot>();
   @Output() readonly removed = new EventEmitter<Snapshot>();
   @Output() readonly changed = new EventEmitter<void>();
@@ -30,6 +31,7 @@ export class SnapshotTasksComponent implements OnInit, OnDestroy {
   readonly acting = signal(false);
   readonly problem = signal('');
   readonly statuses = snapshotTaskStatus;
+  readonly taskName = snapshotTaskName;
   readonly panorama = signal<{ url: string; width: number; height: number; count: number } | null>(null);
   readonly generatingPanorama = signal(false);
   readonly panoramaProgress = signal('');
@@ -68,8 +70,9 @@ export class SnapshotTasksComponent implements OnInit, OnDestroy {
             this.nextSnapshotOffset.set(images.nextOffset);
           }
         }
-      } else if (!this.selected() && page.groups.length) {
-        await this.selectTask(page.groups[0]);
+      } else if (!this.selected()) {
+        if (this.taskId) await this.selectTask(await this.api.snapshotGroup(this.taskId));
+        else if (page.groups.length) await this.selectTask(page.groups[0]);
       }
     } catch (error) {
       if (!this.destroyed) this.problem.set(errorMessage(error));

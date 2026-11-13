@@ -226,10 +226,68 @@ test('精确定位仅由独立请求提交完整 P/T/Z，安装修正不进入�
   assert.deepEqual(response.json().target, target);
   assert.equal(f.state.ptzCount, 0);
   assert.equal(f.state.ptzCommands.length, 0);
-  for (const payload of [{ pan: 1 }, { ...target, pan: 361 }, { ...target, tilt: -1 }, { ...target, zoom: 0 }]) {
+  const signedTargets = [-90, -0.0725, 90].map((tilt) => ({ ...target, tilt }));
+  for (const signed of signedTargets) {
+    const accepted = await f.app.inject({ method: 'POST', url, payload: signed });
+    assert.equal(accepted.statusCode, 200, accepted.body);
+    assert.deepEqual(accepted.json().target, signed);
+  }
+  assert.deepEqual(f.state.controls, [target, ...signedTargets]);
+  for (const payload of [{ pan: 1 }, { ...target, pan: 361 }, { ...target, tilt: -90.001 },
+    { ...target, tilt: 90.001 }, { ...target, tilt: 359.9275 }, { ...target, zoom: 0 }]) {
     assert.equal((await f.app.inject({ method: 'POST', url, payload })).statusCode, 400);
   }
-  assert.equal(f.state.controls.length, 1);
+  assert.equal(f.state.controls.length, 4);
+});
+
+test('最大倍率按摄像头保存并在重启后恢复，精确定位拒绝超过已保存上限的 Z', async (t) => {
+  const f = await fixture(t);
+  assert.equal(f.camera.maxZoom, 73);
+  const cameraUrl = `/api/cameras/${f.camera.id}`;
+  const second = await f.app.inject({ method: 'POST', url: '/api/cameras', payload: { ...input, name: '天津船闸', code: '000002' } });
+  assert.equal(second.statusCode, 201, second.body);
+  assert.equal(second.json().maxZoom, 32);
+  for (const maxZoom of [0, -1, null]) {
+    assert.equal((await f.app.inject({ method: 'PUT', url: cameraUrl, payload: { ...input, maxZoom } })).statusCode, 400);
+    assert.equal((await f.app.inject({ method: 'POST', url: '/api/cameras', payload: { ...input, code: '000003', maxZoom } })).statusCode, 400);
+  }
+  const saved = await f.app.inject({ method: 'PUT', url: cameraUrl, payload: { ...input, maxZoom: 40.5 } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json().maxZoom, 40.5);
+  const renamed = await f.app.inject({ method: 'PUT', url: cameraUrl, payload: { ...input, name: '天津船闸' } });
+  assert.equal(renamed.statusCode, 200, renamed.body);
+  assert.equal(renamed.json().maxZoom, 40.5);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  const cameras = (await f.app.inject('/api/cameras')).json();
+  assert.equal(cameras.find((camera) => camera.id === f.camera.id).maxZoom, 40.5);
+  assert.equal(cameras.find((camera) => camera.id === second.json().id).maxZoom, 32);
+  const rejected = await f.app.inject({ method: 'POST', url: `${cameraUrl}/precise`, payload: { pan: 10, tilt: -1, zoom: 40.6 } });
+  assert.equal(rejected.statusCode, 400, rejected.body);
+  assert.match(rejected.json().message, /最大倍率 40.5/);
+  assert.equal(f.state.controls.length, 0);
+  assert.equal(f.state.loginCount, 0);
+  const accepted = await f.app.inject({ method: 'POST', url: `${cameraUrl}/precise`, payload: { pan: 10, tilt: -1, zoom: 40.5 } });
+  assert.equal(accepted.statusCode, 200, accepted.body);
+  assert.equal(f.state.controls.at(-1).zoom, 40.5);
+  const shot = await f.app.inject({ method: 'POST', url: `${cameraUrl}/snapshots`, payload: {} });
+  assert.equal(shot.statusCode, 201, shot.body);
+  assert.equal(Object.hasOwn(shot.json().calibration, 'maxZoom'), false);
+});
+
+test('LiveGBS 下发边界拒绝越界 T 或 Z，且不触发上游登录或控制', () => {
+  let requests = 0;
+  const client = new LiveGbsClient({ baseUrl: 'http://example.invalid', username: 'test-user', password: 'test-password',
+    fetchImpl: () => { requests++; throw new Error('不应请求上游'); } });
+  for (const tilt of [-90.001, 90.001, 359.9275, NaN]) {
+    assert.throws(() => client.preciseControl(input, { pan: 10, tilt, zoom: 8 }),
+      (error) => error.statusCode === 400 && /目标 T/.test(error.message));
+  }
+  for (const zoom of [0, 32.1, NaN, Infinity]) {
+    assert.throws(() => client.preciseControl({ ...input, maxZoom: 32 }, { pan: 10, tilt: -1, zoom }),
+      (error) => error.statusCode === 400 && /目标 Z/.test(error.message));
+  }
+  assert.equal(requests, 0);
 });
 
 test('启动请求尚未结束时 stop 排在它之后，冲突请求不破坏停止顺序，停止失败可重试', async (t) => {

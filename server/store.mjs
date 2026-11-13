@@ -5,10 +5,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { httpError } from './errors.mjs';
 
 export const calibrationKeys = ['longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'];
-const cameraKeys = ['name', 'serial', 'code', ...calibrationKeys];
+const cameraKeys = ['name', 'serial', 'code', 'maxZoom', ...calibrationKeys];
 const zeroCorrections = { tiltOffset: 0, imageRoll: 0 };
+const plotLayerColumns = 'id, name, sourceFileName, byteLength, featureCount, geometryTypes, createdAt, updatedAt';
 
-function cameraRecord(row) { return { ...zeroCorrections, ...row }; }
+const defaultMaxZoom = (name) => name === '天津船闸' ? 32 : 73;
+function cameraRecord(row) { return { ...zeroCorrections, maxZoom: defaultMaxZoom(row.name), ...row }; }
 
 function snapshotRecord(row) {
   const snapshot = JSON.parse(row.metadata);
@@ -30,6 +32,7 @@ export class CameraStore {
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS cameras (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, serial TEXT NOT NULL, code TEXT NOT NULL,
+        maxZoom REAL NOT NULL DEFAULT 73,
         longitude REAL, latitude REAL, height REAL,
         pAxisPitch REAL NOT NULL, pAxisRoll REAL NOT NULL, panOffset REAL NOT NULL,
         tiltOffset REAL NOT NULL DEFAULT 0, imageRoll REAL NOT NULL DEFAULT 0,
@@ -55,13 +58,27 @@ export class CameraStore {
         taskId TEXT NOT NULL REFERENCES recognition_tasks(id), snapshotId TEXT NOT NULL,
         position INTEGER NOT NULL, metadata TEXT NOT NULL, PRIMARY KEY(taskId, snapshotId)
       );
+      CREATE TABLE IF NOT EXISTS plot_layers (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, sourceFileName TEXT NOT NULL, geojsonText TEXT NOT NULL,
+        byteLength INTEGER NOT NULL, featureCount INTEGER NOT NULL, geometryTypes TEXT NOT NULL,
+        createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS plot_layer_cameras (
+        layerId TEXT NOT NULL REFERENCES plot_layers(id) ON DELETE CASCADE,
+        cameraId TEXT NOT NULL REFERENCES cameras(id), visible INTEGER NOT NULL CHECK (visible IN (0, 1)),
+        PRIMARY KEY(layerId, cameraId)
+      );
     `);
       const columns = new Set(this.db.prepare('PRAGMA table_info(cameras)').all().map((column) => column.name));
       const missing = Object.keys(zeroCorrections).filter((key) => !columns.has(key));
-      if (missing.length) {
+      if (missing.length || !columns.has('maxZoom')) {
         this.db.exec('BEGIN IMMEDIATE');
         try {
           for (const key of missing) this.db.exec(`ALTER TABLE cameras ADD COLUMN ${key} REAL NOT NULL DEFAULT 0`);
+          if (!columns.has('maxZoom')) {
+            this.db.exec('ALTER TABLE cameras ADD COLUMN maxZoom REAL NOT NULL DEFAULT 73');
+            this.db.prepare('UPDATE cameras SET maxZoom = 32 WHERE name = ?').run('天津船闸');
+          }
           this.db.exec('COMMIT');
         } catch (error) {
           this.db.exec('ROLLBACK');
@@ -111,11 +128,12 @@ export class CameraStore {
   }
 
   saveCamera(input, id) {
-    const values = cameraKeys.map((key) => input[key]);
+    const previous = id ? this.getCamera(id) : null;
+    const record = { ...input, maxZoom: input.maxZoom ?? previous?.maxZoom ?? defaultMaxZoom(input.name) };
+    const values = cameraKeys.map((key) => record[key]);
     const now = new Date().toISOString();
     try {
       if (id) {
-        this.getCamera(id);
         this.db.prepare(`UPDATE cameras SET ${cameraKeys.map((key) => `${key} = ?`).join(', ')}, updatedAt = ? WHERE id = ?`)
           .run(...values, now, id);
       } else {
@@ -128,6 +146,73 @@ export class CameraStore {
       throw error;
     }
     return this.getCamera(id);
+  }
+
+  plotLayerRecord(row) {
+    return { ...row, geometryTypes: JSON.parse(row.geometryTypes),
+      associations: this.db.prepare('SELECT cameraId, visible FROM plot_layer_cameras WHERE layerId = ? ORDER BY cameraId')
+        .all(row.id).map((association) => ({ ...association, visible: Boolean(association.visible) })) };
+  }
+
+  listPlotLayers() {
+    return this.db.prepare(`SELECT ${plotLayerColumns} FROM plot_layers ORDER BY createdAt, id`).all()
+      .map((row) => this.plotLayerRecord(row));
+  }
+
+  getPlotLayer(id) {
+    const row = this.db.prepare('SELECT * FROM plot_layers WHERE id = ?').get(id);
+    if (!row) throw httpError(404, '标绘图层不存在');
+    return this.plotLayerRecord(row);
+  }
+
+  importPlotLayer(input) {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    this.transaction(() => {
+      const cameraIds = [...new Set(input.cameraIds)];
+      for (const cameraId of cameraIds) this.getCamera(cameraId);
+      this.db.prepare(`INSERT INTO plot_layers (${plotLayerColumns}, geojsonText) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, input.name, input.sourceFileName, input.byteLength, input.featureCount,
+          JSON.stringify(input.geometryTypes), now, now, input.geojsonText);
+      const associate = this.db.prepare('INSERT INTO plot_layer_cameras (layerId, cameraId, visible) VALUES (?, ?, 1)');
+      for (const cameraId of cameraIds) associate.run(id, cameraId);
+    });
+    return this.getPlotLayer(id);
+  }
+
+  setPlotLayerVisibility(id, cameraId, visible) {
+    this.transaction(() => {
+      this.getPlotLayer(id);
+      this.getCamera(cameraId);
+      const changed = this.db.prepare('UPDATE plot_layer_cameras SET visible = ? WHERE layerId = ? AND cameraId = ?')
+        .run(Number(visible), id, cameraId).changes;
+      if (!changed) throw httpError(404, '该摄像头未关联此标绘图层');
+      this.db.prepare('UPDATE plot_layers SET updatedAt = ? WHERE id = ?').run(new Date().toISOString(), id);
+    });
+    return { cameraId, visible };
+  }
+
+  savePlotLayer(id, input) {
+    this.transaction(() => {
+      const previous = this.getPlotLayer(id);
+      const cameraIds = new Set(input.cameraIds);
+      for (const cameraId of cameraIds) this.getCamera(cameraId);
+      this.db.prepare('UPDATE plot_layers SET name = ?, updatedAt = ? WHERE id = ?')
+        .run(input.name, new Date().toISOString(), id);
+      const detach = this.db.prepare('DELETE FROM plot_layer_cameras WHERE layerId = ? AND cameraId = ?');
+      for (const association of previous.associations) {
+        if (!cameraIds.has(association.cameraId)) detach.run(id, association.cameraId);
+      }
+      const associate = this.db.prepare('INSERT OR IGNORE INTO plot_layer_cameras (layerId, cameraId, visible) VALUES (?, ?, 1)');
+      for (const cameraId of cameraIds) associate.run(id, cameraId);
+    });
+    const { geojsonText, ...summary } = this.getPlotLayer(id);
+    return summary;
+  }
+
+  deletePlotLayer(id) {
+    this.getPlotLayer(id);
+    this.db.prepare('DELETE FROM plot_layers WHERE id = ?').run(id);
   }
 
   addSnapshot(snapshot) {
@@ -247,12 +332,13 @@ export class CameraStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
-  addRecognitionTask(task, items) {
+  addRecognitionTask(task, items, associateSource = false) {
     this.transaction(() => {
       this.db.prepare('INSERT INTO recognition_tasks VALUES (?, ?, ?, ?)')
         .run(task.id, task.cameraId, task.createdAt, JSON.stringify(task));
       const insert = this.db.prepare('INSERT INTO recognition_items VALUES (?, ?, ?, ?)');
       items.forEach((item, index) => insert.run(task.id, item.snapshotId, index, JSON.stringify(item)));
+      if (associateSource) this.updateSnapshotGroup(task.sourceTaskId, { recognitionTaskId: task.id, recognitionError: null });
     });
   }
 

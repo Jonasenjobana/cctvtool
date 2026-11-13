@@ -13,15 +13,18 @@ export interface CameraInput extends Calibration {
   name: string;
   serial: string;
   code: string;
+  maxZoom?: number;
 }
 
 export interface Camera extends CameraInput {
   id: string;
+  maxZoom: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type CameraDraft = Omit<CameraInput, 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll'> & {
+export type CameraDraft = Omit<CameraInput, 'maxZoom' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll'> & {
+  maxZoom?: number | null;
   pAxisPitch: number | null;
   pAxisRoll: number | null;
   panOffset: number | null;
@@ -146,7 +149,7 @@ export interface PlaybackSource {
 
 export function emptyCamera(): CameraDraft {
   return {
-    name: '', serial: '', code: '', longitude: null, latitude: null, height: null,
+    name: '', serial: '', code: '', maxZoom: 73, longitude: null, latitude: null, height: null,
     pAxisPitch: 0, pAxisRoll: 0, panOffset: 0, tiltOffset: 0, imageRoll: 0,
   };
 }

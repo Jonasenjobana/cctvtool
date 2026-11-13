@@ -124,6 +124,13 @@ export class LiveGbsClient {
   }
 
   preciseControl(camera, target) {
+    if (!Number.isFinite(target.tilt) || target.tilt < -90 || target.tilt > 90) {
+      throw httpError(400, '目标 T 必须位于 -90～90°，负值上抬、正值下俯');
+    }
+    const maxZoom = camera.maxZoom ?? 73;
+    if (!Number.isFinite(target.zoom) || target.zoom < 1 || target.zoom > maxZoom) {
+      throw httpError(400, `目标 Z 必须位于 1～${maxZoom}，请检查摄像头最大倍率设置`);
+    }
     return this.#sendControl('/api/v1/control/ptzprecise', camera, {
       pan: target.pan, tilt: target.tilt, zoom: target.zoom,
     });

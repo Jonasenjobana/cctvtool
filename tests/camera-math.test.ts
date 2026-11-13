@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Cartesian3, Cartographic, Matrix4, Transforms } from 'cesium';
-import { createCameraPose, footprintSegments, frustumCorners, observationFov, videoFovPlane } from '../src/app/camera-math.ts';
+import { createCameraPose, footprintSegments, frustumCorners, observationFov, pointTargetPtz, videoFovPlane } from '../src/app/camera-math.ts';
 import type { CameraDraft, RawPtz } from '../src/app/models.ts';
 
 const camera: CameraDraft = {
@@ -81,7 +81,7 @@ test('覆盖线只包含有限距离内的正向椭球交点，朝天时没有�
 test('视频截面四角与原始 FOV 一致，随倾斜 P 轴和 PTZ 变化，画面方向正确', () => {
   for (const pan of [0, 93, 359]) {
     const pose = createCameraPose({ ...camera, pAxisPitch: 12, pAxisRoll: -7, panOffset: 17 }, { ...ptz, Pan: pan, Tilt: 15 });
-    const plane = videoFovPlane(pose, 500, 16 / 9);
+    const plane = videoFovPlane(pose, 500);
     const vertices = [[-.5, .5], [.5, .5], [.5, -.5], [-.5, -.5]];
     const expected = frustumCorners(pose, 500);
     vertices.forEach(([x, y], index) => {
@@ -95,18 +95,24 @@ test('视频截面四角与原始 FOV 一致，随倾斜 P 轴和 PTZ 变化，�
   }
 });
 
-test('视频比例不匹配时通过透明留边保持原比例，不改变接口 FOV 或截面位置', () => {
-  const pose = createCameraPose(camera, { ...ptz, HorizontalFieldAngle: 80, VerticalFieldAngle: 30 });
-  const narrow = videoFovPlane(pose, 500, 1);
-  const wide = videoFovPlane(pose, 500, 4);
-  const aspect = Math.tan(40 * Math.PI / 180) / Math.tan(15 * Math.PI / 180);
-  near(narrow.uvScale.x, aspect);
-  near(narrow.uvScale.y, 1);
-  near(wide.uvScale.x, 1);
-  near(wide.uvScale.y, 4 / aspect);
-  assert.deepEqual(narrow.matrix, wide.matrix);
-  assert.equal(pose.horizontalFov, 80);
-  assert.equal(pose.verticalFov, 30);
+test('视频完整像素与两个独立 FOV 对应，和同一空间点的投影重合', () => {
+  for (const [horizontalFov, verticalFov] of [[17.11, 9.62], [30.8, 17.94], [80, 30]]) {
+    const pose = createCameraPose(camera, { ...ptz, HorizontalFieldAngle: horizontalFov, VerticalFieldAngle: verticalFov });
+    const plane = videoFovPlane(pose, 500);
+    const inverse = Matrix4.inverse(plane.matrix, new Matrix4());
+    for (const [x, y] of [[0, 0], [0.15, 0.2], [0.5, 0.5], [0.9, 0.85], [1, 1]]) {
+      const point = Cartesian3.add(pose.position, Cartesian3.multiplyByScalar(pose.direction, 500, new Cartesian3()), new Cartesian3());
+      Cartesian3.add(point, Cartesian3.multiplyByScalar(pose.right,
+        500 * (2 * x - 1) * Math.tan(horizontalFov * Math.PI / 360), new Cartesian3()), point);
+      Cartesian3.add(point, Cartesian3.multiplyByScalar(pose.up,
+        500 * (1 - 2 * y) * Math.tan(verticalFov * Math.PI / 360), new Cartesian3()), point);
+      const local = Matrix4.multiplyByPoint(inverse, point, new Cartesian3());
+      near(0.5 + local.x * plane.uvScale.x, x, 1e-8);
+      near(0.5 - local.y * plane.uvScale.y, y, 1e-8);
+    }
+    assert.equal(pose.horizontalFov, horizontalFov);
+    assert.equal(pose.verticalFov, verticalFov);
+  }
 });
 
 test('T 偏移正值上抬，画面 Roll 绕最终光轴旋转，两者不改变 P 轴或原始 PTZ', () => {
@@ -136,4 +142,96 @@ test('P 轴前后倾与局部 T 偏移在一个 P 朝向相似，转 P 后不可
   near(Cartesian3.distance(fromMount(0).direction, fromTilt(0).direction), 0);
   assert.ok(Cartesian3.distance(fromMount(90).direction, fromTilt(90).direction) > 0.05);
   assert.ok(Cartesian3.distance(fromMount(90).panAxis, fromTilt(90).panAxis) > 0.05);
+});
+
+test('临时点反算的原始 P/T 将光轴指向目标，覆盖安装倾斜、偏移和不同当前姿态', () => {
+  for (const setup of [camera, { ...camera, pAxisPitch: 12, pAxisRoll: -7, panOffset: 17, tiltOffset: 1.64, imageRoll: 23 }]) {
+    for (const target of [
+      { longitude: 113.91, latitude: 22.1 }, { longitude: 113.9, latitude: 22.11 },
+      { longitude: 113.88, latitude: 22.09 }, { longitude: 113.94, latitude: 22.13 },
+    ]) {
+      for (const [Pan, Tilt] of [[0, 0], [359, 30], [180, -30], [90, 60]]) {
+        const reading = { ...ptz, Pan, Tilt, Zoom: 8.8 };
+        const original = { ...reading };
+        const result = pointTargetPtz(setup, reading, target);
+        const pose = createCameraPose(setup, { ...reading, Pan: result.pan, Tilt: result.tilt });
+        const expected = Cartesian3.normalize(Cartesian3.subtract(
+          Cartesian3.fromDegrees(target.longitude, target.latitude, 0), pose.position, new Cartesian3(),
+        ), new Cartesian3());
+        near(Cartesian3.distance(pose.direction, expected), 0, 1e-10);
+        assert.ok(result.pan >= 0 && result.pan < 360);
+        assert.ok(result.tilt >= -90 && result.tilt <= 90);
+        assert.equal(result.zoom, 8.8);
+        assert.deepEqual(reading, original);
+      }
+    }
+  }
+});
+
+test('临时点反算在有符号 T 范围内选择较近的解，竖直指向保留当前 P', () => {
+  const target = { longitude: camera.longitude!, latitude: camera.latitude! + 0.01 };
+  const normal = pointTargetPtz(camera, { ...ptz, Pan: 180, Tilt: 0 }, target);
+  assert.ok(normal.tilt < 90);
+  near(Math.min(normal.pan, 360 - normal.pan), 0, 1e-8);
+  const tilted = { ...camera, pAxisPitch: -25, tiltOffset: 80 };
+  const forward = pointTargetPtz(tilted, { ...ptz, Pan: 0, Tilt: 60 }, target);
+  assert.ok(forward.tilt > 0 && forward.tilt < 90);
+  near(Math.min(forward.pan, 360 - forward.pan), 0, 1e-8);
+  const inverted = pointTargetPtz(tilted, { ...ptz, Pan: 180, Tilt: -80 }, target);
+  assert.ok(inverted.tilt > -90 && inverted.tilt < 0);
+  near(inverted.pan, 180, 1e-8);
+  const vertical = pointTargetPtz({ ...camera, longitude: 0, latitude: 0 }, { ...ptz, Pan: 123, Tilt: 25 }, {
+    longitude: 0, latitude: 0,
+  });
+  near(vertical.pan, 123, 1e-8);
+  near(vertical.tilt, 90, 1e-8);
+});
+
+test('临时点反算随位置高度更新，保持倍率且不依赖 FOV 或画面 Roll', () => {
+  const setup = { ...camera, longitude: 0, latitude: 0 };
+  const target = { longitude: 0, latitude: 0.01 };
+  const reading = { Pan: 30, Tilt: 10, Zoom: 37 };
+  const low = pointTargetPtz(setup, reading, target);
+  const high = pointTargetPtz({ ...setup, height: 200 }, reading, target);
+  assert.ok(high.tilt > low.tilt);
+  const east = pointTargetPtz(setup, reading, { longitude: 0.01, latitude: 0 });
+  near(east.pan, 90, 1e-8);
+  assert.deepEqual(pointTargetPtz({ ...setup, imageRoll: 71 }, reading, target), low);
+  assert.equal(high.zoom, 37);
+});
+
+test('临时点反算在跨经度 180°和极区使用同一 WGS84 目标方向', () => {
+  for (const [setup, target] of [
+    [{ ...camera, longitude: 179.99, latitude: 55 }, { longitude: -179.99, latitude: 55.001 }],
+    [{ ...camera, longitude: 0, latitude: 90 }, { longitude: 120, latitude: 89.99 }],
+  ] as [CameraDraft, { longitude: number; latitude: number }][]) {
+    const result = pointTargetPtz(setup, ptz, target);
+    const pose = createCameraPose(setup, { ...ptz, Pan: result.pan, Tilt: result.tilt });
+    const expected = Cartesian3.normalize(Cartesian3.subtract(
+      Cartesian3.fromDegrees(target.longitude, target.latitude, 0), pose.position, new Cartesian3(),
+    ), new Cartesian3());
+    near(Cartesian3.distance(pose.direction, expected), 0, 1e-10);
+  }
+});
+
+test('临时点反算明确拒绝缺少安装参数、非法读数、重合及椭球遮挡的目标', () => {
+  const target = { longitude: 113.91, latitude: 22.1 };
+  assert.throws(() => pointTargetPtz({ ...camera, height: null }, ptz, target), /高度/);
+  assert.throws(() => pointTargetPtz({ ...camera, pAxisPitch: null }, ptz, target), /前后倾/);
+  assert.throws(() => pointTargetPtz(camera, { ...ptz, Tilt: NaN }, target), /云台 T/);
+  for (const Tilt of [-91, 91, 359.9]) assert.throws(() => pointTargetPtz(camera, { ...ptz, Tilt }, target), /当前 T/);
+  assert.throws(() => pointTargetPtz(camera, { ...ptz, Zoom: 0 }, target), /倍率/);
+  assert.throws(() => pointTargetPtz(camera, ptz, { longitude: 181, latitude: 22 }), /经纬度/);
+  assert.throws(() => pointTargetPtz({ ...camera, height: 0 }, ptz, {
+    longitude: camera.longitude!, latitude: camera.latitude!,
+  }), /重合/);
+  assert.throws(() => pointTargetPtz(camera, ptz, { longitude: -66.1, latitude: -22.1 }), /可视范围/);
+  assert.throws(() => pointTargetPtz({ ...camera, tiltOffset: 90 }, ptz, target), /不可达/);
+});
+
+test('临时点追踪保留上抬负 T，不包装成 300 多度', () => {
+  const setup = { ...camera, longitude: 0, latitude: 0, height: 6.6, tiltOffset: -1 };
+  const result = pointTargetPtz(setup, { Pan: 0, Tilt: 2, Zoom: 8 }, { longitude: 0, latitude: 0.01 });
+  assert.ok(result.tilt < 0 && result.tilt > -1, `应为小幅负 T，实际 ${result.tilt}`);
+  assert.equal(result.zoom, 8);
 });

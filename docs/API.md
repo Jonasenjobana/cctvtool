@@ -25,7 +25,7 @@
 | `DELETE /api/plot-layers/:id` | 删除图层原文、元数据和全部摄像头关联，成功返回 HTTP 204 |
 | `GET /api/cameras/:id/ptz` | 返回 `{ raw, requestedAt, receivedAt, durationMs }`；`raw` 为上游 PTZ 业务值 |
 | `POST /api/cameras/:id/control` | 接收 `{ command, speed? }`，转发连续控制或停止，返回 `{ command, speed, sentAt }` |
-| `POST /api/cameras/:id/precise` | 接收完整 `{ pan, tilt, zoom }`，下发精确定位，返回 `{ target, sentAt }` |
+| `POST /api/cameras/:id/precise` | 接收完整 `{ pan, tilt, zoom }`，供高级表单和临时点手动追踪下发原始精确定位，返回 `{ target, sentAt }` |
 | `GET /api/cameras/:id/snapshots` | 返回该通道截图记录，按创建时间倒序排列 |
 | `POST /api/cameras/:id/snapshots` | 接收 `{ calibration? }`，完成前后回读、抓图、图片和元数据保存，返回 HTTP 201 及截图记录 |
 | `GET /api/snapshots/:id/image` | 读取已保存图片的二进制内容 |
@@ -55,6 +55,7 @@
   "name": "摄像头名称",
   "serial": "<SERIAL>",
   "code": "<CODE>",
+  "maxZoom": 73,
   "longitude": null,
   "latitude": null,
   "height": null,
@@ -70,11 +71,13 @@
 
 `panOffset` 表示安装坐标系的默认方位，真北为 0°、向东为 90°。固定安装矩阵为 `Rz(-panOffset) × Rx(pAxisPitch) × Ry(pAxisRoll)`，随后应用设备局部 `Rz(-Pan) × Rx(tiltOffset - Tilt) × Ry(imageRoll)`。前后倾和左右倾以此安装坐标系为参考，与参考 Cesium 场景的安装 Z-X-Y 旋转约定一致。
 
-应用启动时自动为旧数据库补齐两列，已存设备初始化为 0。读取历史截图时缺少两项按 0 处理，原始元数据保持不变；MCP 只读打开旧库时也按 0 兼容，不执行结构迁移。
+`maxZoom` 为每台摄像头持久保存的最大倍率，数字且不小于 1；新建请求省略时，名称为“天津船闸”默认 32，其他默认 73；更新请求省略时保留已保存值。名称变化不重置上限。前端在“设备信息”编辑并保存后生效，刷新及重启后保留。该字段是设备配置，不属于历史截图的 `calibration`。
+
+应用启动时自动为旧数据库补齐 `tiltOffset/imageRoll/maxZoom`，两项修正初始化为 0，最大倍率按上述设备默认值初始化，已有值不重置。读取历史截图时缺少两项修正按 0 处理，原始元数据保持不变；MCP 只读打开旧库时按同样默认值兼容，不执行结构迁移。
 
 `command` 可选 `left/right/up/down/upleft/upright/downleft/downright/zoomin/zoomout/stop`，`speed` 为 0～255 整数，省略时使用 129。连续控制直接调用上游 `/api/v1/control/ptz`，不预先回读，不计算角度目标。前端方向和变倍按钮按下发送启动、松手发送 stop，界面保持 PTZ 轮询。
 
-精确定位使用独立 `/api/cameras/:id/precise`，要求完整提交 `pan/tilt/zoom`，P/T 范围 0～360°，Z 最小为 1。高级表单展开和编辑不发指令，点击提交才调用上游 `/api/v1/control/ptzprecise`。P/T 偏移及画面 Roll 均不加入任何控制参数，原始回读也不修改。接口返回仅表示请求已发送，设备位置及停稳状态以回读和现场为准。
+精确定位使用独立 `/api/cameras/:id/precise`，要求完整提交 `pan/tilt/zoom`，P 为 0～360°，T 为 -90～90°、负值上抬且正值下俯，Z 为 1 至该摄像头已保存的 `maxZoom`。高级表单展开和编辑不发指令，点击提交才调用上游 `/api/v1/control/ptzprecise`。临时点手动追踪由前端根据当前安装位置、姿态及零高程目标反算原始 P/T，点击后先重新回读 PTZ；普通点保留该次 Zoom，带船体尺寸的点根据同次 Z/HFOV/VFOV 估算横纵占比不超过 50% 的倍率，并受该摄像头已保存的最大 Z 约束，再调用此接口。船体尺寸、船高及朝向只保留在前端，不加入请求或数据库；估算假设及边界见 [README](../README.md#cesium-视场与最佳观察)。P/T 仅从 T 合法范围内选择更接近当前读数的解，停止、切页、保存修改或删除目标使回读后尚未下发的追踪失效。后端原样转发原始目标，不再次叠加安装修正，原始回读也不修改。HTTP 校验和 LiveGBS 下发边界均拒绝越界 T 与 Z，扫描下发也遵守当前设备最大 Z；负 T 不包装成 360°附近的数值。接口返回仅表示请求已发送，设备位置及停稳状态以回读和现场为准。
 
 截图的 `calibration` 包含 `longitude`、`latitude`、`height`、`pAxisPitch`、`pAxisRoll`、`panOffset`、`tiltOffset`、`imageRoll` 八个字段；提供时需完整提交，省略时使用数据库配置。前端提交当前表单草稿，后端将其作为该样本的参数副本，不覆盖设备配置。
 
@@ -119,16 +122,16 @@ Content-Type: application/json
 
 | 字段 | 约定 |
 | --- | --- |
-| `basePtz` | 必填，当前已调好的 `{ pan, tilt, zoom }`；P/T 为 0～360°，Z ≥ 1。若与新的回读不符返回 409 |
-| `panMin`、`panMax` | 必填，设备原始 P 的目标中心范围，0 ≤ 最小 < 最大 ≤ 360；不跨 0°，不叠加安装偏移 |
+| `basePtz` | 必填，当前已调好的 `{ pan, tilt, zoom }`；P 为 0～360°，T 为 -90～90°，Z ≥ 1。若与新的回读不符返回 409 |
+| `panMin`、`panMax` | 必填，设备原始 P，均为 0～360°，不叠加安装偏移。普通模式分别表示起始／结束 P，结束值小于起始值时沿 P 递增方向跨 0°；海天线模式表示最小／最大 P，要求最小值小于最大值且不跨 0° |
 | `settleMs` | 可选，稳定等待时间，默认 1000 毫秒，0～10000；即使为 0 也至少要求两次到位回读 |
 | `moveTimeoutMs` | 可选，每点定位稳定等待上限，默认 30000 毫秒，1000～120000 |
 | `calibration` | 可选，完整安装参数副本，语义与单张截图一致；省略用已保存配置。实时表单提交当前草稿 |
-| `horizon` | 可选，`{ preScanZoom, tiltMin, tiltMax }` 创建低倍率预扫；预扫倍率 ≥ 1 且小于当前 Z，0 ≤ 最小 T < 最大 T ≤ 360，当前 T 须在其中；P 覆盖至少 30°，建议 90°以上。T 填写设备实际可达范围，0°～360°只是接口允许值 |
+| `horizon` | 可选，`{ preScanZoom, tiltMin, tiltMax }` 创建低倍率预扫；预扫倍率 ≥ 1 且小于当前 Z，-90 ≤ 最小 T < 最大 T ≤ 90，当前 T 须在其中；P 覆盖至少 30°，建议 90°以上。允许 T 可按设备进一步机械限制收窄 |
 
-普通模式省略 `horizon`。HFOV 从启动时当前倍率的 PTZ 接口读取，必须为 0°～180°之间的有效值。张数 `N = ceil((panMax - panMin) / HFOV)`，步长 `S = (panMax - panMin) / N`，第 `i` 个目标为 `panMin + (i + 0.5) × S`（`i` 从 0 开始）。150°扇区、30°视场角产生 5 张；0°～150°时目标 P 为 15°、45°、75°、105°、135°。普通模式每次提交精确 PTZ 时固定任务原始的 T/Z。上限为 10000 张，超限返回 400；海天线模式见[分阶段接口](#海天线预扫描与正式扫描接口)。
+普通模式省略 `horizon`。HFOV 从启动时当前倍率的 PTZ 接口读取，必须为 0°～180°之间的有效值。跨度 `D = panMax - panMin`，负值时加 360°，要求 `D > 0`；相同起止值和 `360 → 0` 返回 400，`0 → 360` 表示完整一周。张数 `N = ceil(D / HFOV)`，步长 `S = D / N`，第 `i` 个目标为 `(panMin + (i + 0.5) × S) % 360`（`i` 从 0 开始）。0° → 150°、30°视场角产生 5 张，目标 P 为 15°、45°、75°、105°、135°；347° → 9° 的跨度为 22°，8°视场角产生 3 张，目标 P 约为 350.667°、358°、5.333°。普通模式每次提交精确 PTZ 时固定任务原始的 T/Z；停稳检查中 P 按环形角比较，T 按有符号差值直接比较。上限为 10000 张，超限返回 400；海天线模式见[分阶段接口](#海天线预扫描与正式扫描接口)。
 
-启动成功返回 HTTP 202 和 `Location: /api/snapshot-groups/<GROUP_ID>`。任务摘要含 `id`、`cameraId`、`kind: "scan"`、`status`、`basePtz`、`panMin/panMax`、`horizontalFieldAngle`、`sampleCount`、`panStep`、`completedCount`、`snapshotCount`、`createdAt`、`finishedAt` 和 `error`。`completedCount` 是已完成采样点数；`snapshotCount` 是当前未删除的图片数，两者在删图后可能不同。
+启动成功返回 HTTP 202 和 `Location: /api/snapshot-groups/<GROUP_ID>`。任务摘要含 `id`、`cameraId`、`kind: "scan"`、`status`、`basePtz`、`panMin/panMax`、`horizontalFieldAngle`、`sampleCount`、`panStep`、`completedCount`、`snapshotCount`、`createdAt`、`finishedAt` 和 `error`。`panMin/panMax` 保留提交的原始起止值，跨 0° 任务的 `panStep` 仍为正值。`completedCount` 是已完成采样点数；`snapshotCount` 是当前未删除的图片数，两者在删图后可能不同。
 
 海天线任务额外返回 `horizon`，含 `phase: "coarse" | "fine"`、`targetZoom`、`tiltMin/tiltMax`、`targetHorizontalFov/targetVerticalFov`；正式阶段另含 `sourceRecognitionTaskId/sourceRevision/sourceResultId`。任务摘要可带 `recognitionTaskId` 或 `recognitionError`，分别用于打开自动创建的识别任务或显示创建失败。创建识别失败不更改已完成截图的状态，现存截图仍可手动创建识别。
 
@@ -187,7 +190,7 @@ Content-Type: application/json
 
 模型无有效点位、采样姿态变化或同组局部倾角/归一化高度突变时默认忽略。邻域、MAD 和最小门槛见 README。突变过滤只比较同一 T/Z/FOV，变 T 的正式扫描不能获得与固定 T 扫描相同的支持，不按图像行位置直接比较不同 T 样本。自动忽略可手动恢复，恢复前必须有合法点位。过滤不保证边界一定是真正海天线。
 
-`generate` 使用当前设备经纬度、高度及默认朝向，以及未忽略截图的真实 PTZ/FOV。模型 `wgs84-horizon-installation-v1` 联合求解 `pAxisPitch/pAxisRoll/tiltOffset/imageRoll`，复用共用旋转链、WGS84 残差和稳健损失。`result.status` 为 `estimated/insufficient_data/unreliable`，只有 `estimated` 包含 `installation` 四项数值。至少 3 张有效图、3 个 P 方向、覆盖 30°；必须收敛、未加阻尼的四参数矩阵条件数小于 `1e8`，各图等权的 RMS 不超过 5 像素。`diagnostics.perSnapshot` 给出逐图像素残差，`diagnostics.rmsAngularResidualDegrees` 给出参与样本真实射线的角度均方根残差，排除项列在 `excluded`。低倍率的像素门槛不直接保证高倍率精度。
+`generate` 使用当前设备经纬度、高度及默认朝向，以及未忽略截图的真实 PTZ/FOV。模型 `wgs84-horizon-installation-v1` 联合求解 `pAxisPitch/pAxisRoll/tiltOffset/imageRoll`，复用共用旋转链、WGS84 残差和稳健损失。`result.status` 为 `estimated/insufficient_data/unreliable`，只有 `estimated` 包含 `installation` 四项数值。有效样本参与拟合后，必须收敛、未加阻尼的四参数矩阵条件数小于 `1e8`，各图等权的 RMS 不超过 5 像素；否则返回 `unreliable`。没有有效样本时返回 `insufficient_data`。张数、不同 P 方向数和覆盖范围用于查看分布，样本较少或方向集中时对标注及固定参数误差更敏感。`diagnostics.perSnapshot` 给出逐图像素残差，`diagnostics.rmsAngularResidualDegrees` 给出参与样本真实射线的角度均方根残差，排除项列在 `excluded`。低倍率的像素门槛不直接保证高倍率精度。
 
 `generate` 每次产生新的 `resultId` 并清除当前结果的应用状态。`apply` 必须同时提交读取的 `revision` 与 `resultId`，只读取服务端保存的合格结果，不接收前端角度值；校验标注版本、结果编号、计算参考的当前设备配置、设备通道、源记录仍存在以及设备未被控制/截图占用。在同一事务中更新四项修正与应用状态，其他设备字段保持原值；不调用 LiveGBS 控制、修改原始 PTZ 或回写历史截图。成功后记录 `appliedAt/appliedRevision`；无合格结果、配置改变、源图删除、过期版本或重复应用返回 409。此写入能力仅属于本地网页流程，MCP 工具继续只读且只估计两个 P 轴倾角。
 
@@ -227,7 +230,7 @@ HTTP 请求按次处理，无会话 ID，支持多个客户端以及 2025 版 St
 | `get_snapshot` | `snapshotId` | 原始截图的 MCP `image` 内容块及 `structuredContent` 元数据 |
 | `estimate_p_axis_tilt` | `cameraId`、`startTime`、`endTime`、`observations` | 倾斜估计、来源、假设和残差；不修改配置 |
 
-`startTime/endTime` 使用带时区的 ISO 时间，统一转换为 UTC；按截图 `createdAt` 筛选，开始包含、结束不包含。缺少时区、结束早于开始或摄像头不存在时明确报错。分页中的方向分布仅代表本页，读取其他页需继续使用 `nextOffset`。
+`startTime/endTime` 使用带时区的 ISO 时间，统一转换为 UTC；按截图 `createdAt` 筛选，开始包含、结束不包含。缺少时区、结束早于开始或摄像头不存在时明确报错。查询的 `pageSampling` 返回本页 `stableSnapshotCount`、`distinctPanCount` 和 `panCoverageDegrees`，用于查看样本分布；读取其他页需继续使用 `nextOffset`。
 
 `get_snapshot` 返回原始分辨率，支持 JPEG／PNG；图片文件缺失、无法识别或尺寸与记录不一致时返回工具错误。AI 应识别远处海天线，避开文字、船体、养殖网、近处波浪及岸线；无法确认时跳过该图。
 
@@ -247,7 +250,7 @@ HTTP 请求按次处理，无会话 ID，支持多个客户端以及 2025 版 St
 
 ### 数据质量与拟合模型
 
-- 至少 3 张有效停稳截图、3 个不同 P 方向，P 的圆周覆盖至少 30°，建议 90°以上。
+- 使用停稳且海天线可确认的截图；张数、不同 P 方向数和圆周覆盖范围用于查看样本分布。样本较少或方向集中时，结果对标注及固定参数误差更敏感。
 - 同一截图不能重复。截图不属于指定摄像头或时间段时拒绝请求；采样期间姿态改变、PTZ/FOV 无效、尺寸无效或历史通道与当前配置不一致时排除该样本并返回原因。
 - 固定当前已保存的经纬度、高度、P/T 偏移和画面 Roll 修正，只拟合 `pAxisPitch/pAxisRoll`；旧截图中的安装参数只作采样记录，不作为真实轴倾角。T 偏移与画面 Roll 本次不联合求解，其输入误差可能影响 P 轴倾斜估计。
 - 前端与拟合共用 `shared/camera-rotation.ts`：安装朝向、前后倾和左右倾按 Z-X-Y 组成固定底座，再应用局部 P/T 和画面 Roll。P 偏移只在固定安装矩阵中应用一次。
@@ -263,7 +266,7 @@ HTTP 请求按次处理，无会话 ID，支持多个客户端以及 2025 版 St
 | `fixedCalibration` | 本次固定采用的经纬度、高度、P/T 偏移、画面 Roll 修正和配置更新时间 |
 | `sourceSnapshotIds`、`observations`、`excluded` | 实际使用的样本、输入标注和排除原因 |
 | `distinctPanCount`、`panCoverageDegrees` | 样本的不同 P 方向数和圆周覆盖范围 |
-| `diagnostics` | 收敛、迭代、条件数、总体及逐图误差；有效样本不足时不进行拟合 |
+| `diagnostics` | 收敛、迭代、条件数、总体及逐图误差；没有有效样本时不进行拟合 |
 | `assumptions`、`warnings` | 模型条件及尚未验证的因素 |
 | `applied` | 始终为 `false`，结果仅通过 MCP 返回 |
 
@@ -343,7 +346,8 @@ GET <LIVEGBS_ORIGIN>/api/v1/device/fetchptzposition?token=<TOKEN>&serial=<SERIAL
 | 字段 | 实测类型与含义 |
 | --- | --- |
 | `DeviceID` | 字符串，本样本等于请求的通道 `code`，不是设备 `serial` |
-| `Pan`、`Tilt` | 数字；画面 OSD 的取整读数与本次读数接近，单位、零位、方向和范围仍需设备契约确认 |
+| `Pan` | 数字；按 0～360°处理，安装零位与真实方向仍需现场复核 |
+| `Tilt` | 数字，-90～90°；负值上抬、正值下俯，原始读数保持有符号数值 |
 | `Zoom` | 数字，本次为 `15`，与画面 OSD 的 `Z015` 一致；是否始终表示光学倍率待确认 |
 | `HorizontalFieldAngle`、`VerticalFieldAngle` | 数字，分别表示水平／垂直视场角；单位、来源和准确性待确认 |
 | `MaxViewDistance` | 数字，本次为 `0`；单位及 `0` 的语义未确认，不直接作为投影距离上限 |
@@ -352,11 +356,11 @@ GET <LIVEGBS_ORIGIN>/api/v1/device/fetchptzposition?token=<TOKEN>&serial=<SERIAL
 
 工具直接将 `HorizontalFieldAngle`、`VerticalFieldAngle` 分别用作 HFOV、VFOV，作为三维投影的唯一视场角来源，并与同次响应中的 `Pan`、`Tilt`、`Zoom` 一起更新和保存。视场角缺失或无效时，显示接口数据异常，当前实时投影不可用。`Zoom` 用于变倍控制与读数展示。
 
-每个注册通道使用一套投影模型。安装位置、P 轴姿态、默认朝向（P 偏移）、T 偏移和画面 Roll 修正由本工具的数据库配置提供；这些修正只在投影计算中应用，原始 PTZ 及下发给 LiveGBS 的控制参数保持设备语义。表单字段及保存流程见 [README](../README.md#表单保存)。
+每个注册通道使用一套投影模型。安装位置、P 轴姿态、默认朝向（P 偏移）、T 偏移和画面 Roll 修正由本工具的数据库配置提供，用于投影及临时点目标反算；原始 PTZ 及下发给 LiveGBS 的控制参数保持设备语义，T 保留 -90～90°有符号值。表单字段及保存流程见 [README](../README.md#表单保存)。
 
 响应中未见设备采样时间字段。接入端需要自行记录请求起止及接收时间，原始值与展示格式分开处理，不套用参考项目的 PTZ 解码。
 
-前述 curl 的 4 次端到端回读耗时为 179、188、406、229 毫秒，平均约 251 毫秒；新后端一次真实回读为 146 毫秒。以上仅为测量样本，不作为固定响应时限；前端当前按 1000 毫秒轮询，前一请求未完成时跳过本轮。
+前述 curl 的 4 次端到端回读耗时为 179、188、406、229 毫秒，平均约 251 毫秒；新后端一次真实回读为 146 毫秒。以上仅为测量样本，不作为固定响应时限。前端选择设备后立即读取一次，随后按页面设置的间隔轮询，默认 10 秒，可填写 1～3600 的整数秒，刷新页面后恢复默认值。修改间隔保留正在执行的回读，前一请求未完成时跳过本轮；该设置仅影响前端自动回读，不改变上游请求超时或后端截图任务的采样流程。
 
 ### 未认证响应
 
@@ -452,7 +456,7 @@ PTZ 与快照来自不同请求，不具备已确认的同步保证。保存快�
 
 1. 目标 LiveGBS 版本、登录密码的转换方式、token 过期与刷新行为，以及其他 token 字段的用途。
 2. 登录失败、设备离线、无效通道、连续及精确控制的响应结构，以及 HTTP 200 下是否可能返回业务错误；真实移动、变倍及 stop 效果需在具备现场操作条件时验证。
-3. P／T 的单位、方向、零点和范围，Z 与视场角的来源及单位，`MaxViewDistance=0` 的含义；控制速度与设备运动速度的对应关系，以及精确定位的范围和到位语义。
+3. P 的单位、方向与安装零位，Z 与视场角的来源及单位，`MaxViewDistance=0` 的含义；控制速度与设备运动速度的对应关系，以及 T -90～90°内进一步的机械限制与精确定位到位语义。
 4. 快照时间头的准确语义、时区、缓存行为与时钟校准；显式尺寸、PNG、历史快照及能够接受的 PTZ 时间对应误差。
 5. 接口响应耗时、超时及轮询频率，设备停稳的判断依据。
 6. 若需要自动枚举设备／通道，需补充设备列表与通道列表的完整契约；当前按选中摄像头已保存的 serial／code 拼接 WS-FLV 地址。

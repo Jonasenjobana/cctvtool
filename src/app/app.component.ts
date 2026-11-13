@@ -1,11 +1,14 @@
 import { DatePipe, DecimalPipe } from '@angular/common';
 import { ChangeDetectionStrategy, Component, HostListener, ViewChild, computed, effect, inject, signal, untracked } from '@angular/core';
 import type { OnDestroy } from '@angular/core';
+import { toObservable } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
-import { EMPTY, catchError, exhaustMap, firstValueFrom, timer } from 'rxjs';
+import { EMPTY, catchError, exhaustMap, firstValueFrom, switchMap, timer } from 'rxjs';
 import type { Subscription } from 'rxjs';
 import { ApiService, errorMessage } from './api.service';
 import { CameraSceneComponent } from './camera-scene.component';
+import type { TemporaryMapPoint } from './camera-scene.component';
+import { estimateVesselZoom, pointTargetPtz, vesselCorners } from './camera-math';
 import { IconComponent } from './icon.component';
 import { LiveVideoComponent } from './live-video.component';
 import { CalibrationHelpComponent } from './calibration-help.component';
@@ -16,11 +19,11 @@ import { PlotLayersComponent } from './plot-layers.component';
 import { PlotLayerState } from './plot-layer-state.service';
 import { HoldPtzControl } from './hold-ptz-control';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
-import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, Snapshot, SnapshotGroup } from './models';
+import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
 import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
-const editableKeys = ['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
-type NumericField = 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
+const editableKeys = ['name', 'serial', 'code', 'maxZoom', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
+type NumericField = 'maxZoom' | 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
 
 @Component({
   selector: 'app-root',
@@ -39,6 +42,7 @@ export class AppComponent implements OnDestroy {
   readonly selectedId = signal('');
   readonly draft = signal<CameraDraft>(emptyCamera());
   readonly reading = signal<PtzReading | null>(null);
+  readonly ptzPollingIntervalSeconds = signal(10);
   readonly stale = signal(true);
   readonly snapshots = signal<Snapshot[]>([]);
   readonly snapshotGroups = signal<SnapshotGroup[]>([]);
@@ -49,6 +53,17 @@ export class AppComponent implements OnDestroy {
   readonly deletingSnapshot = signal(false);
   readonly page = signal<'scene' | 'tasks' | 'recognition' | 'plotting'>('scene');
   readonly showPlotPanel = signal(false);
+  readonly showTemporaryPoints = signal(false);
+  readonly temporaryPoints = signal<readonly TemporaryMapPoint[]>([]);
+  readonly pointLongitude = signal<number | null>(null);
+  readonly pointLatitude = signal<number | null>(null);
+  readonly pointLength = signal<number | null>(null);
+  readonly pointWidth = signal<number | null>(null);
+  readonly pointHeading = signal<number | null>(0);
+  readonly pointHeight = signal<number | null>(null);
+  readonly editingPointId = signal<number | null>(null);
+  readonly pointError = signal('');
+  private nextTemporaryPointId = 0;
   readonly plotPreparing = signal(false);
   readonly plotFocusRequest = signal<PlotLayerFocusRequest | null>(null);
   readonly cameraPlotLayers = computed(() => {
@@ -71,8 +86,8 @@ export class AppComponent implements OnDestroy {
   readonly scanPanMin = signal<number | null>(0);
   readonly scanPanMax = signal<number | null>(150);
   readonly preScanZoom = signal<number | null>(1);
-  readonly scanTiltMin = signal<number | null>(0);
-  readonly scanTiltMax = signal<number | null>(360);
+  readonly scanTiltMin = signal<number | null>(-90);
+  readonly scanTiltMax = signal<number | null>(90);
   readonly currentScan = computed(() => this.snapshotGroups().find((group) => group.kind === 'scan' && ['running', 'pausing'].includes(group.status))
     || this.snapshotGroups().find((group) => group.kind === 'scan') || null);
   readonly scanning = computed(() => ['running', 'pausing'].includes(this.currentScan()?.status || ''));
@@ -113,12 +128,14 @@ export class AppComponent implements OnDestroy {
   private pressedButton: HTMLButtonElement | null = null;
   private keyboardHeld = false;
   readonly selectedCamera = computed(() => this.cameras().find((camera) => camera.id === this.selectedId()) || null);
+  readonly pointZoomMax = computed(() => this.selectedCamera()?.maxZoom ?? 73);
   readonly currentReading = computed(() => this.selectedSnapshot()?.ptz || this.reading());
   readonly sceneReading = computed(() => this.selectedSnapshot()?.ptz || (this.stale() ? null : this.reading()));
   readonly formValue = computed<CameraDraft>(() => {
     const snapshot = this.selectedSnapshot();
     return snapshot ? {
-      name: snapshot.cameraName, serial: snapshot.serial, code: snapshot.code, ...snapshot.calibration,
+      name: snapshot.cameraName, serial: snapshot.serial, code: snapshot.code,
+      maxZoom: this.selectedCamera()?.maxZoom, ...snapshot.calibration,
     } : this.draft();
   });
   readonly sceneCamera = computed(() => this.selectedId() ? this.formValue() : null);
@@ -139,6 +156,7 @@ export class AppComponent implements OnDestroy {
   readonly formValid = computed(() => {
     const draft = this.draft();
     return [draft.name, draft.serial, draft.code].every((value) => value.trim().length > 0)
+      && this.inRange(draft.maxZoom ?? null, 1, Number.MAX_VALUE)
       && this.inRange(draft.longitude, -180, 180, true)
       && this.inRange(draft.latitude, -90, 90, true)
       && this.inRange(draft.height, 0, 100000, true)
@@ -153,17 +171,31 @@ export class AppComponent implements OnDestroy {
   readonly canPrecise = computed(() => {
     const target = this.preciseTarget();
     return Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning()
-      && this.inRange(target.pan, 0, 360) && this.inRange(target.tilt, 0, 360) && this.inRange(target.zoom, 1, Number.MAX_VALUE));
+      && this.inRange(target.pan, 0, 360) && this.inRange(target.tilt, -90, 90) && this.inRange(target.zoom, 1, this.pointZoomMax()));
   });
   readonly canCapture = computed(() => Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning() && this.formValid()));
-  readonly canScan = computed(() => this.canCapture() && this.inRange(this.scanPanMin(), 0, 360)
-    && this.inRange(this.scanPanMax(), 0, 360) && this.scanPanMax()! > this.scanPanMin()!
-    && (this.scanMode() === 'fixed' || (!this.stale() && !!this.reading()
-      && this.scanPanMax()! - this.scanPanMin()! >= 30
-      && this.inRange(this.preScanZoom(), 1, Number.MAX_VALUE) && this.preScanZoom()! < this.reading()!.raw.Zoom
-      && this.inRange(this.scanTiltMin(), 0, 360) && this.inRange(this.scanTiltMax(), 0, 360)
-      && this.scanTiltMin()! < this.scanTiltMax()!
-      && this.inRange(this.reading()!.raw.Tilt, this.scanTiltMin()!, this.scanTiltMax()!))));
+  readonly canTrackPoint = computed(() => this.page() === 'scene' && this.canCapture() && !this.stale() && !!this.reading()
+    && this.draft().serial === this.selectedCamera()?.serial && this.draft().code === this.selectedCamera()?.code);
+  readonly pointTargets = computed(() => {
+    const reading = this.reading();
+    return this.temporaryPoints().map((point) => {
+      if (!this.selectedId() || !reading || this.stale() || this.selectedSnapshot()) return { point, target: null, framing: null, error: '' };
+      try { return { point, ...this.calculatePointTarget(point, reading.raw), error: '' }; }
+      catch (error) { return { point, target: null, framing: null, error: errorMessage(error) }; }
+    });
+  });
+  readonly canScan = computed(() => {
+    const panMin = this.scanPanMin()!;
+    const panMax = this.scanPanMax()!;
+    const panSpan = panMax - panMin + (panMax < panMin ? 360 : 0);
+    return this.canCapture() && this.inRange(panMin, 0, 360) && this.inRange(panMax, 0, 360) && panSpan > 0
+      && (this.scanMode() === 'fixed' || (!this.stale() && !!this.reading()
+        && panMax - panMin >= 30
+        && this.inRange(this.preScanZoom(), 1, Number.MAX_VALUE) && this.preScanZoom()! < this.reading()!.raw.Zoom
+        && this.inRange(this.scanTiltMin(), -90, 90) && this.inRange(this.scanTiltMax(), -90, 90)
+        && this.scanTiltMin()! < this.scanTiltMax()!
+        && this.inRange(this.reading()!.raw.Tilt, this.scanTiltMin()!, this.scanTiltMax()!)));
+  });
   private readonly pollingPaused = computed(() => this.operating() === 'snapshot');
   private readonly holdControl = new HoldPtzControl(
     (id, command, speed, keepalive) => this.api.control(id, command, speed, keepalive),
@@ -183,6 +215,7 @@ export class AppComponent implements OnDestroy {
   private plotRequestId = 0;
 
   constructor() {
+    const ptzPollingInterval = toObservable(this.ptzPollingIntervalSeconds);
     effect(() => {
       const id = this.selectedId(), page = this.page();
       if ((page === 'scene' && id) || page === 'plotting') untracked(() => { void this.plots.refresh(); });
@@ -199,13 +232,17 @@ export class AppComponent implements OnDestroy {
     effect((onCleanup) => {
       const id = this.selectedId();
       if (!id || this.pollingPaused()) return;
-      const subscription = timer(0, 1000).pipe(exhaustMap(() => this.api.ptz(id).pipe(
-        catchError((error: unknown) => {
-          this.stale.set(true);
-          this.liveError.set(errorMessage(error));
-          return EMPTY;
-        }),
-      ))).subscribe((reading) => {
+      // 只重建定时器，保留 exhaustMap 内的在途请求，避免调整间隔时重复回读。
+      const subscription = ptzPollingInterval.pipe(
+        switchMap((seconds) => timer(0, seconds * 1000)),
+        exhaustMap(() => this.api.ptz(id).pipe(
+          catchError((error: unknown) => {
+            this.stale.set(true);
+            this.liveError.set(errorMessage(error));
+            return EMPTY;
+          }),
+        )),
+      ).subscribe((reading) => {
         this.reading.set(reading);
         this.stale.set(false);
         this.liveError.set('');
@@ -225,6 +262,10 @@ export class AppComponent implements OnDestroy {
 
   private inRange(value: number | null, min: number, max: number, nullable = false) {
     return value === null ? nullable : Number.isFinite(value) && value >= min && value <= max;
+  }
+
+  setPtzPollingInterval(input: HTMLInputElement) {
+    if (input.reportValidity()) this.ptzPollingIntervalSeconds.set(input.valueAsNumber);
   }
 
   loadPlayback() {
@@ -259,8 +300,8 @@ export class AppComponent implements OnDestroy {
   private activate(camera: Camera) {
     this.plotNavigationRevision++;
     this.plotFocusRequest.set(null);
-    const { name, serial, code, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
-    this.draft.set({ name, serial, code, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll });
+    const { name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
+    this.draft.set({ name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll });
     this.selectedId.set(camera.id);
     this.reading.set(null);
     this.stale.set(true);
@@ -319,14 +360,90 @@ export class AppComponent implements OnDestroy {
     if (revision !== this.plotNavigationRevision) return false;
     this.plotFocusRequest.set(null);
     this.page.set(page);
+    this.showTemporaryPoints.set(false);
     this.panel.set(null);
     return true;
   }
 
   togglePlotPanel() {
     this.showPlotPanel.update((show) => !show);
+    this.showTemporaryPoints.set(false);
     this.panel.set(null);
     if (this.showPlotPanel() && this.selectedId()) void this.plots.refresh();
+  }
+
+  toggleTemporaryPoints() {
+    this.showTemporaryPoints.update((show) => !show);
+    this.showPlotPanel.set(false);
+    this.panel.set(null);
+  }
+
+  addTemporaryPoint() {
+    const longitude = this.pointLongitude(), latitude = this.pointLatitude();
+    if (longitude === null || latitude === null || !Number.isFinite(longitude) || !Number.isFinite(latitude)
+      || Math.abs(longitude) > 180 || Math.abs(latitude) > 90) {
+      this.pointError.set('请输入有效经纬度：经度 -180～180，纬度 -90～90');
+      return;
+    }
+    const hasVessel = this.pointLength() !== null || this.pointWidth() !== null || this.pointHeight() !== null || this.pointHeading() !== 0;
+    const vessel = hasVessel ? { length: this.pointLength()!, width: this.pointWidth()!, heading: this.pointHeading()!,
+      height: this.pointHeight() ?? undefined } : undefined;
+    const id = this.editingPointId();
+    const point: TemporaryMapPoint = { id: id ?? this.nextTemporaryPointId + 1, longitude, latitude, vessel };
+    try { if (vessel) vesselCorners(point, vessel); }
+    catch (error) { this.pointError.set(errorMessage(error)); return; }
+    if (id !== null) this.temporaryPoints.update((points) => points.map((item) => item.id === id ? point : item));
+    else {
+      this.nextTemporaryPointId = point.id;
+      this.temporaryPoints.update((points) => [...points, point]);
+    }
+    this.editingPointId.set(null);
+    this.pointError.set('');
+  }
+
+  editTemporaryPoint(point: TemporaryMapPoint) {
+    this.editingPointId.set(point.id);
+    this.pointLongitude.set(point.longitude);
+    this.pointLatitude.set(point.latitude);
+    this.pointLength.set(point.vessel?.length ?? null);
+    this.pointWidth.set(point.vessel?.width ?? null);
+    this.pointHeading.set(point.vessel?.heading ?? 0);
+    this.pointHeight.set(point.vessel?.height ?? null);
+    this.pointError.set('');
+  }
+
+  resetTemporaryPointForm() {
+    this.editingPointId.set(null);
+    this.pointLongitude.set(null);
+    this.pointLatitude.set(null);
+    this.pointLength.set(null);
+    this.pointWidth.set(null);
+    this.pointHeading.set(0);
+    this.pointHeight.set(null);
+    this.pointError.set('');
+  }
+
+  clearTemporaryPoints() {
+    this.temporaryPoints.set([]);
+    this.resetTemporaryPointForm();
+  }
+
+  removeTemporaryPoint(id: number) {
+    this.temporaryPoints.update((points) => points.filter((point) => point.id !== id));
+    if (this.editingPointId() === id) this.resetTemporaryPointForm();
+  }
+
+  private calculatePointTarget(point: TemporaryMapPoint, reading: RawPtz) {
+    const camera = this.draft();
+    const target = pointTargetPtz(camera, reading, point);
+    const framing = point.vessel ? estimateVesselZoom(camera, reading, point, point.vessel, target, this.pointZoomMax()) : null;
+    return { target: framing ? { ...target, zoom: framing.zoom } : target, framing };
+  }
+
+  focusTemporaryPoint(point: TemporaryMapPoint) {
+    this.plotFocusRequest.set(null);
+    this.following.set(false);
+    this.scene?.focusTemporaryPoint(point);
   }
 
   plotVisibility(layerId: string) {
@@ -438,6 +555,7 @@ export class AppComponent implements OnDestroy {
     const id = this.selectedId();
     const input: CameraInput = {
       name: this.draft().name.trim(), serial: this.draft().serial.trim(), code: this.draft().code.trim(),
+      maxZoom: this.draft().maxZoom!,
       ...this.calibration(),
     };
     const channelChanged = this.selectedCamera()?.serial !== input.serial || this.selectedCamera()?.code !== input.code;
@@ -531,19 +649,39 @@ export class AppComponent implements OnDestroy {
     if (raw && !this.stale()) this.preciseTarget.set({ pan: raw.Pan, tilt: raw.Tilt, zoom: raw.Zoom });
   }
 
-  async sendPrecise() {
-    if (!this.canPrecise()) return;
+  async sendPrecise(point?: TemporaryMapPoint) {
+    if (point ? !this.canTrackPoint() : !this.canPrecise()) return;
     const revision = ++this.preciseRevision;
     const id = this.selectedId();
+    const navigationRevision = this.plotNavigationRevision;
     this.operating.set('precise');
     this.operationError.set('');
     this.operationMessage.set('');
-    const { pan, tilt, zoom } = this.preciseTarget();
     try {
-      const result = await this.api.precise(id, { pan: pan!, tilt: tilt!, zoom: zoom! });
+      let target: PreciseTarget;
+      if (point) {
+        // 点击后重新回读 Z/FOV；停止、切页或目标修改、删除后不发送迟到的定位。
+        const reading = await firstValueFrom(this.api.ptz(id));
+        if (revision !== this.preciseRevision || this.selectedId() !== id || this.page() !== 'scene'
+          || navigationRevision !== this.plotNavigationRevision
+          || !this.temporaryPoints().some((item) => item === point)) return;
+        this.reading.set(reading);
+        this.stale.set(false);
+        this.liveError.set('');
+        const camera = this.draft(), saved = this.selectedCamera();
+        if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) {
+          throw new Error('请检查安装参数，并先保存设备通道修改后再追踪');
+        }
+        target = this.calculatePointTarget(point, reading.raw).target;
+        this.preciseTarget.set(target);
+      } else {
+        const { pan, tilt, zoom } = this.preciseTarget();
+        target = { pan: pan!, tilt: tilt!, zoom: zoom! };
+      }
+      const result = await this.api.precise(id, target);
       if (revision !== this.preciseRevision || this.selectedId() !== id) return;
       this.controlTarget.set(result.target);
-      this.operationMessage.set('精确定位指令已发送，位置以回读为准');
+      this.operationMessage.set(point ? `点 ${point.id} 追踪指令已发送，位置以回读为准` : '精确定位指令已发送，位置以回读为准');
     } catch (error) {
       if (revision === this.preciseRevision && this.selectedId() === id) this.operationError.set(errorMessage(error));
     } finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }

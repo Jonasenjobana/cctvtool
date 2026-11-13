@@ -36,13 +36,14 @@ const cameraSchema = {
     name: { type: 'string', minLength: 1, maxLength: 100 },
     serial: { type: 'string', minLength: 1, maxLength: 100 },
     code: { type: 'string', minLength: 1, maxLength: 100 },
+    maxZoom: { type: 'number', minimum: 1 },
     ...calibrationProperties,
   },
   required: ['name', 'serial', 'code', ...calibrationKeys],
 };
 const preciseProperties = {
   pan: { type: 'number', minimum: 0, maximum: 360 },
-  tilt: { type: 'number', minimum: 0, maximum: 360 },
+  tilt: { type: 'number', minimum: -90, maximum: 90 },
   zoom: { type: 'number', minimum: 1 },
 };
 const pageSchema = { type: 'object', additionalProperties: false, properties: {
@@ -53,9 +54,9 @@ const pageOptions = (query) => ({ ...(query.limit ? { limit: Number(query.limit)
 const fieldLabels = {
   name: '名称', serial: '设备编号', code: '通道编号', longitude: '经度', latitude: '纬度', height: '高度',
   pAxisPitch: 'P 轴前后倾', pAxisRoll: 'P 轴左右倾', panOffset: '默认朝向',
-  tiltOffset: 'T 偏移', imageRoll: '画面 Roll 修正',
+  tiltOffset: 'T 偏移', imageRoll: '画面 Roll 修正', maxZoom: '最大倍率 Z',
   command: '控制指令', speed: '控制速度', pan: '目标 P', tilt: '目标 T', zoom: '目标 Z',
-  basePtz: '基础 PTZ', panMin: '最小 P', panMax: '最大 P', settleMs: '稳定等待时间', moveTimeoutMs: '定位超时',
+  basePtz: '基础 PTZ', panMin: '起始 P', panMax: '结束 P', settleMs: '稳定等待时间', moveTimeoutMs: '定位超时',
   sourceFileName: '来源文件名', geojsonText: 'GeoJSON 原文', cameraIds: '关联摄像头', visible: '图层显隐',
 };
 
@@ -319,6 +320,7 @@ export async function createApp({
   }, async (request) => trackControl(request.params.id, async () => {
     const camera = store.getCamera(request.params.id);
     const target = { ...request.body };
+    if (target.zoom > camera.maxZoom) throw httpError(400, `目标 Z 不能超过该摄像头的最大倍率 ${camera.maxZoom}`);
     await livegbs.preciseControl(camera, target);
     return { target, sentAt: new Date().toISOString() };
   }));
@@ -343,8 +345,8 @@ export async function createApp({
         moveTimeoutMs: { type: 'integer', minimum: 1000, maximum: 120000, default: 30000 },
         calibration: calibrationSchema,
         horizon: { type: 'object', additionalProperties: false, required: ['preScanZoom', 'tiltMin', 'tiltMax'], properties: {
-          preScanZoom: { type: 'number', minimum: 1 }, tiltMin: { type: 'number', minimum: 0, maximum: 360 },
-          tiltMax: { type: 'number', minimum: 0, maximum: 360 },
+          preScanZoom: { type: 'number', minimum: 1 }, tiltMin: { type: 'number', minimum: -90, maximum: 90 },
+          tiltMax: { type: 'number', minimum: -90, maximum: 90 },
         } },
       },
     } },

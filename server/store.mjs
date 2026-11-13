@@ -5,11 +5,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { httpError } from './errors.mjs';
 
 export const calibrationKeys = ['longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'];
-const cameraKeys = ['name', 'serial', 'code', ...calibrationKeys];
+const cameraKeys = ['name', 'serial', 'code', 'maxZoom', ...calibrationKeys];
 const zeroCorrections = { tiltOffset: 0, imageRoll: 0 };
 const plotLayerColumns = 'id, name, sourceFileName, byteLength, featureCount, geometryTypes, createdAt, updatedAt';
 
-function cameraRecord(row) { return { ...zeroCorrections, ...row }; }
+const defaultMaxZoom = (name) => name === '天津船闸' ? 32 : 73;
+function cameraRecord(row) { return { ...zeroCorrections, maxZoom: defaultMaxZoom(row.name), ...row }; }
 
 function snapshotRecord(row) {
   const snapshot = JSON.parse(row.metadata);
@@ -31,6 +32,7 @@ export class CameraStore {
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS cameras (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, serial TEXT NOT NULL, code TEXT NOT NULL,
+        maxZoom REAL NOT NULL DEFAULT 73,
         longitude REAL, latitude REAL, height REAL,
         pAxisPitch REAL NOT NULL, pAxisRoll REAL NOT NULL, panOffset REAL NOT NULL,
         tiltOffset REAL NOT NULL DEFAULT 0, imageRoll REAL NOT NULL DEFAULT 0,
@@ -69,10 +71,14 @@ export class CameraStore {
     `);
       const columns = new Set(this.db.prepare('PRAGMA table_info(cameras)').all().map((column) => column.name));
       const missing = Object.keys(zeroCorrections).filter((key) => !columns.has(key));
-      if (missing.length) {
+      if (missing.length || !columns.has('maxZoom')) {
         this.db.exec('BEGIN IMMEDIATE');
         try {
           for (const key of missing) this.db.exec(`ALTER TABLE cameras ADD COLUMN ${key} REAL NOT NULL DEFAULT 0`);
+          if (!columns.has('maxZoom')) {
+            this.db.exec('ALTER TABLE cameras ADD COLUMN maxZoom REAL NOT NULL DEFAULT 73');
+            this.db.prepare('UPDATE cameras SET maxZoom = 32 WHERE name = ?').run('天津船闸');
+          }
           this.db.exec('COMMIT');
         } catch (error) {
           this.db.exec('ROLLBACK');
@@ -122,11 +128,12 @@ export class CameraStore {
   }
 
   saveCamera(input, id) {
-    const values = cameraKeys.map((key) => input[key]);
+    const previous = id ? this.getCamera(id) : null;
+    const record = { ...input, maxZoom: input.maxZoom ?? previous?.maxZoom ?? defaultMaxZoom(input.name) };
+    const values = cameraKeys.map((key) => record[key]);
     const now = new Date().toISOString();
     try {
       if (id) {
-        this.getCamera(id);
         this.db.prepare(`UPDATE cameras SET ${cameraKeys.map((key) => `${key} = ?`).join(', ')}, updatedAt = ? WHERE id = ?`)
           .run(...values, now, id);
       } else {

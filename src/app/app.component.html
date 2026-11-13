@@ -19,13 +19,14 @@
       <app-plot-layers [cameras]="cameras()" [selectedCameraId]="selectedId()" [focusing]="plotPreparing() || !!operating() || saving()" (focused)="focusPlotLayer($event)" />
     } @else {
     <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
-      [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)" />
+      [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" [temporaryPoints]="temporaryPoints()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)" />
     <header class="map-toolbar">
       <button type="button" class="device-picker" (click)="togglePanel('devices')">
         <app-icon name="camera" /><span>{{ selectedCamera()?.name || '选择摄像头' }}</span><app-icon name="down" />
       </button>
       <div class="view-actions">
         <button type="button" [class.selected]="showPlotPanel()" [attr.aria-expanded]="showPlotPanel()" (click)="togglePlotPanel()"><app-icon name="layers" />图层</button>
+        <button type="button" [class.selected]="showTemporaryPoints()" [attr.aria-expanded]="showTemporaryPoints()" aria-controls="temporary-point-panel" (click)="toggleTemporaryPoints()"><app-icon name="plus" />临时点</button>
         @if (!selectedSnapshot()) {
           <button type="button" [class.selected]="showVideo()" (click)="showVideo.set(!showVideo())"><app-icon name="video" />直播融合</button>
         }
@@ -37,6 +38,50 @@
         <button type="button" [disabled]="!selectedId()" (click)="bestView()"><app-icon name="target" />最佳观察</button>
         <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId()" (click)="overview()"><app-icon name="map" /></button>
       </div>
+      @if (showTemporaryPoints()) {
+        <div class="temporary-point-container">
+          <section id="temporary-point-panel" class="temporary-point-panel" aria-label="临时经纬度点">
+            <div class="temporary-point-heading"><h2>临时点</h2><button type="button" class="icon-button" aria-label="关闭临时点工具" (click)="showTemporaryPoints.set(false)"><app-icon name="close" /></button></div>
+            <form (ngSubmit)="addTemporaryPoint()">
+              <div class="temporary-point-fields">
+                <label for="point-longitude">经度<input id="point-longitude" name="pointLongitude" type="number" min="-180" max="180" step="any" required [ngModel]="pointLongitude()" (ngModelChange)="pointLongitude.set($event); pointError.set('')"></label>
+                <label for="point-latitude">纬度<input id="point-latitude" name="pointLatitude" type="number" min="-90" max="90" step="any" required [ngModel]="pointLatitude()" (ngModelChange)="pointLatitude.set($event); pointError.set('')"></label>
+              </div>
+              <details class="temporary-vessel-fields">
+                <summary>船体尺寸 / 自动倍率</summary>
+                <div class="temporary-point-fields">
+                  <label for="point-length">船长（m）<input id="point-length" name="pointLength" type="number" min="0" step="any" [ngModel]="pointLength()" (ngModelChange)="pointLength.set($event); pointError.set('')"></label>
+                  <label for="point-width">船宽（m）<input id="point-width" name="pointWidth" type="number" min="0" step="any" [ngModel]="pointWidth()" (ngModelChange)="pointWidth.set($event); pointError.set('')"></label>
+                  <label for="point-heading">船艏朝向（°）<input id="point-heading" name="pointHeading" type="number" min="0" max="360" step="any" [ngModel]="pointHeading()" (ngModelChange)="pointHeading.set($event); pointError.set('')"></label>
+                  <label for="point-height">船高（m，可选）<input id="point-height" name="pointHeight" type="number" min="0" step="any" [ngModel]="pointHeight()" (ngModelChange)="pointHeight.set($event); pointError.set('')"></label>
+                </div>
+                <div class="temporary-vessel-limits">最大占比 50% · Z 上限 {{ pointZoomMax() }}</div>
+              </details>
+              <div class="temporary-point-actions"><button type="submit"><app-icon [name]="editingPointId() === null ? 'plus' : 'save'" />{{ editingPointId() === null ? '添加' : '保存点' }}</button>@if (editingPointId() !== null) { <button type="button" (click)="resetTemporaryPointForm()">取消</button> }<button type="button" [disabled]="!temporaryPoints().length" (click)="clearTemporaryPoints()">清空</button></div>
+              @if (pointError()) { <p class="inline-error" role="alert">{{ pointError() }}</p> }
+              @if (operationError()) { <p class="inline-error" role="alert">{{ operationError() }}</p> }
+              @if (operationMessage()) { <p class="inline-message" role="status">{{ operationMessage() }}</p> }
+            </form>
+            <div class="temporary-point-list">
+              @for (entry of pointTargets(); track entry.point.id) {
+                @let point = entry.point;
+                <div class="temporary-point-row">
+                  <div><strong>点 {{ point.id }}</strong><span>{{ point.longitude | number:'1.0-8' }}, {{ point.latitude | number:'1.0-8' }}</span>
+                    @if (point.vessel; as vessel) { <span>长 {{ vessel.length }} m · 宽 {{ vessel.width }} m · 朝向 {{ vessel.heading }}°@if (vessel.height !== undefined) { · 船高 {{ vessel.height }} m } @else { · 船高未填 }</span> }
+                    @if (entry.target; as target) { <span>目标 P {{ target.pan | number:'1.2-3' }}° · T {{ target.tilt | number:'1.2-3' }}° · Z {{ target.zoom | number:'1.0-2' }}</span> }
+                    @if (entry.framing; as framing) { <span>斜距 {{ framing.distanceMeters | number:'1.0-1' }} m · 预计占比：宽 {{ framing.widthFraction * 100 | number:'1.0-1' }}% / 高 {{ framing.heightFraction * 100 | number:'1.0-1' }}%</span> }
+                    @if (entry.error) { <p class="inline-error">{{ entry.error }}</p> }
+                  </div>
+                  <button type="button" [attr.aria-label]="'定位点 ' + point.id" (click)="focusTemporaryPoint(point)">定位</button>
+                  <button type="button" [attr.aria-label]="'编辑点 ' + point.id" (click)="editTemporaryPoint(point)">编辑</button>
+                  <button type="button" [disabled]="!canTrackPoint() || !entry.target" [attr.aria-label]="'云台追踪点 ' + point.id" (click)="sendPrecise(point)">追踪</button>
+                  <button type="button" [attr.aria-label]="'删除点 ' + point.id" (click)="removeTemporaryPoint(point.id)">删除</button>
+                </div>
+              }
+            </div>
+          </section>
+        </div>
+      }
     </header>
     @if (showPlotPanel()) {
       <section class="plot-panel" aria-label="当前摄像头标绘图层">
@@ -138,14 +183,15 @@
         <button type="button" class="capture-button" [disabled]="!canCapture()" (click)="capture()"><app-icon name="camera" /><span>{{ operating() === 'snapshot' ? '保存中' : '截图' }}</span></button>
       </div>
       <div class="control-speed"><label>速度 <input type="number" aria-label="云台控制速度，0 到 255" min="0" max="255" step="1" [disabled]="!!operating() || saving() || !!selectedSnapshot()" [ngModel]="controlSpeed()" (ngModelChange)="controlSpeed.set($event)"></label><span>按住控制，松手停止</span><button type="button" class="stop-control" [disabled]="!selectedId() || saving() || operating() === 'snapshot' || !!selectedSnapshot() || stopping()" (click)="stopControl()">停止</button></div>
+      <div class="ptz-polling"><label for="ptz-polling-interval">PTZ 回读间隔</label><input #ptzPollingInput id="ptz-polling-interval" type="number" min="1" max="3600" step="1" required [ngModel]="ptzPollingIntervalSeconds()" (change)="setPtzPollingInterval(ptzPollingInput)"><span>秒</span></div>
       <details class="precise-control">
         <summary>精确 PTZ（高级）</summary>
         <form (ngSubmit)="sendPrecise()">
           <fieldset [disabled]="!!operating() || saving() || !!selectedSnapshot()">
             <div class="precise-fields">
               <label for="precise-pan">P（°）<input id="precise-pan" name="precisePan" type="number" min="0" max="360" step="0.01" required [ngModel]="preciseTarget().pan" (ngModelChange)="editPrecise('pan', $event)"></label>
-              <label for="precise-tilt">T（°）<input id="precise-tilt" name="preciseTilt" type="number" min="0" max="360" step="0.01" required [ngModel]="preciseTarget().tilt" (ngModelChange)="editPrecise('tilt', $event)"></label>
-              <label for="precise-zoom">Z<input id="precise-zoom" name="preciseZoom" type="number" min="1" step="0.1" required [ngModel]="preciseTarget().zoom" (ngModelChange)="editPrecise('zoom', $event)"></label>
+              <label for="precise-tilt">T（°）<input id="precise-tilt" name="preciseTilt" type="number" min="-90" max="90" step="0.01" required [ngModel]="preciseTarget().tilt" (ngModelChange)="editPrecise('tilt', $event)"></label>
+              <label for="precise-zoom">Z<input id="precise-zoom" name="preciseZoom" type="number" min="1" [max]="pointZoomMax()" step="0.1" required [ngModel]="preciseTarget().zoom" (ngModelChange)="editPrecise('zoom', $event)"></label>
             </div>
             <div class="precise-actions"><button type="button" [disabled]="!reading() || stale()" (click)="fillPrecise()">填入当前读数</button><button type="submit" [disabled]="!canPrecise()">发送精确定位</button></div>
           </fieldset>
@@ -175,18 +221,18 @@
             <h3>自动截图</h3>
             <label for="scan-mode">采样方式<select id="scan-mode" name="scanMode" [disabled]="!!operating() || scanning()" [ngModel]="scanMode()" (ngModelChange)="scanMode.set($event)"><option value="fixed">普通截图（固定 T/Z）</option><option value="horizon">海天线预扫描</option></select></label>
             <div class="field-grid">
-              <label for="scan-pan-min">最小 P <span>°</span><input id="scan-pan-min" name="scanPanMin" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMin()" (ngModelChange)="scanPanMin.set($event)"></label>
-              <label for="scan-pan-max">最大 P <span>°</span><input id="scan-pan-max" name="scanPanMax" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMax()" (ngModelChange)="scanPanMax.set($event)"></label>
+              <label for="scan-pan-min">{{ scanMode() === 'fixed' ? '起始 P' : '最小 P' }} <span>°</span><input id="scan-pan-min" name="scanPanMin" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMin()" (ngModelChange)="scanPanMin.set($event)"></label>
+              <label for="scan-pan-max">{{ scanMode() === 'fixed' ? '结束 P' : '最大 P' }} <span>°</span><input id="scan-pan-max" name="scanPanMax" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMax()" (ngModelChange)="scanPanMax.set($event)"></label>
             </div>
             @if (scanMode() === 'horizon') {
               <label for="pre-scan-zoom">预扫倍率 <span>Z</span><input id="pre-scan-zoom" name="preScanZoom" type="number" min="1" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="preScanZoom()" (ngModelChange)="preScanZoom.set($event)"></label>
               <div class="field-grid">
-                <label for="scan-tilt-min">允许最小 T <span>°</span><input id="scan-tilt-min" name="scanTiltMin" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanTiltMin()" (ngModelChange)="scanTiltMin.set($event)"></label>
-                <label for="scan-tilt-max">允许最大 T <span>°</span><input id="scan-tilt-max" name="scanTiltMax" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanTiltMax()" (ngModelChange)="scanTiltMax.set($event)"></label>
+                <label for="scan-tilt-min">允许最小 T <span>°</span><input id="scan-tilt-min" name="scanTiltMin" type="number" min="-90" max="90" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanTiltMin()" (ngModelChange)="scanTiltMin.set($event)"></label>
+                <label for="scan-tilt-max">允许最大 T <span>°</span><input id="scan-tilt-max" name="scanTiltMax" type="number" min="-90" max="90" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanTiltMax()" (ngModelChange)="scanTiltMax.set($event)"></label>
               </div>
               <p class="scan-baseline">先调好 T 并确认低倍率画面含海天线，再恢复正式目标倍率。开始时重新回读当前 Z，预扫倍率须更低；P 覆盖至少 30°，建议 90°以上。允许 T 请按设备实际可达范围填写，且须包含当前 T。</p>
               <p class="scan-baseline">预扫固定初始 T，缺线或遮挡图可在复核页忽略，必要时重新预扫。</p>
-            } @else { <p class="scan-baseline">开始时读取当前 T/Z，固定整轮使用</p> }
+            } @else { <p class="scan-baseline">开始时读取并固定 T/Z；P 从起始值递增，支持跨 0°。</p> }
             <div class="scan-actions"><button type="button" [disabled]="!canScan()" (click)="startSnapshotScan()">{{ scanMode() === 'horizon' ? '开始海天线预扫描' : '开始自动截图' }}</button><button type="button" (click)="openPage('tasks')">查看任务</button></div>
             @if (currentScan(); as task) {
               <div class="scan-progress"><span>{{ taskName(task) }} · {{ taskStatuses[task.status] }} · 已采样 {{ task.completedCount }}/{{ task.sampleCount }}</span><progress [value]="task.completedCount" [max]="task.sampleCount" aria-label="自动截图进度"></progress>
@@ -235,6 +281,7 @@
           <label for="camera-name">名称<input id="camera-name" name="name" type="text" maxlength="100" required autocomplete="off" [ngModel]="formValue().name" (ngModelChange)="editText('name', $event)"></label>
           <label for="camera-serial">设备编号<input id="camera-serial" name="serial" type="text" maxlength="100" required autocomplete="off" spellcheck="false" [ngModel]="formValue().serial" (ngModelChange)="editText('serial', $event)"></label>
           <label for="camera-code">通道编号<input id="camera-code" name="code" type="text" maxlength="100" required autocomplete="off" spellcheck="false" [ngModel]="formValue().code" (ngModelChange)="editText('code', $event)"></label>
+          <label for="camera-max-zoom">最大倍率 Z<input id="camera-max-zoom" name="maxZoom" type="number" min="1" step="0.1" required [ngModel]="formValue().maxZoom" (ngModelChange)="editNumber('maxZoom', $event)"></label>
         </section>
       </fieldset>
       <div class="form-footer">

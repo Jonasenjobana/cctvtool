@@ -1,0 +1,59 @@
+<header class="plots-heading">
+  <h1>标绘管理</h1>
+  <button type="button" [disabled]="plots.loading() || plots.busy() || focusing" (click)="plots.refresh()"><app-icon name="refresh" />{{ plots.loading() ? '正在读取…' : '刷新 / 重试' }}</button>
+</header>
+<div class="plots-content">
+  @if (plots.problem()) { <p class="plot-error" role="alert">{{ plots.problem() }}</p> }
+  @if (message()) { <p class="plot-message" role="status">{{ message() }}</p> }
+  <form class="import-form" (ngSubmit)="importLayer()">
+    <fieldset [disabled]="plots.busy() || plots.loading() || focusing">
+      <h2>导入 GeoJSON</h2>
+      <div class="import-fields">
+        <label for="plot-file">文件 <span>UTF-8 · 最大 10 MiB</span><input #plotFile id="plot-file" type="file" accept=".geojson,.json" (change)="readFile($event)"></label>
+        <label for="plot-import-name">管理名称<input id="plot-import-name" name="importName" type="text" maxlength="200" required [ngModel]="importName()" (ngModelChange)="importName.set($event)"></label>
+      </div>
+      @if (sourceFileName()) { <p class="file-name">{{ sourceFileName() }}{{ readingFile() ? ' · 正在读取…' : '' }}</p> }
+      <fieldset class="camera-options"><legend>关联摄像头（可全部取消）</legend>
+        @for (camera of cameras; track camera.id) {
+          <label><input type="checkbox" [checked]="importCameraIds().includes(camera.id)" (change)="toggleImportCamera(camera.id, $event)">{{ camera.name }}</label>
+        } @empty { <span class="muted">暂无摄像头，将保留为未关联图层</span> }
+      </fieldset>
+      @if (fileProblem()) { <p class="plot-error" role="alert">{{ fileProblem() }}</p> }
+      <button type="submit" class="primary" [disabled]="!canImport()">{{ plots.busy() ? '正在保存…' : '导入图层' }}</button>
+    </fieldset>
+  </form>
+
+  @if (editingId()) {
+    <form class="edit-form" (ngSubmit)="saveLayer()">
+      <fieldset [disabled]="plots.busy() || plots.loading() || focusing">
+        <h2>编辑名称与关联</h2>
+        <label for="plot-edit-name">管理名称<input id="plot-edit-name" name="editName" type="text" maxlength="200" required [ngModel]="editName()" (ngModelChange)="editName.set($event)"></label>
+        <fieldset class="camera-options"><legend>关联摄像头（可全部取消）</legend>
+          @for (camera of cameras; track camera.id) {
+            <label><input type="checkbox" [checked]="editCameraIds().includes(camera.id)" (change)="toggleEditCamera(camera.id, $event)">{{ camera.name }}</label>
+          } @empty { <span class="muted">暂无摄像头</span> }
+        </fieldset>
+        <div class="form-actions"><button type="submit" class="primary" [disabled]="!editName().trim()">保存</button><button type="button" (click)="editingId.set('')">取消</button></div>
+      </fieldset>
+    </form>
+  }
+
+  <div class="list-heading"><h2>全部图层（{{ plots.layers().length }}）</h2>
+    <label for="plot-camera-context">显隐与定位摄像头<select id="plot-camera-context" [disabled]="plots.busy() || focusing" [ngModel]="contextId()" (ngModelChange)="contextId.set($event)"><option value="">选择摄像头</option>@for (camera of cameras; track camera.id) { <option [value]="camera.id">{{ camera.name }}</option> }</select></label>
+  </div>
+  <div class="table-scroll"><table>
+    <thead><tr><th scope="col">名称</th><th scope="col">来源文件</th><th scope="col">要素数</th><th scope="col">关联摄像头</th><th scope="col">操作</th></tr></thead>
+    <tbody>
+      @for (layer of plots.layers(); track layer.id) {
+        <tr><td>{{ layer.name }}@if (plots.layerErrors().get(layer.id); as error) { <p class="plot-error" role="alert">{{ error }}</p> }</td><td>{{ layer.sourceFileName }}</td><td>{{ layer.featureCount }}</td><td>{{ cameraNames(layer) }}</td>
+          <td><div class="row-actions">
+            <button type="button" [disabled]="!association(layer) || plots.busy() || plots.loading() || focusing" (click)="setVisibility(layer)">{{ association(layer)?.visible ? '隐藏' : '显示' }}</button>
+            <button type="button" [disabled]="!association(layer) || plots.busy() || plots.loading() || focusing" (click)="focusLayer(layer)">定位</button>
+            <button type="button" [disabled]="plots.busy() || plots.loading() || focusing" (click)="editLayer(layer)">编辑名称 / 关联</button>
+            <button type="button" class="delete" [disabled]="plots.busy() || plots.loading() || focusing" (click)="deleteLayer(layer)">删除图层</button>
+          </div>@if (!association(layer)) { <small class="muted">{{ contextId() ? '未关联此摄像头，可编辑关联' : '选择摄像头后使用显隐与定位' }}</small> }</td>
+        </tr>
+      } @empty { <tr><td colspan="5" class="empty">{{ plots.loading() ? '正在读取…' : '暂无标绘图层' }}</td></tr> }
+    </tbody>
+  </table></div>
+</div>

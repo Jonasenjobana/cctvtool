@@ -1,8 +1,8 @@
 # 实现标绘管理页与地图图层面板
 
 Type: implementation
-Status: open
-Assignee: unassigned
+Status: in-progress
+Assignee: /root/plot_ui
 Parent: [GeoJSON 标绘管理](../spec.md)
 Blocked by:
 

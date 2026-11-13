@@ -1,5 +1,5 @@
 import { DatePipe, DecimalPipe } from '@angular/common';
-import { ChangeDetectionStrategy, Component, HostListener, ViewChild, computed, effect, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, HostListener, ViewChild, computed, effect, inject, signal, untracked } from '@angular/core';
 import type { OnDestroy } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { EMPTY, catchError, exhaustMap, firstValueFrom, timer } from 'rxjs';
@@ -12,9 +12,12 @@ import { CalibrationHelpComponent } from './calibration-help.component';
 import { SnapshotItemComponent } from './snapshot-item.component';
 import { SnapshotTasksComponent } from './snapshot-tasks.component';
 import { RecognitionTasksComponent } from './recognition-tasks.component';
+import { PlotLayersComponent } from './plot-layers.component';
+import { PlotLayerState } from './plot-layer-state.service';
 import { HoldPtzControl } from './hold-ptz-control';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
 import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, Snapshot, SnapshotGroup } from './models';
+import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
 const editableKeys = ['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
 type NumericField = 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
@@ -22,7 +25,7 @@ type NumericField = 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisR
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent],
+  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent, PlotLayersComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './app.component.html',
   styleUrl: './app.component.css',
@@ -31,6 +34,7 @@ export class AppComponent implements OnDestroy {
   @ViewChild(CameraSceneComponent) scene?: CameraSceneComponent;
   @ViewChild(RecognitionTasksComponent) recognition?: RecognitionTasksComponent;
   private readonly api = inject(ApiService);
+  readonly plots = inject(PlotLayerState);
   readonly cameras = signal<Camera[]>([]);
   readonly selectedId = signal('');
   readonly draft = signal<CameraDraft>(emptyCamera());
@@ -43,7 +47,22 @@ export class AppComponent implements OnDestroy {
   readonly nextSnapshotOffset = signal<number | null>(null);
   readonly groupLoading = signal(false);
   readonly deletingSnapshot = signal(false);
-  readonly page = signal<'scene' | 'tasks' | 'recognition'>('scene');
+  readonly page = signal<'scene' | 'tasks' | 'recognition' | 'plotting'>('scene');
+  readonly showPlotPanel = signal(false);
+  readonly plotPreparing = signal(false);
+  readonly plotFocusRequest = signal<PlotLayerFocusRequest | null>(null);
+  readonly cameraPlotLayers = computed(() => {
+    const id = this.selectedId();
+    return id ? this.plots.layers().filter((layer) => layer.associations.some((association) => association.cameraId === id)) : [];
+  });
+  readonly plotRenderLayers = computed<readonly PlotLayerRenderInput[]>(() => {
+    const texts = this.plots.texts(), cameraId = this.selectedId();
+    return this.cameraPlotLayers().flatMap((layer) => {
+      const text = texts.get(layer.id);
+      return text === undefined ? [] : [{ id: layer.id, name: layer.name, geojsonText: text,
+        visible: layer.associations.find((association) => association.cameraId === cameraId)!.visible }];
+    });
+  });
   readonly recognitionTaskId = signal('');
   readonly snapshotTaskId = signal('');
   readonly taskStatuses = snapshotTaskStatus;
@@ -160,8 +179,23 @@ export class AppComponent implements OnDestroy {
   private groupRevision = 0;
   private preciseRevision = 0;
   private playbackSubscription?: Subscription;
+  private plotNavigationRevision = 0;
+  private plotRequestId = 0;
 
   constructor() {
+    effect(() => {
+      const id = this.selectedId(), page = this.page();
+      if ((page === 'scene' && id) || page === 'plotting') untracked(() => { void this.plots.refresh(); });
+    });
+    effect(() => {
+      const layers = this.cameraPlotLayers(), page = this.page(), loading = this.plots.loading();
+      if (page === 'scene' && !loading && layers.length) untracked(() => { void this.plots.loadDetails(layers.map((layer) => layer.id)); });
+    });
+    effect(() => {
+      const problem = this.plots.problem(), errors = this.plots.layerErrors();
+      const hasLayerError = this.cameraPlotLayers().some((layer) => errors.has(layer.id));
+      if (this.page() === 'scene' && (problem || hasLayerError)) this.showPlotPanel.set(true);
+    });
     effect((onCleanup) => {
       const id = this.selectedId();
       if (!id || this.pollingPaused()) return;
@@ -223,6 +257,8 @@ export class AppComponent implements OnDestroy {
   }
 
   private activate(camera: Camera) {
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     const { name, serial, code, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
     this.draft.set({ name, serial, code, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll });
     this.selectedId.set(camera.id);
@@ -251,19 +287,24 @@ export class AppComponent implements OnDestroy {
   }
 
   selectCamera(camera: Camera) {
-    if (this.operating() || this.saving()) return;
-    if (this.isDirty() && !window.confirm('当前参数尚未保存，确定切换并放弃修改？')) return;
+    if (this.operating() || this.saving()) return false;
+    if (this.isDirty() && !window.confirm('当前参数尚未保存，确定切换并放弃修改？')) return false;
     this.activate(camera);
     this.panel.set(null);
+    return true;
   }
 
   openRecognition(id: string) {
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.recognitionTaskId.set(id);
     this.page.set('recognition');
     this.panel.set(null);
   }
 
   openSnapshotTask(group: SnapshotGroup) {
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.snapshotTaskId.set(group.id);
     if (this.selectedId() === group.cameraId) {
       this.snapshotGroups.update((groups) => [group, ...groups.filter((item) => item.id !== group.id)]);
@@ -272,10 +313,66 @@ export class AppComponent implements OnDestroy {
     this.panel.set(null);
   }
 
-  async openPage(page: 'scene' | 'tasks' | 'recognition') {
-    if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return;
+  async openPage(page: 'scene' | 'tasks' | 'recognition' | 'plotting') {
+    const revision = ++this.plotNavigationRevision;
+    if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return false;
+    if (revision !== this.plotNavigationRevision) return false;
+    this.plotFocusRequest.set(null);
     this.page.set(page);
     this.panel.set(null);
+    return true;
+  }
+
+  togglePlotPanel() {
+    this.showPlotPanel.update((show) => !show);
+    this.panel.set(null);
+    if (this.showPlotPanel() && this.selectedId()) void this.plots.refresh();
+  }
+
+  plotVisibility(layerId: string) {
+    return this.plots.layers().find((layer) => layer.id === layerId)?.associations.find((association) => association.cameraId === this.selectedId())?.visible;
+  }
+
+  async togglePlotVisibility(layerId: string) {
+    const visible = this.plotVisibility(layerId);
+    if (visible !== undefined && !this.plotPreparing()) await this.plots.setVisibility(layerId, this.selectedId(), !visible);
+  }
+
+  async focusPlotLayer(request: { layerId: string; cameraId: string }) {
+    if (this.plotPreparing() || this.plots.busy() || this.plots.loading() || this.operating() || this.saving()) return;
+    const camera = this.cameras().find((item) => item.id === request.cameraId);
+    const association = this.plots.layers().find((layer) => layer.id === request.layerId)?.associations.find((item) => item.cameraId === request.cameraId);
+    if (!camera || !association) { this.plots.problem.set('请先将图层关联到目标摄像头'); return; }
+    const revision = this.plotNavigationRevision;
+    this.plotPreparing.set(true);
+    this.plotFocusRequest.set(null);
+    this.plots.problem.set('');
+    try {
+      if (!association.visible && !await this.plots.setVisibility(request.layerId, request.cameraId, true)) return;
+      if (revision !== this.plotNavigationRevision) return;
+      if (!await this.plots.loadDetails([request.layerId]) || revision !== this.plotNavigationRevision) return;
+      if (this.operating() || this.saving()) { this.plots.problem.set('当前操作尚未结束，请稍后定位'); return; }
+      if (this.selectedId() !== camera.id && !this.selectCamera(camera)) {
+        this.plots.problem.set('摄像头未切换，已取消定位');
+        return;
+      }
+      if (!await this.openPage('scene')) { this.plots.problem.set('当前页面未能离开，已取消定位'); return; }
+      if (this.selectedId() !== camera.id || this.page() !== 'scene') return;
+      // activate 会恢复跟随；仅在切换摄像头和切页都成功后关闭，定位只改变地图观察。
+      this.following.set(false);
+      this.showPlotPanel.set(true);
+      this.plotFocusRequest.set({ layerId: request.layerId, requestId: ++this.plotRequestId });
+    } finally { this.plotPreparing.set(false); }
+  }
+
+  onPlotLayerError(error: PlotLayerError) {
+    if (this.page() === 'scene' && this.cameraPlotLayers().some((layer) => layer.id === error.layerId)) this.plots.reportLayerError(error);
+  }
+
+  onPlotFocusResult(result: PlotLayerFocusResult) {
+    if (result.requestId !== this.plotFocusRequest()?.requestId || this.page() !== 'scene') return;
+    this.plotFocusRequest.set(null);
+    if (!result.success) this.plots.problem.set(result.message || '图层定位失败，请刷新后重试');
   }
 
   installationApplied(camera: Camera) {
@@ -290,6 +387,8 @@ export class AppComponent implements OnDestroy {
   newCamera() {
     if (this.operating() || this.saving()) return;
     if (this.isDirty() && !window.confirm('当前参数尚未保存，确定放弃修改并注册设备？')) return;
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.selectedId.set('');
     this.draft.set(emptyCamera());
     this.reading.set(null);
@@ -589,19 +688,24 @@ export class AppComponent implements OnDestroy {
       if (this.isDirty() && !window.confirm('当前参数尚未保存，确定切换并放弃修改？')) return;
       this.activate(camera);
     }
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.page.set('scene');
     this.viewSnapshot(snapshot);
   }
 
   async togglePanel(panel: 'devices' | 'snapshots') {
-    if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return;
-    this.page.set('scene');
-    this.panel.set(this.panel() === panel ? null : panel);
+    const previous = this.panel();
+    if (!await this.openPage('scene')) return;
+    this.showPlotPanel.set(false);
+    this.panel.set(previous === panel ? null : panel);
     if (this.panel() === 'snapshots') void this.loadSnapshots();
   }
 
   viewSnapshot(snapshot: Snapshot) {
     if (this.operating() || this.saving()) return;
+    this.plotNavigationRevision++;
+    this.plotFocusRequest.set(null);
     this.selectedSnapshot.set(snapshot);
     this.hidePreview.set(false);
     this.following.set(true);
@@ -612,6 +716,7 @@ export class AppComponent implements OnDestroy {
   bestView() { this.scene?.focus(); }
   overview() { this.following.set(false); this.scene?.overview(); }
   ngOnDestroy() {
+    this.plotNavigationRevision++;
     this.playbackSubscription?.unsubscribe();
     void this.holdControl.release(true);
   }

@@ -1,6 +1,6 @@
 :host{display:block;height:100dvh;min-height:0}
 .workspace{height:100%;display:grid;grid-template-columns:56px minmax(0,1fr) 340px;overflow:hidden}
-.workspace.recognition-page{grid-template-columns:56px minmax(0,1fr)}.right-panel[hidden]{display:none}
+.workspace.recognition-page,.workspace.plotting-page{grid-template-columns:56px minmax(0,1fr)}.right-panel[hidden]{display:none}
 .icon-rail{background:#f9fafb;border-right:1px solid #e2e6eb;display:flex;align-items:center;flex-direction:column;gap:8px;padding:18px 7px 20px;z-index:5}
 .brand{height:44px;width:40px;display:flex;align-items:center;justify-content:center;color:#3675dd;margin-bottom:14px}
 .brand app-icon{width:25px;height:25px}
@@ -20,6 +20,7 @@
 .view-actions{display:flex;align-items:center;gap:7px}
 .view-actions app-icon{width:15px;height:15px}
 .view-actions button.selected{color:#2c69d0;border-color:#c3d5f6}
+.plot-panel{position:absolute;right:16px;top:64px;width:330px;max-width:calc(100% - 32px);max-height:calc(100% - 100px);display:flex;flex-direction:column;padding:12px 14px;background:#fff;border:1px solid #e1e5eb;border-radius:4px;z-index:3}.plot-panel-heading{display:flex;align-items:center;justify-content:space-between}.plot-panel h2{font-size:14px;font-weight:500}.plot-context{font-size:11px;color:#7c8796;overflow-wrap:anywhere}.plot-panel-actions{display:flex;gap:8px;margin:12px 0}.plot-panel-actions button,.plot-layer-row button{padding:6px 8px;border:1px solid #dce3ed;border-radius:3px;font-size:11px}.plot-panel-actions app-icon{width:14px;height:14px}.plot-panel-list{overflow:auto;min-height:0}.plot-layer-row{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:12px 0;border-top:1px solid #edf0f3}.plot-layer-row strong{font-size:12px;font-weight:500;flex:1;overflow-wrap:anywhere}.plot-layer-row>div{display:flex;gap:6px}.plot-layer-row p{flex-basis:100%;margin:0}.plot-empty{font-size:12px;color:#8b94a1;padding:16px 0}
 .history-badge{display:flex;align-items:center;color:#986c25;background:#fff8e8}
 .icon-button{width:30px;height:30px;padding:0!important;border-radius:3px}
 .icon-button:hover{background:#f1f4f8}

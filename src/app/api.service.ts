@@ -3,6 +3,7 @@ import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
 import type { HorizonPoint, HorizonScanOptions, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage } from './models';
+import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
@@ -13,6 +14,29 @@ export class ApiService {
   }
 
   cameras() { return firstValueFrom(this.http.get<Camera[]>('/api/cameras').pipe(timeout(10000))); }
+
+  plotLayers() { return firstValueFrom(this.http.get<PlotLayerSummary[]>('/api/plot-layers').pipe(timeout(10000))); }
+
+  plotLayer(id: string) {
+    return firstValueFrom(this.http.get<PlotLayerDetail>(`/api/plot-layers/${id}`).pipe(timeout(10000)));
+  }
+
+  importPlotLayer(input: PlotLayerImportInput) {
+    return firstValueFrom(this.http.post<PlotLayerDetail>('/api/plot-layers', input).pipe(timeout(30000)));
+  }
+
+  savePlotLayer(id: string, input: PlotLayerUpdateInput) {
+    return firstValueFrom(this.http.put<PlotLayerSummary>(`/api/plot-layers/${id}`, input).pipe(timeout(10000)));
+  }
+
+  setPlotLayerVisibility(id: string, cameraId: string, visible: boolean) {
+    return firstValueFrom(this.http.put<PlotLayerAssociation>(`/api/plot-layers/${id}/cameras/${cameraId}`,
+      { visible }).pipe(timeout(10000)));
+  }
+
+  deletePlotLayer(id: string) {
+    return firstValueFrom(this.http.delete<void>(`/api/plot-layers/${id}`).pipe(timeout(10000)));
+  }
 
   playback(cameraId: string) { return this.http.get<PlaybackSource>('/api/playback', { params: { cameraId } }).pipe(timeout(10000)); }
 

@@ -1,5 +1,5 @@
 import {
-  ChangeDetectionStrategy, Component, ElementRef, Input, NgZone, ViewChild, inject, signal,
+  ChangeDetectionStrategy, Component, ElementRef, EventEmitter, Input, NgZone, Output, ViewChild, inject, signal,
 } from '@angular/core';
 import type { AfterViewInit, OnChanges, OnDestroy, SimpleChanges } from '@angular/core';
 import {
@@ -13,6 +13,8 @@ import type { CameraDraft, PtzReading } from './models';
 import { createAmapImagery } from './amap-imagery';
 import { startVideoFrameLoop } from './video-frame-loop';
 import { createVideoMaterial } from './video-material';
+import { PlotLayerScene } from './plot-layer-scene';
+import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
 const videoPlaneDistance = 500;
 
@@ -51,6 +53,10 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @Input() video: HTMLVideoElement | null = null;
   @Input() snapshotUrl: string | null = null;
   @Input() videoOpacity = 1;
+  @Input() plotLayers: readonly PlotLayerRenderInput[] = [];
+  @Input() plotFocus: PlotLayerFocusRequest | null = null;
+  @Output() readonly plotLayerError = new EventEmitter<PlotLayerError>();
+  @Output() readonly plotFocusResult = new EventEmitter<PlotLayerFocusResult>();
   readonly problem = signal('');
   readonly videoProblem = signal('');
   private readonly zone = inject(NgZone);
@@ -70,6 +76,8 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   private videoFailed = false;
   private stopVideoFrames?: () => void;
   private stopVisibility?: () => void;
+  private plotScene?: PlotLayerScene;
+  private sceneFailed = false;
   private readonly occluder = new EllipsoidalOccluder(Ellipsoid.WGS84);
 
   ngAfterViewInit() {
@@ -105,8 +113,15 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         });
         this.observer.observe(this.container.nativeElement);
         this.update();
+        this.plotScene = new PlotLayerScene(this.viewer,
+          (error) => this.zone.run(() => this.plotLayerError.emit(error)),
+          (result) => this.zone.run(() => this.plotFocusResult.emit(result)));
+        this.plotScene.sync(this.plotLayers);
+        this.plotScene.focus(this.plotFocus);
       } catch (error) {
+        this.sceneFailed = true;
         this.problem.set('三维场景初始化失败，请检查显卡与 WebGL 支持');
+        this.rejectPlotFocus();
         console.error('Cesium 初始化失败', error);
       }
     });
@@ -118,6 +133,19 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       this.releaseVideo();
     }
     this.update();
+    if (changes['plotLayers']) this.plotScene?.sync(this.plotLayers);
+    if (changes['plotFocus']) {
+      this.plotScene?.focus(this.plotFocus);
+      if (this.sceneFailed) this.rejectPlotFocus();
+    }
+  }
+
+  private rejectPlotFocus() {
+    if (!this.plotFocus) return;
+    const requestId = this.plotFocus.requestId;
+    this.zone.run(() => this.plotFocusResult.emit({
+      requestId, success: false, message: '三维场景初始化失败，无法定位标绘图层',
+    }));
   }
 
   onSnapshotLoad(event: Event) {
@@ -287,6 +315,8 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   ngOnDestroy() {
+    this.plotScene?.destroy();
+    this.plotScene = undefined;
     this.observer?.disconnect();
     this.stopVisibility?.();
     this.releaseVideo();

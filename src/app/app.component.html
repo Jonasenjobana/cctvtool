@@ -1,4 +1,4 @@
-<div class="workspace" [class.recognition-page]="page() === 'recognition'">
+<div class="workspace" [class.recognition-page]="page() === 'recognition'" [class.plotting-page]="page() === 'plotting'">
   <nav class="icon-rail" aria-label="主菜单">
     <div class="brand" title="云台姿态调试"><app-icon name="target" /></div>
     <button type="button" title="三维视场" aria-label="三维视场" [class.active]="page() === 'scene' && !panel()" (click)="openPage('scene')"><app-icon name="map" /></button>
@@ -6,6 +6,7 @@
     <button type="button" title="截图记录" aria-label="截图记录" [class.active]="panel() === 'snapshots'" (click)="togglePanel('snapshots')"><app-icon name="image" /></button>
     <button type="button" title="截图任务" aria-label="截图任务" [class.active]="page() === 'tasks'" (click)="openPage('tasks')"><app-icon name="tasks" /></button>
     <button type="button" title="识别任务" aria-label="识别任务" [class.active]="page() === 'recognition'" (click)="openPage('recognition')"><app-icon name="horizon" /></button>
+    <button type="button" title="标绘管理" aria-label="标绘管理" [class.active]="page() === 'plotting'" (click)="openPage('plotting')"><app-icon name="layers" /></button>
     <span class="service-dot" [class.connected]="apiConnected()" [title]="apiConnected() ? '调试服务已连接' : '调试服务未连接'" role="status" [attr.aria-label]="apiConnected() ? '调试服务已连接' : '调试服务未连接'"></span>
   </nav>
 
@@ -14,13 +15,17 @@
       <app-recognition-tasks [taskId]="recognitionTaskId()" (applied)="installationApplied($event)" (scanCreated)="openSnapshotTask($event)" />
     } @else if (page() === 'tasks') {
       <app-snapshot-tasks [taskId]="snapshotTaskId()" (opened)="openTaskSnapshot($event)" (removed)="forgetSnapshot($event)" (changed)="loadSnapshots()" (recognitionCreated)="openRecognition($event)" />
+    } @else if (page() === 'plotting') {
+      <app-plot-layers [cameras]="cameras()" [selectedCameraId]="selectedId()" [focusing]="plotPreparing() || !!operating() || saving()" (focused)="focusPlotLayer($event)" />
     } @else {
-    <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()" />
+    <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
+      [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)" />
     <header class="map-toolbar">
       <button type="button" class="device-picker" (click)="togglePanel('devices')">
         <app-icon name="camera" /><span>{{ selectedCamera()?.name || '选择摄像头' }}</span><app-icon name="down" />
       </button>
       <div class="view-actions">
+        <button type="button" [class.selected]="showPlotPanel()" [attr.aria-expanded]="showPlotPanel()" (click)="togglePlotPanel()"><app-icon name="layers" />图层</button>
         @if (!selectedSnapshot()) {
           <button type="button" [class.selected]="showVideo()" (click)="showVideo.set(!showVideo())"><app-icon name="video" />直播融合</button>
         }
@@ -33,6 +38,21 @@
         <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId()" (click)="overview()"><app-icon name="map" /></button>
       </div>
     </header>
+    @if (showPlotPanel()) {
+      <section class="plot-panel" aria-label="当前摄像头标绘图层">
+        <div class="plot-panel-heading"><h2>标绘图层</h2><button type="button" class="icon-button" aria-label="关闭图层面板" (click)="showPlotPanel.set(false)"><app-icon name="close" /></button></div>
+        <p class="plot-context">{{ selectedCamera()?.name || '请先选择摄像头' }}</p>
+        <div class="plot-panel-actions"><button type="button" [disabled]="!selectedId() || plots.loading() || plots.busy() || plotPreparing()" (click)="plots.refresh()"><app-icon name="refresh" />{{ plots.loading() ? '正在读取…' : '刷新 / 重试' }}</button><button type="button" (click)="openPage('plotting')">标绘管理</button></div>
+        @if (plots.problem()) { <p class="inline-error" role="alert">{{ plots.problem() }}</p> }
+        <div class="plot-panel-list">
+          @for (layer of cameraPlotLayers(); track layer.id) {
+            <div class="plot-layer-row"><strong>{{ layer.name }}</strong><div><button type="button" [disabled]="plots.busy() || plots.loading() || plotPreparing()" (click)="togglePlotVisibility(layer.id)">{{ plotVisibility(layer.id) ? '隐藏' : '显示' }}</button><button type="button" [disabled]="plots.busy() || plots.loading() || plotPreparing() || !!operating() || saving()" (click)="focusPlotLayer({ layerId: layer.id, cameraId: selectedId() })">定位</button></div>
+              @if (plots.layerErrors().get(layer.id); as error) { <p class="inline-error" role="alert">{{ error }}</p> }
+            </div>
+          } @empty { <p class="plot-empty">{{ plots.loading() ? '正在读取…' : selectedId() ? '当前摄像头没有关联图层' : '请选择摄像头后查看图层' }}</p> }
+        </div>
+      </section>
+    }
     @if (pageError()) {
       <div class="page-error" role="alert"><span>{{ pageError() }}</span><button type="button" class="icon-button" aria-label="关闭提示" (click)="pageError.set('')"><app-icon name="close" /></button></div>
     }
@@ -100,7 +120,7 @@
     }
   </main>
 
-  <aside class="right-panel" [hidden]="page() === 'recognition'" aria-label="云台控制与安装参数">
+  <aside class="right-panel" [hidden]="page() === 'recognition' || page() === 'plotting'" aria-label="云台控制与安装参数">
     <section class="controller-section">
       <div class="section-heading"><h1>云台控制</h1><span class="connection-label" [class.live]="!!reading() && !stale() && !selectedSnapshot()">{{ selectedSnapshot() ? '历史状态' : operating() === 'snapshot' ? '正在截图' : stopping() ? '正在停止' : operating() === 'control' ? '控制未结束' : operating() === 'precise' ? '精确定位' : !selectedId() ? '未选择设备' : stale() ? '等待回读' : '实时' }}</span></div>
       <div class="controller-workbench">

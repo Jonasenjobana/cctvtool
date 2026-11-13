@@ -8,6 +8,7 @@ const paths: Record<string, string> = {
   tasks: 'M9 5h11 M9 12h11 M9 19h11 M3 5h.01 M3 12h.01 M3 19h.01',
   horizon: 'M3 15h18 M3 18h18 M5 12l4-5 4 5 4-3 4 3 M3 3h18v18H3z',
   map: 'M3 5l6-2 6 2 6-2v16l-6 2-6-2-6 2z M9 3v16 M15 5v16',
+  layers: 'M12 3L2 8l10 5 10-5-10-5 M2 12l10 5 10-5 M2 16l10 5 10-5',
   up: 'M6 15l6-6 6 6',
   down: 'M6 9l6 6 6-6',
   left: 'M15 6l-6 6 6 6',

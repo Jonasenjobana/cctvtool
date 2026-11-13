@@ -12,6 +12,7 @@ import { httpError } from './errors.mjs';
 import { playbackSource } from './playback.mjs';
 import { checkHorizonReading, createHorizonScanPlan, createScanPlan, ptzMatches, scanTarget, scanTiltTolerance, waitForScanTarget } from './snapshot-scan.mjs';
 import { registerRecognitionRoutes } from './recognition.mjs';
+import { registerPlotLayerRoutes } from './plot-layers.mjs';
 
 const projectDir = fileURLToPath(new URL('../', import.meta.url));
 const nullableNumber = (minimum, maximum) => ({ type: ['number', 'null'], minimum, maximum });
@@ -55,6 +56,7 @@ const fieldLabels = {
   tiltOffset: 'T 偏移', imageRoll: '画面 Roll 修正',
   command: '控制指令', speed: '控制速度', pan: '目标 P', tilt: '目标 T', zoom: '目标 Z',
   basePtz: '基础 PTZ', panMin: '最小 P', panMax: '最大 P', settleMs: '稳定等待时间', moveTimeoutMs: '定位超时',
+  sourceFileName: '来源文件名', geojsonText: 'GeoJSON 原文', cameraIds: '关联摄像头', visible: '图层显隐',
 };
 
 export async function createApp({
@@ -78,6 +80,7 @@ export async function createApp({
   const activeScans = new Map();
   const isBusy = (id) => operations.has(id) || moving.has(id) || pendingStops.has(id);
   const recognition = registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer, startHorizonScan });
+  registerPlotLayerRoutes(app, store);
   app.addHook('onClose', async () => {
     const stopped = await Promise.allSettled([...moving.keys()].map((id) => stopDevice(id, 129)));
     for (const result of stopped) if (result.status === 'rejected') console.error('关闭服务时停止云台失败', result.reason);
@@ -85,6 +88,7 @@ export async function createApp({
     store.close();
   });
   app.setErrorHandler((error, request, reply) => {
+    if (error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') return reply.code(413).send({ message: '请求体超过容量限制' });
     if (error.validation) {
       const fields = [...new Set(error.validation.map((item) => {
         const key = item.instancePath.split('/').at(-1) || item.params.missingProperty;

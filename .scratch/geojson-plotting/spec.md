@@ -78,7 +78,7 @@ ApiService 使用 `plotLayers()`、`plotLayer(id)`、`importPlotLayer(input)`、
 
 `CameraSceneComponent` 增加 Input `plotLayers: readonly PlotLayerRenderInput[]` 与 `plotFocus: PlotLayerFocusRequest | null`，Output `plotLayerError: PlotLayerError` 与 `plotFocusResult: PlotLayerFocusResult`。场景初次创建与 Input 变化时同步；聚焦请求以 requestId 区分重复定位同一图层。
 
-每个业务图层持有自己的 Cesium GeoJsonDataSource 或受控子源，整体显隐与定位统一处理。复用 Cesium 的 GeoJSON 和 simplestyle 支持，统一默认颜色与线宽；不修改摄像头点、视锥、覆盖线、视频或底图。带高程的线不能统一启用贴地，二维和三维几何在展示副本中分开处理；原文及 properties 不被改写。
+每个业务图层持有自己的 Cesium GeoJsonDataSource 或受控子源，整体显隐与定位统一处理。复用 Cesium 的 GeoJSON 和 simplestyle 支持，统一默认颜色与线宽；不修改摄像头点、视锥、覆盖线、视频或底图。带高程的线不能统一启用贴地，二维和三维几何在展示副本中分开处理。展示副本只传递绘制所需的 simplestyle 属性，避免业务字段与 Cesium 的属性方法重名；原文及全部 properties 完整保留在数据库和缓存中。
 
 同一原文的改名、显隐不重复解析几何。切换、移除、隐藏、定位或销毁期间应核对最新同步代次和 Viewer 身份；迟到的 load/add/flyTo 结果不能把旧图层放回新场景。只移除本模块拥有的资源，释放实体、监听及引用；按需渲染的场景在变化后请求重绘。单个图层加载失败需明确显示并可重试，不影响其他图层及原有场景。
 

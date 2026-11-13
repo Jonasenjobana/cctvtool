@@ -13,6 +13,7 @@ import { playbackSource } from './playback.mjs';
 import { checkHorizonReading, createHorizonScanPlan, createScanPlan, ptzMatches, scanTarget, scanTiltTolerance, waitForScanTarget } from './snapshot-scan.mjs';
 import { registerRecognitionRoutes } from './recognition.mjs';
 import { registerPlotLayerRoutes } from './plot-layers.mjs';
+import { registerVesselSourceRoutes } from './vessel-sources.mjs';
 
 const projectDir = fileURLToPath(new URL('../', import.meta.url));
 const nullableNumber = (minimum, maximum) => ({ type: ['number', 'null'], minimum, maximum });
@@ -61,6 +62,7 @@ const fieldLabels = {
 };
 
 export async function createApp({
+  ais,
   recognizer,
   dataDir = resolve(projectDir, process.env.DATA_DIR || 'data'),
   webDir = join(projectDir, 'dist/web/browser'),
@@ -82,6 +84,7 @@ export async function createApp({
   const isBusy = (id) => operations.has(id) || moving.has(id) || pendingStops.has(id);
   const recognition = registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer, startHorizonScan });
   registerPlotLayerRoutes(app, store);
+  registerVesselSourceRoutes(app, ais);
   app.addHook('onClose', async () => {
     const stopped = await Promise.allSettled([...moving.keys()].map((id) => stopDevice(id, 129)));
     for (const result of stopped) if (result.status === 'rejected') console.error('关闭服务时停止云台失败', result.reason);

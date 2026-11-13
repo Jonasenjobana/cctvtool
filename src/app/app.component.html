@@ -19,12 +19,14 @@
       <app-plot-layers [cameras]="cameras()" [selectedCameraId]="selectedId()" [focusing]="plotPreparing() || !!operating() || saving()" (focused)="focusPlotLayer($event)" />
     } @else {
     <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
-      [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" [temporaryPoints]="temporaryPoints()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)" />
+      [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" [temporaryPoints]="temporaryPoints()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)"
+      [vessels]="aisTargets()" [vesselSource]="ais.selectedSource()" [trackedMmsi]="ais.trackedMmsi()" (vesselSelected)="selectAisTarget($event)" />
     <header class="map-toolbar">
       <button type="button" class="device-picker" (click)="togglePanel('devices')">
         <app-icon name="camera" /><span>{{ selectedCamera()?.name || '选择摄像头' }}</span><app-icon name="down" />
       </button>
       <div class="view-actions">
+        <button type="button" [class.selected]="showAisPanel()" [attr.aria-expanded]="showAisPanel()" [title]="ais.problem() || 'AIS 数据源'" (click)="showAisPanel.set(!showAisPanel()); showPlotPanel.set(false); showTemporaryPoints.set(false)">AIS{{ ais.problem() ? ' !' : '' }}</button>
         <button type="button" [class.selected]="showPlotPanel()" [attr.aria-expanded]="showPlotPanel()" (click)="togglePlotPanel()"><app-icon name="layers" />图层</button>
         <button type="button" [class.selected]="showTemporaryPoints()" [attr.aria-expanded]="showTemporaryPoints()" aria-controls="temporary-point-panel" (click)="toggleTemporaryPoints()"><app-icon name="plus" />临时点</button>
         @if (!selectedSnapshot()) {
@@ -83,6 +85,7 @@
         </div>
       }
     </header>
+    @if (showAisPanel()) { <app-ais-panel [canTrack]="canTrackPoint()" [busy]="!!operating() || saving()" [operationError]="operationError()" [operationMessage]="operationMessage()" (tracked)="trackAis($event)" (closed)="showAisPanel.set(false)" /> }
     @if (showPlotPanel()) {
       <section class="plot-panel" aria-label="当前摄像头标绘图层">
         <div class="plot-panel-heading"><h2>标绘图层</h2><button type="button" class="icon-button" aria-label="关闭图层面板" (click)="showPlotPanel.set(false)"><app-icon name="close" /></button></div>

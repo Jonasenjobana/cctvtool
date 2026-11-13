@@ -59,7 +59,7 @@ export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
 
 export function pointTargetPtz(
   camera: CameraDraft, ptz: Pick<RawPtz, 'Pan' | 'Tilt' | 'Zoom'>,
-  target: { longitude: number; latitude: number },
+  target: { longitude: number; latitude: number; height?: number },
 ): PreciseTarget {
   const longitude = finite(camera.longitude, '经度'), latitude = finite(camera.latitude, '纬度');
   const height = finite(camera.height, '高度');
@@ -75,7 +75,9 @@ export function pointTargetPtz(
     imageRoll: finite(camera.imageRoll, '画面 Roll 修正'),
   };
   const position = Cartesian3.fromDegrees(longitude, latitude, height);
-  const destination = Cartesian3.fromDegrees(target.longitude, target.latitude, 0);
+  const targetHeight = finite(target.height ?? 0, '目标高度');
+  if (targetHeight < 0) throw new Error('目标高度不能小于 0');
+  const destination = Cartesian3.fromDegrees(target.longitude, target.latitude, targetHeight);
   const direction = Cartesian3.subtract(destination, position, new Cartesian3());
   if (Cartesian3.magnitudeSquared(direction) < 1e-12) throw new Error('临时点与摄像头位置重合，无法计算方向');
   if (!new EllipsoidalOccluder(Ellipsoid.WGS84, position).isPointVisible(destination)) {

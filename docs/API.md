@@ -15,6 +15,9 @@
 | `GET /api/health` | 返回 `status` 和 `livegbsConfigured`，不返回认证信息 |
 | `GET /api/playback?cameraId=<ID>` | 返回指定摄像头的 `{ url, serial, code, smsId }`，未传 ID 时使用默认通道；`url` 为 WS-FLV 地址，不包含登录凭据或 token |
 | `GET /api/cameras` | 返回数据库中的设备列表 |
+| `GET /api/data-sources` | 返回固定项目身份与可选 AIS 来源，不携带上游地址 |
+| `GET /api/data-sources/:id/snapshot` | 返回统一来源状态和完整有效目标快照 |
+| `GET /api/data-sources/:id/events` | 同源 SSE 完整快照流，重连重新发送当前状态 |
 | `POST /api/cameras` | 注册设备，返回 HTTP 201 及保存后的完整记录 |
 | `PUT /api/cameras/:id` | 完整保存当前设备配置，返回数据库记录 |
 | `GET /api/plot-layers` | 返回全部标绘图层摘要，不携带 GeoJSON 原文 |
@@ -86,6 +89,38 @@
 同一设备的连续控制、精确定位、截图及配置保存互斥，连续控制保持占用直到 stop 成功。停止请求独立接收并排在同一设备尚未结束的控制请求之后；启动失败也不阻止 stop，停止失败保留连续控制占用，允许重试停止。并发 stop 共用一次在途停止请求。参数无效返回 400、设备或图片不存在返回 404、重复通道或操作冲突返回 409、上游失败返回 502、上游超时返回 504、未配置上游认证信息返回 503。本工具错误体为 `{ "message": "错误说明" }`。
 
 后端使用 `URLToken`，在临近有效期前重新登录；并发登录合并，上游 401 后重新登录并重试一次。网络错误和超时不自动重发控制请求，前端不持有或传递上游 token。
+
+### AIS 数据源接口
+
+后端 [project.mjs](../server/project.mjs) 固定部署身份、来源地址、适配器及时间/几何参数；不提供前端来源编辑或摄像头绑定 API。当前项目为 `tianjin-lock / 天津船闸`，来源为 `tianjin-lock-ais / 天津船闸 AIS`。目录响应为：
+
+```json
+{
+  "project": { "id": "tianjin-lock", "name": "天津船闸" },
+  "sources": [{
+    "id": "tianjin-lock-ais", "name": "天津船闸 AIS", "type": "ais",
+    "geometry": { "antennaFromSternRatio": 0.1, "antennaFromPortRatio": 0.5, "heightMeters": 10 },
+    "maxDistanceMeters": 10000, "expireAfterMs": 600000
+  }]
+}
+```
+
+快照响应固定为 `{ sourceId, status, error, receivedAt, targets }`。`status` 为 `idle/connecting/connected/reconnecting`；`error` 为可展示的异常或坏记录计数，正常时为 `null`；`receivedAt` 为后端最近收到来源消息的 ISO 时间，尚未收到时为 `null`。单船 `targets` 只含以下字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mmsi` | 九位字符串，不转换为数字 |
+| `time` | 带时区的 ISO 来源记录时间，不保证是船端发射或定位时刻 |
+| `longitude/latitude` | WGS84 十进制度的原始报告位置 |
+| `heading` | 真北顺时针船艏度数，0～359°范围；不可用为 `null`，不用 COG 替代 |
+| `length/width` | 船长/船宽，米；缺失或非正值为 `null` |
+| `speed` | 对地航速，节；缺失、负值及本来源不可用编码为 `null`，0 为有效静止值 |
+
+本源无偏移的 `date` 按后端配置 UTC+08:00 解释后输出 ISO；已解码的经纬度和速度不再次按 AIS 位字段缩放。只消费 `api=1`，按 MMSI 合并；同身份较新时间优先，同时间以后到的有效记录为准。空批、其他类别或本批未出现不删除目标；按来源时间超过 10 分钟清除，超过后端当前时间一分钟的未来记录跳过。坏记录和非法 JSON 公开错误，其他有效记录继续可用。
+
+来源按需连接并在后端共享，断线清空目标后从 2 秒至 30 秒指数退避重连；10 秒连接超时，90 秒无任何消息则重连。SSE 使用 `text/event-stream`，每条 `data:` 为上述完整快照，短批次合并为最多每 250 毫秒一次更新，15 秒注释心跳；慢客户端仅保留一份最新待发快照，不累积增量队列。不依赖 `Last-Event-ID`，重新连接直接取完整状态。未知来源返回 404。服务关闭会结束 SSE 并释放来源连接与定时器。
+
+浏览器页面单选来源，选择按项目保存在当前浏览器，不写摄像头或数据库。历史模式和离页关闭订阅；切源隔离旧回调。目标和估算 ABCD 均不入库；ABCD/模拟高度属于展示边界，从目录参数与有效船长宽/船艏派生，保持统一 AIS 业务字段精简。点选追踪复用 `/api/cameras/:id/precise`，有有效几何时瞄准估算盒中心并计算受摄像头最大 Z 限制的倍率；无几何时保留倍率，定位报告点。交互和估算边界见 [README](../README.md#ais-数据源与追踪船体)。
 
 ### GeoJSON 标绘接口
 

@@ -17,6 +17,9 @@ import { SnapshotTasksComponent } from './snapshot-tasks.component';
 import { RecognitionTasksComponent } from './recognition-tasks.component';
 import { PlotLayersComponent } from './plot-layers.component';
 import { PlotLayerState } from './plot-layer-state.service';
+import { AisState } from './ais-state.service';
+import { AisPanelComponent } from './ais-panel.component';
+import { vesselGeometry } from './ais-math';
 import { HoldPtzControl } from './hold-ptz-control';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
 import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
@@ -28,7 +31,7 @@ type NumericField = 'maxZoom' | 'longitude' | 'latitude' | 'height' | 'pAxisPitc
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent, PlotLayersComponent],
+  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent, PlotLayersComponent, AisPanelComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './app.component.html',
   styleUrl: './app.component.css',
@@ -38,6 +41,9 @@ export class AppComponent implements OnDestroy {
   @ViewChild(RecognitionTasksComponent) recognition?: RecognitionTasksComponent;
   private readonly api = inject(ApiService);
   readonly plots = inject(PlotLayerState);
+  readonly ais = inject(AisState);
+  readonly showAisPanel = signal(false);
+  readonly aisTargets = computed(() => this.page() === 'scene' && !this.selectedSnapshot() ? this.ais.targets() : []);
   readonly cameras = signal<Camera[]>([]);
   readonly selectedId = signal('');
   readonly draft = signal<CameraDraft>(emptyCamera());
@@ -217,6 +223,10 @@ export class AppComponent implements OnDestroy {
   constructor() {
     const ptzPollingInterval = toObservable(this.ptzPollingIntervalSeconds);
     effect(() => {
+      const active = this.page() === 'scene' && !this.selectedSnapshot();
+      untracked(() => this.ais.setActive(active));
+    });
+    effect(() => {
       const id = this.selectedId(), page = this.page();
       if ((page === 'scene' && id) || page === 'plotting') untracked(() => { void this.plots.refresh(); });
     });
@@ -258,6 +268,7 @@ export class AppComponent implements OnDestroy {
       onCleanup(() => subscription.unsubscribe());
     });
     void this.initialize();
+    void this.ais.load();
   }
 
   private inRange(value: number | null, min: number, max: number, nullable = false) {
@@ -298,6 +309,7 @@ export class AppComponent implements OnDestroy {
   }
 
   private activate(camera: Camera) {
+    this.ais.clearTracking();
     this.plotNavigationRevision++;
     this.plotFocusRequest.set(null);
     const { name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
@@ -366,6 +378,7 @@ export class AppComponent implements OnDestroy {
   }
 
   togglePlotPanel() {
+    this.showAisPanel.set(false);
     this.showPlotPanel.update((show) => !show);
     this.showTemporaryPoints.set(false);
     this.panel.set(null);
@@ -373,6 +386,7 @@ export class AppComponent implements OnDestroy {
   }
 
   toggleTemporaryPoints() {
+    this.showAisPanel.set(false);
     this.showTemporaryPoints.update((show) => !show);
     this.showPlotPanel.set(false);
     this.panel.set(null);
@@ -628,6 +642,7 @@ export class AppComponent implements OnDestroy {
     if (this.holdControl.busy) { this.releaseControl(); return; }
     if (!this.selectedId() || this.saving() || this.operating() === 'snapshot') return;
     this.preciseRevision++;
+    this.ais.clearTracking();
     this.operating.set('control');
     this.stopping.set(true);
     this.operationError.set('');
@@ -685,6 +700,47 @@ export class AppComponent implements OnDestroy {
     } catch (error) {
       if (revision === this.preciseRevision && this.selectedId() === id) this.operationError.set(errorMessage(error));
     } finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }
+  }
+
+  selectAisTarget(mmsi: string) {
+    this.ais.selectTarget(mmsi);
+    this.showPlotPanel.set(false);
+    this.showTemporaryPoints.set(false);
+    this.showAisPanel.set(true);
+  }
+
+  async trackAis(mmsi: string) {
+    if (!this.canTrackPoint() || this.ais.status() !== 'connected') return;
+    const revision = ++this.preciseRevision;
+    const id = this.selectedId(), sourceId = this.ais.selectedId(), navigation = this.plotNavigationRevision;
+    const current = () => revision === this.preciseRevision && id === this.selectedId() && sourceId === this.ais.selectedId()
+      && this.page() === 'scene' && !this.selectedSnapshot() && navigation === this.plotNavigationRevision && mmsi === this.ais.selectedMmsi();
+    this.operating.set('precise');
+    this.operationError.set('');
+    this.operationMessage.set('');
+    try {
+      const [snapshot, reading] = await Promise.all([this.api.dataSourceSnapshot(sourceId), firstValueFrom(this.api.ptz(id))]);
+      if (!current()) return;
+      const ship = snapshot.targets.find(target => target.mmsi === mmsi), source = this.ais.selectedSource();
+      if (!ship || !source || snapshot.status !== 'connected' || this.ais.status() !== 'connected') throw new Error('该 AIS 目标已失效或来源已断开');
+      const camera = this.draft(), saved = this.selectedCamera();
+      if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) throw new Error('请先检查安装参数并保存设备通道修改');
+      this.reading.set(reading);
+      this.stale.set(false);
+      this.liveError.set('');
+      const geometry = vesselGeometry(ship, source.geometry);
+      const point = geometry ? { ...geometry.point, height: source.geometry.heightMeters / 2 } : ship;
+      const aim = pointTargetPtz(camera, reading.raw, point);
+      const framing = geometry ? estimateVesselZoom(camera, reading.raw, geometry.point, geometry.vessel, aim, this.pointZoomMax()) : null;
+      const target = framing ? { ...aim, zoom: framing.zoom } : aim;
+      this.preciseTarget.set(target);
+      const result = await this.api.precise(id, target);
+      if (!current()) return;
+      this.ais.trackedMmsi.set(mmsi);
+      this.controlTarget.set(result.target);
+      this.operationMessage.set(`AIS ${mmsi} 单次追踪指令已发送，位置以回读为准`);
+    } catch (error) { if (current()) this.operationError.set(errorMessage(error)); }
+    finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }
   }
 
   async capture() {
@@ -854,6 +910,7 @@ export class AppComponent implements OnDestroy {
   bestView() { this.scene?.focus(); }
   overview() { this.following.set(false); this.scene?.overview(); }
   ngOnDestroy() {
+    this.ais.setActive(false);
     this.plotNavigationRevision++;
     this.playbackSubscription?.unsubscribe();
     void this.holdControl.release(true);

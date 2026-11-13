@@ -15,6 +15,8 @@ import { startVideoFrameLoop } from './video-frame-loop';
 import { createVideoMaterial } from './video-material';
 import { PlotLayerScene } from './plot-layer-scene';
 import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
+import { AisScene } from './ais-scene';
+import type { VesselSourceInfo, VesselTarget } from './ais.models';
 
 const videoPlaneDistance = 500;
 
@@ -63,6 +65,10 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @Input() plotLayers: readonly PlotLayerRenderInput[] = [];
   @Input() plotFocus: PlotLayerFocusRequest | null = null;
   @Input() temporaryPoints: readonly TemporaryMapPoint[] = [];
+  @Input() vessels: readonly VesselTarget[] = [];
+  @Input() vesselSource: VesselSourceInfo | null = null;
+  @Input() trackedMmsi = '';
+  @Output() readonly vesselSelected = new EventEmitter<string>();
   @Output() readonly plotLayerError = new EventEmitter<PlotLayerError>();
   @Output() readonly plotFocusResult = new EventEmitter<PlotLayerFocusResult>();
   readonly problem = signal('');
@@ -86,6 +92,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   private stopVideoFrames?: () => void;
   private stopVisibility?: () => void;
   private plotScene?: PlotLayerScene;
+  private aisScene?: AisScene;
   private sceneFailed = false;
   private readonly occluder = new EllipsoidalOccluder(Ellipsoid.WGS84);
 
@@ -130,6 +137,8 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
           (result) => this.zone.run(() => this.plotFocusResult.emit(result)));
         this.plotScene.sync(this.plotLayers);
         this.plotScene.focus(this.plotFocus);
+        this.aisScene = new AisScene(this.viewer, mmsi => this.zone.run(() => this.vesselSelected.emit(mmsi)));
+        this.aisScene.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi);
       } catch (error) {
         this.sceneFailed = true;
         this.problem.set('三维场景初始化失败，请检查显卡与 WebGL 支持');
@@ -145,6 +154,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       this.releaseVideo();
     }
     this.update();
+    this.aisScene?.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi);
     if (changes['temporaryPoints']) this.syncTemporaryPoints();
     if (changes['plotLayers']) this.plotScene?.sync(this.plotLayers);
     if (changes['plotFocus']) {
@@ -370,6 +380,8 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   ngOnDestroy() {
+    this.aisScene?.destroy();
+    this.aisScene = undefined;
     this.plotScene?.destroy();
     this.plotScene = undefined;
     this.observer?.disconnect();

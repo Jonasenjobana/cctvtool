@@ -4,6 +4,7 @@ import { firstValueFrom, timeout } from 'rxjs';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
 import type { HorizonPoint, HorizonScanOptions, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
+import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
@@ -14,6 +15,12 @@ export class ApiService {
   }
 
   cameras() { return firstValueFrom(this.http.get<Camera[]>('/api/cameras').pipe(timeout(10000))); }
+
+  dataSources() { return firstValueFrom(this.http.get<VesselSourceCatalog>('/api/data-sources').pipe(timeout(10000))); }
+
+  dataSourceSnapshot(id: string) {
+    return firstValueFrom(this.http.get<VesselSnapshot>(`/api/data-sources/${encodeURIComponent(id)}/snapshot`).pipe(timeout(10000)));
+  }
 
   plotLayers() { return firstValueFrom(this.http.get<PlotLayerSummary[]>('/api/plot-layers').pipe(timeout(10000))); }
 

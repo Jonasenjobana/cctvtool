@@ -1,0 +1,34 @@
+<section aria-label="AIS 数据源">
+  <div class="heading"><h2>AIS 船舶</h2><button type="button" aria-label="关闭 AIS 面板" (click)="closed.emit()"><app-icon name="close" /></button></div>
+  <label for="ais-source">数据源</label>
+  <select id="ais-source" [disabled]="busy || ais.loading()" [ngModel]="ais.selectedId()" (ngModelChange)="ais.selectSource($event)">
+    <option value="">不显示 AIS</option>
+    @for (source of ais.catalog()?.sources ?? []; track source.id) { <option [value]="source.id">{{ source.name }}</option> }
+  </select>
+  <div class="status" role="status">{{ ais.catalog()?.project?.name }} · {{ statusText() }} · 有效目标 {{ ais.targets().length }}</div>
+  @if (ais.problem()) { <p class="error" role="alert">{{ ais.problem() }}</p> }
+  @if (ais.preferenceError()) { <p class="error" role="alert">{{ ais.preferenceError() }}</p> }
+  @if (!ais.catalog() && !ais.loading()) { <button type="button" (click)="ais.load()">重新读取数据源</button> }
+  <form (ngSubmit)="find()">
+    <label for="ais-mmsi">MMSI</label>
+    <div class="search"><input id="ais-mmsi" name="aisMmsi" type="text" inputmode="numeric" maxlength="9" autocomplete="off" [ngModel]="search()" (ngModelChange)="search.set($event); lookupError.set('')"><button type="submit" [disabled]="!ais.targets().length">查找</button></div>
+  </form>
+  @if (lookupError()) { <p class="error" role="alert">{{ lookupError() }}</p> }
+  @if (operationError) { <p class="error" role="alert">{{ operationError }}</p> }
+  @if (operationMessage) { <p class="status" role="status">{{ operationMessage }}</p> }
+  @if (ais.selectedTarget(); as ship) {
+    <div class="details">
+      <strong>{{ ship.mmsi }}</strong><span>{{ ship.time | date:'yyyy-MM-dd HH:mm:ss' }}</span>
+      <span>{{ ship.longitude | number:'1.6-6' }}, {{ ship.latitude | number:'1.6-6' }}</span>
+      <span>船艏 {{ ship.heading === null ? '—' : ship.heading + '°' }} · 航速 {{ ship.speed === null ? '—' : ship.speed + ' 节' }}</span>
+      <span>长 {{ ship.length ?? '—' }} m · 宽 {{ ship.width ?? '—' }} m</span>
+      @if (geometry(); as model) {
+        <span>估算 ABCD {{ model.abcd.a | number:'1.0-1' }}/{{ model.abcd.b | number:'1.0-1' }}/{{ model.abcd.c | number:'1.0-1' }}/{{ model.abcd.d | number:'1.0-1' }} m</span>
+        <span>模拟船高 {{ model.vessel.height }} m</span>
+      } @else { <span>尺寸或船艏向缺失，使用 AIS 报告点</span> }
+      <div class="actions"><button type="button" [disabled]="!canTrack || busy || ais.status() !== 'connected'" (click)="tracked.emit(ship.mmsi)">追踪一次</button>
+        @if (ais.trackedMmsi()) { <button type="button" [disabled]="busy" (click)="ais.clearTracking()">清除追踪标记</button> }
+      </div>
+    </div>
+  }
+</section>

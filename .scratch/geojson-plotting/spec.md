@@ -6,7 +6,7 @@
 
 用户已确认：地图只加载当前摄像头关联的图层，各摄像头独立保存显隐，新关联默认显示；解除关联只影响该摄像头，删除图层删除原始数据及全部关联，允许保留未关联图层。
 
-用户已确认：WGS84 经纬度、保留已有高程、无高程贴地；文件样式优先，缺省使用统一样式。不做手工绘制、要素编辑、样式编辑器、其他坐标系转换、其他文件格式或导出。
+WGS84 经纬度及已有高程保持业务原值，二维点与面贴地，区域使用颜色填充，独立线按屏幕宽度绘制；样式按下述场景规则使用。不做手工绘制、要素编辑、样式编辑器、其他坐标系转换、其他文件格式或导出。
 
 用户指定只新增 HTTP API 公开边界测试，前端通过生产构建检查，不新增地图模块或组件测试。沿用 Node 22.22.3、npm 和现有依赖；禁止浏览器调试及真实设备操作。改动前完整回归为 114 项通过。
 
@@ -78,7 +78,13 @@ ApiService 使用 `plotLayers()`、`plotLayer(id)`、`importPlotLayer(input)`、
 
 `CameraSceneComponent` 增加 Input `plotLayers: readonly PlotLayerRenderInput[]` 与 `plotFocus: PlotLayerFocusRequest | null`，Output `plotLayerError: PlotLayerError` 与 `plotFocusResult: PlotLayerFocusResult`。场景初次创建与 Input 变化时同步；聚焦请求以 requestId 区分重复定位同一图层。
 
-每个业务图层持有自己的 Cesium GeoJsonDataSource 或受控子源，整体显隐与定位统一处理。复用 Cesium 的 GeoJSON 和 simplestyle 支持，统一默认颜色与线宽；不修改摄像头点、视锥、覆盖线、视频或底图。带高程的线不能统一启用贴地，二维和三维几何在展示副本中分开处理。展示副本只传递绘制所需的 simplestyle 属性，避免业务字段与 Cesium 的属性方法重名；原文及全部 properties 完整保留在数据库和缓存中。
+每个业务图层持有自己的 Cesium GeoJsonDataSource 或受控子源，整体显隐与定位统一处理。复用 Cesium 的 GeoJSON 和 simplestyle 支持，统一默认颜色与线宽；不修改摄像头点、视锥、覆盖线、视频或底图。
+
+区域（Polygon、MultiPolygon）统一使用黄色（`#ffff00`）填充并关闭外轮廓及内环轮廓线，保留内孔。`fill-opacity` 缺省或为 0 时使用 25% 不透明度，其余沿用文件值。二维区域保持 WGS84 零高程，三维区域保留已有高度。
+
+独立线使用朝向地图观察相机的标准屏幕宽度折线，显示线宽至少 4 像素，保留更粗的原线宽、颜色与透明度。二维线保持 WGS84 零高程，深度重合或被海面遮住的部分采用同色、同虚线样式的深度失败材质继续绘制，三维线保持原高度及深度遮挡规则。线支持双值 `stroke-dasharray`（字符串或数组）。
+
+展示副本只传递绘制所需的样式属性，不旋转地理坐标或改写文件，避免业务字段与 Cesium 的属性方法重名；原文及全部 properties 完整保留在数据库和缓存中。
 
 同一原文的改名、显隐不重复解析几何。切换、移除、隐藏、定位或销毁期间应核对最新同步代次和 Viewer 身份；迟到的 load/add/flyTo 结果不能把旧图层放回新场景。只移除本模块拥有的资源，释放实体、监听及引用；按需渲染的场景在变化后请求重绘。单个图层加载失败需明确显示并可重试，不影响其他图层及原有场景。
 

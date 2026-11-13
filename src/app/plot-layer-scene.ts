@@ -1,4 +1,7 @@
-import { BoundingSphere, Cartesian3, Color, GeoJsonDataSource, HeadingPitchRange, Matrix4 } from 'cesium';
+import {
+  BoundingSphere, Cartesian3, Color, ColorMaterialProperty, ConstantProperty, GeoJsonDataSource,
+  HeadingPitchRange, JulianDate, Matrix4, PolylineDashMaterialProperty,
+} from 'cesium';
 import type { PerspectiveFrustum, Viewer } from 'cesium';
 import type {
   PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput,
@@ -21,10 +24,44 @@ interface Feature {
 interface FeatureCollection { type: 'FeatureCollection'; features: Feature[]; }
 
 const plotColor = Color.fromCssColorString('#3687ff');
-const simpleStyleProperties = [
+const defaultFillOpacity = 0.25;
+const minimumLineWidth = 4;
+const renderStyleProperties = [
   'marker-size', 'marker-symbol', 'marker-color',
-  'stroke', 'stroke-opacity', 'stroke-width', 'fill', 'fill-opacity',
+  'stroke', 'stroke-opacity', 'stroke-width', 'stroke-dasharray', 'fill', 'fill-opacity',
 ];
+
+function applyDisplayStyle(source: GeoJsonDataSource, onSurface: boolean) {
+  const time = JulianDate.now();
+  for (const entity of source.entities.values) {
+    const polygon = entity.polygon;
+    if (polygon) {
+      polygon.fill = new ConstantProperty(true);
+      polygon.outline = new ConstantProperty(false);
+    }
+    const polyline = entity.polyline;
+    if (!polyline) continue;
+    const color: Color = polyline.material?.getValue(time)?.color ?? plotColor;
+    const inputWidth: unknown = polyline.width?.getValue(time);
+    const width = typeof inputWidth === 'number' && Number.isFinite(inputWidth)
+      ? Math.max(minimumLineWidth, inputWidth) : minimumLineWidth;
+    let material: ColorMaterialProperty | PolylineDashMaterialProperty = new ColorMaterialProperty(color);
+    const dashValue: unknown = entity.properties?.['stroke-dasharray']?.getValue(time);
+    const dash = typeof dashValue === 'string' ? dashValue.trim().split(/[\s,]+/).map(Number) : dashValue;
+    if (Array.isArray(dash) && dash.length === 2
+      && dash.every((value) => typeof value === 'number' && Number.isFinite(value) && value > 0)
+      && Number.isFinite(dash[0] + dash[1])) {
+      const dashLength = dash[0] + dash[1];
+      const dashBits = Math.max(1, Math.min(15, Math.round(16 * dash[0] / dashLength)));
+      material = new PolylineDashMaterialProperty({ color, dashLength, dashPattern: (1 << dashBits) - 1 });
+      polyline.material = material;
+    }
+    polyline.width = new ConstantProperty(width);
+    // 标准折线在屏幕上扩宽，避免低机位下贴地横线被压扁；深度重合时沿用同一材质，坐标保持不变。
+    polyline.clampToGround = new ConstantProperty(false);
+    if (onSurface) polyline.depthFailMaterial = material;
+  }
+}
 
 function* positions(coordinates: Coordinates): Generator<Position> {
   if (!coordinates.length) return;
@@ -82,10 +119,16 @@ function displayData(text: string) {
     const target = dimension === 2 ? ground : elevated;
     // 业务字段可能与 Cesium 的属性方法同名；展示副本只传绘制样式，完整属性仍留在原文和缓存。
     const properties = feature?.properties;
-    const displayProperties = properties ? Object.fromEntries(
-      simpleStyleProperties.filter((key) => Object.hasOwn(properties, key))
+    let displayProperties = properties ? Object.fromEntries(
+      renderStyleProperties.filter((key) => Object.hasOwn(properties, key))
         .map((key) => [key, properties[key]]),
     ) : null;
+    if (displayGeometry.type === 'Polygon' || displayGeometry.type === 'MultiPolygon') {
+      displayProperties ??= {};
+      displayProperties['fill'] = '#ffff00';
+      // 纯轮廓文件也以区域颜色显示，只调整展示副本，不改写原文中的透明度。
+      if (displayProperties['fill-opacity'] === 0) displayProperties['fill-opacity'] = defaultFillOpacity;
+    }
     target.features.push({
       type: 'Feature', id: feature?.id, properties: displayProperties, geometry: displayGeometry,
     });
@@ -194,7 +237,7 @@ export class PlotLayerScene {
         const source = new GeoJsonDataSource(state.input.name);
         sources.push(source);
         await source.load(group.data, {
-          markerColor: plotColor, stroke: plotColor, strokeWidth: 2, fill: plotColor.withAlpha(0.25),
+          markerColor: plotColor, stroke: plotColor, strokeWidth: 2, fill: plotColor.withAlpha(defaultFillOpacity),
           clampToGround: group.clampToGround,
         });
         // 同原文允许沿用最新名称/显隐；已移除或被替换的加载结果不能重新进入场景。
@@ -202,6 +245,7 @@ export class PlotLayerScene {
           this.releaseSources(sources);
           return;
         }
+        applyDisplayStyle(source, group.clampToGround);
       }
       for (const source of sources) {
         if (!this.current(state)) {

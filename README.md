@@ -39,6 +39,18 @@ npm test
 
 生产入口为 `http://127.0.0.1:3000`，Fastify 同时提供页面、Cesium 静态资源、业务接口与截图文件。数据库位于 `data/cctv.sqlite`，图片位于 `data/snapshots/`；备份时保留完整数据目录。
 
+### 数据库初始化
+
+新部署可在启动服务前执行：
+
+```powershell
+npm run db:init
+```
+
+脚本读取 `.env` 中的 `DATA_DIR`，默认使用项目下的 `data/`，通过现有存储模块创建完整表结构，再导入 [摄像头初始数据](scripts/initial-cameras.json)。初始数据来自当前已保存的 7 台摄像头：隘洲岛2、隘洲岛1、小蜘洲岛2、小蜘洲岛1、竹洲岛2、竹洲岛1、天津船闸，包含原始 ID、设备与通道编号、名称、最大倍率、经纬度、高度、P 轴前后倾和左右倾、默认朝向、T 偏移、画面 Roll 修正及原始创建和更新时间，数值保留数据库精度。
+
+导入在同一事务中完成，已有相同 `serial + code` 的通道直接跳过，保留其现有配置，可重复执行；其他导入错误会回滚本次摄像头写入并以失败状态退出。初始化数据仅包含摄像头及其安装配置，截图、截图任务、识别记录、标绘和登录凭据需按各自部署或备份流程准备。后续要更新新部署采用的设备参数时，维护 `scripts/initial-cameras.json`；已部署数据库仍通过页面保存配置。
+
 ## 项目入口
 
 源码仓库：[Jonasenjobana/cctvtool](https://github.com/Jonasenjobana/cctvtool)（远端 `origin`）；第二个仓库为 `ssh://linzequan@192.168.1.10:29418/~linzequan/cctv-tool.git`（远端 `internal`）。参与开发前阅读[项目工作规则](AGENTS.md)与 [Git 协作规范](CONTRIBUTING.md)。
@@ -70,6 +82,7 @@ npm test
 | [server/livegbs.mjs](server/livegbs.mjs) | LiveGBS 登录、token 缓存、过期重试和接口转发 | 修改上游接入时 |
 | [server/playback.mjs](server/playback.mjs) | 所选设备的 WS-FLV 地址拼接 | 修改 CMS、sms_id 或摄像头切流时 |
 | [server/store.mjs](server/store.mjs) | SQLite 表结构与数据读写 | 修改持久化字段时 |
+| [初始化脚本](scripts/init-db.mjs)、[摄像头初始数据](scripts/initial-cameras.json)、[初始化回归](tests/init-db.test.mjs) | 新部署建库、导入已注册摄像头及安装参数、重复执行与回滚验证 | 初始化数据库或更新初始设备配置时 |
 | [自动截图](server/snapshot-scan.mjs)、[扫描回归](tests/snapshot-scan.test.mjs) | 扇区等分、精确定位、稳定回读、分组、暂停／继续及删除一致性 | 修改自动采样时 |
 | [海天线控制](server/horizon-control.mjs)、[几何回归](tests/horizon-control.test.mjs)、[两阶段流程回归](tests/horizon-scan.test.mjs) | 椭球切线 T 反求、低倍预扫、复核门禁及正式扫描余量与恢复 | 修改海天线自动采样或 T 补偿后 |
 | [MCP HTTP 入口](server/mcp-http.mjs)、[HTTP 服务](server/mcp-http-app.mjs)、[工具定义](server/calibration-mcp.mjs) | 局域网 Streamable HTTP、访问认证及四个只读标定工具 | 接入或修改 MCP 时 |

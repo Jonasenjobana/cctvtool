@@ -16,6 +16,7 @@
     "dev:web": "ng serve --host 0.0.0.0",
     "build": "ng build",
     "start": "node --env-file-if-exists=.env server/index.mjs",
+    "db:init": "node --env-file-if-exists=.env scripts/init-db.mjs",
     "mcp": "node --env-file-if-exists=.env server/mcp-http.mjs",
     "mcp:stdio": "node --env-file-if-exists=.env server/mcp.mjs",
     "test": "node --test tests/*.test.mjs tests/*.test.ts"

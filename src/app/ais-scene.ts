@@ -6,7 +6,7 @@ import {
 import * as Cesium from 'cesium';
 import type { Viewer } from 'cesium';
 import type { CameraPose } from './camera-math';
-import type { VesselSourceInfo, VesselTarget } from './ais.models';
+import type { VesselBodyDimensions, VesselSourceInfo, VesselTarget } from './ais.models';
 import { isInCameraView, vesselGeometry } from './ais-math';
 
 // Cesium 的类型声明省略渲染队列；仅将本模块的盒命令放在视频合成之后。
@@ -68,13 +68,14 @@ export class AisScene {
     });
   }
 
-  sync(targets: readonly VesselTarget[], source: VesselSourceInfo | null, pose: CameraPose | undefined, trackedMmsi: string) {
+  sync(targets: readonly VesselTarget[], source: VesselSourceInfo | null, pose: CameraPose | undefined, trackedMmsi: string,
+    bodies: ReadonlyMap<string, VesselBodyDimensions>) {
     if (this.sourceId !== (source?.id ?? '')) { this.clear(); this.sourceId = source?.id ?? ''; }
     const visible = new Set<string>();
     if (source && pose) {
       for (const target of targets) {
         const tracked = target.mmsi === trackedMmsi;
-        const geometry = tracked ? vesselGeometry(target, source.geometry) : null;
+        const geometry = tracked ? vesselGeometry(target, source.geometry, bodies.get(target.mmsi)) : null;
         const position = geometry?.position ?? Cartesian3.fromDegrees(target.longitude, target.latitude);
         const radius = geometry ? Cartesian3.magnitude(geometry.dimensions) / 2 : 0;
         if (!isInCameraView(pose, position, source.maxDistanceMeters, radius)) continue;

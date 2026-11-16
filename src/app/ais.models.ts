@@ -15,6 +15,14 @@ export interface VesselGeometryOptions {
   heightMeters: number;
 }
 
+export interface VesselBodyDimensions {
+  a: number;
+  b: number;
+  c: number;
+  d: number;
+  height: number;
+}
+
 export interface VesselSourceInfo {
   id: string;
   name: string;

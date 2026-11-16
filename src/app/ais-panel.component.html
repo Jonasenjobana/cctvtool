@@ -22,13 +22,22 @@
       <strong>{{ ship.mmsi }}</strong><span>{{ ship.time | date:'yyyy-MM-dd HH:mm:ss' }}</span>
       <span>{{ ship.longitude | number:'1.6-6' }}, {{ ship.latitude | number:'1.6-6' }}</span>
       <span>船艏 {{ ship.heading === null ? '—' : ship.heading + '°' }} · 航速 {{ ship.speed === null ? '—' : ship.speed + ' 节' }}</span>
-      <span>长 {{ ship.length ?? '—' }} m · 宽 {{ ship.width ?? '—' }} m</span>
+      <span>AIS 长 {{ ship.length ?? '—' }} m · 宽 {{ ship.width ?? '—' }} m</span>
+      <form class="body-form" (ngSubmit)="applyBody()">
+        <div class="body-heading"><div class="body-title"><strong>船体尺寸</strong><app-calibration-help topic="ais-body" /></div><span>{{ ais.selectedBodyOverride() ? '手动' : '估算' }}</span></div>
+        <div class="body-fields">
+          @for (field of bodyFields; track field.key) {
+            <label [for]="'ais-body-' + field.key">{{ field.label }}<input [id]="'ais-body-' + field.key" [name]="field.key" type="number" min="0" step="any" required [ngModel]="bodyValues()[field.key]" (ngModelChange)="editBody(field.key, $event)"></label>
+          }
+        </div>
+        <div class="actions"><button type="submit">应用尺寸</button><button type="button" [disabled]="!ais.selectedBodyOverride() && !bodyDraft()" (click)="resetBody()">恢复估算</button></div>
+        @if (bodyError()) { <p class="error" role="alert">{{ bodyError() }}</p> }
+      </form>
       @if (geometry(); as model) {
-        <span>估算 ABCD {{ model.abcd.a | number:'1.0-1' }}/{{ model.abcd.b | number:'1.0-1' }}/{{ model.abcd.c | number:'1.0-1' }}/{{ model.abcd.d | number:'1.0-1' }} m</span>
-        <span>模拟船高 {{ model.vessel.height }} m</span>
+        <span>当前船体 {{ model.vessel.length | number:'1.0-2' }} × {{ model.vessel.width | number:'1.0-2' }} × {{ model.vessel.height | number:'1.0-2' }} m</span>
       } @else { <span>尺寸或船艏向缺失，使用 AIS 报告点</span> }
-      <div class="actions"><button type="button" [disabled]="!canTrack || busy || ais.status() !== 'connected'" (click)="tracked.emit(ship.mmsi)">追踪一次</button>
-        @if (ais.trackedMmsi()) { <button type="button" [disabled]="busy" (click)="ais.clearTracking()">清除追踪标记</button> }
+      <div class="actions"><button type="button" [disabled]="!canTrack || busy || ais.status() !== 'connected' || ais.trackedMmsi() === ship.mmsi" (click)="tracked.emit(ship.mmsi)">{{ ais.trackedMmsi() === ship.mmsi ? '正在追踪' : '开始追踪' }}</button>
+        @if (ais.trackedMmsi()) { <button type="button" (click)="ais.clearTracking()">停止追踪</button> }
       </div>
     </div>
   }

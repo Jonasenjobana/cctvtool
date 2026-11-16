@@ -20,6 +20,8 @@ import { PlotLayerState } from './plot-layer-state.service';
 import { AisState } from './ais-state.service';
 import { AisPanelComponent } from './ais-panel.component';
 import { vesselGeometry } from './ais-math';
+import { startAisTracking } from './ais-tracking';
+import type { VesselTarget } from './ais.models';
 import { HoldPtzControl } from './hold-ptz-control';
 import { createPtzPath } from '../../shared/snapshot-path';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
@@ -224,6 +226,33 @@ export class AppComponent implements OnDestroy {
     effect(() => {
       const active = this.page() === 'scene' && !this.selectedSnapshot();
       untracked(() => this.ais.setActive(active));
+    });
+    effect((onCleanup) => {
+      const mmsi = this.ais.trackedMmsi(), id = this.selectedId(), sourceId = this.ais.selectedId();
+      const selection = this.ais.selectionRevision(), page = this.page(), history = this.selectedSnapshot();
+      const bodyRevision = this.ais.bodyRevision();
+      const status = this.ais.status(), selected = this.ais.selectedMmsi();
+      if (!mmsi) return;
+      if (!id || page !== 'scene' || history || status !== 'connected' || selected !== mmsi) {
+        untracked(() => this.ais.clearTracking());
+        return;
+      }
+      const navigation = this.plotNavigationRevision;
+      const stop = untracked(() => startAisTracking({
+        target: () => sourceId === this.ais.selectedId() && selection === this.ais.selectionRevision()
+          && id === this.selectedId() && mmsi === this.ais.trackedMmsi() && mmsi === this.ais.selectedMmsi()
+          && this.ais.status() === 'connected' && this.page() === 'scene' && !this.selectedSnapshot()
+          && navigation === this.plotNavigationRevision && bodyRevision === this.ais.bodyRevision()
+          ? this.ais.targets().find(ship => ship.mmsi === mmsi) ?? null : null,
+        ready: () => this.canTrackPoint(),
+        track: (current, changed) => this.locateAis(mmsi, id, sourceId, current, changed),
+        stopped: error => {
+          if (selection !== this.ais.selectionRevision() || bodyRevision !== this.ais.bodyRevision()) return;
+          if (error) this.operationError.set(error instanceof Error ? error.message : errorMessage(error));
+          this.ais.clearTracking();
+        },
+      }));
+      onCleanup(stop);
     });
     effect(() => {
       const id = this.selectedId(), page = this.page();
@@ -558,6 +587,7 @@ export class AppComponent implements OnDestroy {
 
   async save() {
     if (!this.formValid() || this.saving() || this.operating() || this.scanning() || this.selectedSnapshot()) return;
+    this.ais.clearTracking();
     const id = this.selectedId();
     const input: CameraInput = {
       name: this.draft().name.trim(), serial: this.draft().serial.trim(), code: this.draft().code.trim(),
@@ -585,6 +615,7 @@ export class AppComponent implements OnDestroy {
     event.preventDefault();
     this.pointerId = event.pointerId;
     this.pressedButton = event.currentTarget as HTMLButtonElement;
+    this.ais.clearTracking();
     this.holdControl.start(this.selectedId(), command, this.controlSpeed()!);
   }
 
@@ -593,6 +624,7 @@ export class AppComponent implements OnDestroy {
     event.preventDefault();
     if (event.repeat || !this.canControl()) return;
     this.keyboardHeld = true;
+    this.ais.clearTracking();
     this.holdControl.start(this.selectedId(), command, this.controlSpeed()!);
   }
 
@@ -625,10 +657,10 @@ export class AppComponent implements OnDestroy {
   }
 
   @HostListener('document:visibilitychange')
-  onVisibilityChange() { if (document.hidden) this.releaseControl(); }
+  onVisibilityChange() { if (document.hidden) { this.ais.clearTracking(); this.releaseControl(); } }
 
   @HostListener('window:pagehide')
-  onPageHide() { void this.holdControl.release(true); }
+  onPageHide() { this.ais.clearTracking(); void this.holdControl.release(true); }
 
   async stopControl() {
     if (this.holdControl.busy) { this.releaseControl(); return; }
@@ -658,6 +690,7 @@ export class AppComponent implements OnDestroy {
 
   async sendPrecise(point?: TemporaryMapPoint) {
     if (point ? !this.canTrackPoint() : !this.canPrecise()) return;
+    this.ais.clearTracking();
     const id = this.selectedId();
     const navigationRevision = this.plotNavigationRevision;
     await this.executePrecise(async current => {
@@ -684,10 +717,16 @@ export class AppComponent implements OnDestroy {
     this.showAisPanel.set(true);
   }
 
-  async trackAis(mmsi: string) {
+  trackAis(mmsi: string) {
     if (!this.canTrackPoint() || this.ais.status() !== 'connected') return;
-    const id = this.selectedId(), sourceId = this.ais.selectedId(), navigation = this.plotNavigationRevision;
-    const selection = this.ais.selectionRevision();
+    if (mmsi !== this.ais.selectedMmsi()) return;
+    this.ais.clearTracking();
+    this.ais.trackedMmsi.set(mmsi);
+  }
+
+  private async locateAis(mmsi: string, id: string, sourceId: string, valid: () => boolean,
+    changed: (ship: VesselTarget) => boolean): Promise<VesselTarget | null> {
+    let located: VesselTarget | null = null;
     await this.executePrecise(async current => {
       const reading = await firstValueFrom(this.api.ptz(id));
       if (!current()) return null;
@@ -696,15 +735,17 @@ export class AppComponent implements OnDestroy {
       if (!current()) return null;
       const ship = snapshot.targets.find(target => target.mmsi === mmsi), source = this.ais.selectedSource();
       if (!ship || !source || snapshot.status !== 'connected' || this.ais.status() !== 'connected') throw new Error('该 AIS 目标已失效或来源已断开');
+      // 定时检查与回读之间可能收到新快照，以实际用于定位的数据去重。
+      if (!changed(ship)) { located = ship; return null; }
       const camera = this.acceptPreciseReading(reading);
-      const geometry = vesselGeometry(ship, source.geometry);
-      const point = geometry ? { ...geometry.point, height: source.geometry.heightMeters / 2 } : ship;
+      const geometry = vesselGeometry(ship, source.geometry, this.ais.bodyOverrides().get(mmsi));
+      const point = geometry ? { ...geometry.point, height: geometry.vessel.height / 2 } : ship;
       const aim = pointTargetPtz(camera, reading.raw, point);
       const framing = geometry ? estimateVesselZoom(camera, reading.raw, geometry.point, geometry.vessel, aim, this.pointZoomMax()) : null;
       const target = framing ? { ...aim, zoom: framing.zoom } : aim;
-      return { target, message: `AIS ${mmsi} 单次追踪指令已发送，位置以回读为准`, sent: () => this.ais.trackedMmsi.set(mmsi) };
-    }, () => sourceId === this.ais.selectedId() && selection === this.ais.selectionRevision()
-      && this.page() === 'scene' && !this.selectedSnapshot() && navigation === this.plotNavigationRevision && mmsi === this.ais.selectedMmsi());
+      return { target, message: `AIS ${mmsi} 追踪指令已发送，位置以回读为准`, sent: () => { located = ship; } };
+    }, valid);
+    return located;
   }
 
   private acceptPreciseReading(reading: PtzReading): CameraDraft {
@@ -796,6 +837,7 @@ export class AppComponent implements OnDestroy {
   async startSnapshotScan() {
     const plan = this.scanPlan().plan;
     if (!this.canScan() || !plan) return;
+    this.ais.clearTracking();
     const id = this.selectedId();
     const calibration = this.calibration();
     this.operating.set('scan');
@@ -813,6 +855,7 @@ export class AppComponent implements OnDestroy {
   async scanAction(action: 'pause' | 'start') {
     const group = this.currentScan();
     if (!group || this.operating() || this.saving()) return;
+    this.ais.clearTracking();
     this.operating.set('scan');
     this.operationError.set('');
     try {

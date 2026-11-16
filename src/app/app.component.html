@@ -20,7 +20,7 @@
     } @else {
     <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
       [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" [temporaryPoints]="temporaryPoints()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)"
-      [vessels]="aisTargets()" [vesselSource]="ais.selectedSource()" [trackedMmsi]="ais.trackedMmsi()" (vesselSelected)="selectAisTarget($event)" />
+      [vessels]="aisTargets()" [vesselSource]="ais.selectedSource()" [vesselBodies]="ais.bodyOverrides()" [trackedMmsi]="ais.trackedMmsi()" (vesselSelected)="selectAisTarget($event)" />
     <header class="map-toolbar">
       <button type="button" class="device-picker" (click)="togglePanel('devices')">
         <app-icon name="camera" /><span>{{ selectedCamera()?.name || '选择摄像头' }}</span><app-icon name="down" />

@@ -18,7 +18,7 @@
 | [GLOSSARY.md](GLOSSARY.md) | 监控数据源、PTZ 截图路径、海天线、标定与标绘术语 | 讨论数据源选择、自动截图、标定或标绘关系时 |
 | [.scratch/horizon-aware-scan/map.md](.scratch/horizon-aware-scan/map.md) | 多点 PTZ 自动截图规格与决策入口 | 修改控制点、插值采样或旧扫描恢复时 |
 | [.scratch/horizon-vertical-drift/map.md](.scratch/horizon-vertical-drift/map.md) | 海天线变倍与转向垂直偏差的证据、验证与修正决策 | 排查低倍对齐后高倍或转向出现上下错位时 |
-| [.scratch/ais-data-source/spec.md](.scratch/ais-data-source/spec.md)、[决策地图](.scratch/ais-data-source/map.md) | AIS 项目适配、统一数据与监控页面船舶展示约定 | 修改 AIS 接入、显示及单次追踪时 |
+| [.scratch/ais-data-source/spec.md](.scratch/ais-data-source/spec.md)、[决策地图](.scratch/ais-data-source/map.md) | AIS 项目适配、统一数据与监控页面船舶展示约定 | 修改 AIS 接入、显示及定时追踪时 |
 
 ## 环境与验证
 

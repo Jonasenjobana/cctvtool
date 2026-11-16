@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Cartesian3, Cartographic, Matrix3, Matrix4, Transforms } from 'cesium';
-import { isInCameraView, vesselGeometry } from '../src/app/ais-math.ts';
+import { isInCameraView, vesselBodyDimensions, vesselGeometry } from '../src/app/ais-math.ts';
 import { createCameraPose, pointTargetPtz } from '../src/app/camera-math.ts';
 import type { VesselTarget } from '../src/app/ais.models.ts';
 
@@ -25,6 +25,33 @@ test('默认 ABCD 对应 100×20 米船，船体中心向船艏偏移 40 米并�
   const forward = Matrix3.multiplyByVector(Matrix3.fromQuaternion(east.orientation), Cartesian3.UNIT_Y, new Cartesian3());
   near(Cartesian3.dot(forward, Cartesian3.UNIT_Y), 1);
   assert.deepEqual(vessel, original);
+});
+
+test('手动 ABCD 和船高共同决定船体大小与偏移，保留原始 AIS 长宽及报告位置', () => {
+  const original = { ...vessel };
+  const body = { a: 30, b: 90, c: 5, d: 25, height: 20 };
+  const geometry = vesselGeometry(vessel, options, body)!;
+  assert.deepEqual(geometry.abcd, { a: 30, b: 90, c: 5, d: 25 });
+  assert.deepEqual(geometry.dimensions, new Cartesian3(30, 120, 20));
+  assert.deepEqual(geometry.vessel, { length: 120, width: 30, heading: 0, height: 20 });
+  const inverse = Matrix4.inverseTransformation(Transforms.eastNorthUpToFixedFrame(Cartesian3.fromDegrees(0, 0)), new Matrix4());
+  const local = Matrix4.multiplyByPoint(inverse, geometry.position, new Cartesian3());
+  near(local.x, 10); near(local.y, -30); near(local.z, 10);
+  near(Cartographic.fromCartesian(geometry.position).height, 10);
+  assert.deepEqual(vessel, original);
+});
+
+test('手动尺寸可补足缺失的 AIS 长宽，允许零边距并拒绝退化或无效船体', () => {
+  const body = { a: 0, b: 100, c: 0, d: 20, height: 12 };
+  const missing = { ...vessel, length: null, width: null };
+  assert.equal(vesselGeometry(missing, options), null);
+  assert.deepEqual(vesselGeometry(missing, options, body)!.dimensions, new Cartesian3(20, 100, 12));
+  assert.equal(vesselGeometry({ ...missing, heading: null }, options, body), null);
+  assert.deepEqual(vesselBodyDimensions({ ...vessel, heading: null }, options), { a: 90, b: 10, c: 10, d: 10, height: 10 });
+  for (const invalid of [{ ...body, a: -1 }, { ...body, b: 0 }, { ...body, d: 0 }, { ...body, height: 0 },
+    { ...body, height: NaN }, { ...body, c: Infinity }]) {
+    assert.equal(vesselGeometry(vessel, options, invalid), null);
+  }
 });
 
 test('显示按摄像头实际 FOV 和距离筛选，追踪船体部分进入视场时仍保留', () => {

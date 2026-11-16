@@ -1,15 +1,26 @@
 import { Cartesian3, Cartographic, Ellipsoid, EllipsoidalOccluder, HeadingPitchRoll, Math as CesiumMath, Matrix4, Transforms } from 'cesium';
-import type { VesselGeometryOptions, VesselTarget } from './ais.models';
+import type { VesselBodyDimensions, VesselGeometryOptions, VesselTarget } from './ais.models';
 import type { CameraPose } from './camera-math';
 
-export function vesselGeometry(target: VesselTarget, options: VesselGeometryOptions) {
-  const { length, width, heading } = target;
-  if (length === null || width === null || heading === null || length <= 0 || width <= 0
-    || ![length, width, heading].every(Number.isFinite) || heading < 0 || heading >= 360) return null;
-  if (!Number.isFinite(options.heightMeters) || options.heightMeters <= 0
-    || ![options.antennaFromSternRatio, options.antennaFromPortRatio].every(value => Number.isFinite(value) && value >= 0 && value <= 1)) return null;
-  const a = length * (1 - options.antennaFromSternRatio), b = length * options.antennaFromSternRatio;
-  const c = width * options.antennaFromPortRatio, d = width * (1 - options.antennaFromPortRatio);
+export function vesselBodyDimensions(target: VesselTarget, options: VesselGeometryOptions, override?: VesselBodyDimensions): VesselBodyDimensions | null {
+  let body = override;
+  if (!body) {
+    const { length, width } = target;
+    if (length === null || width === null || length <= 0 || width <= 0 || ![length, width].every(Number.isFinite)
+      || ![options.antennaFromSternRatio, options.antennaFromPortRatio].every(value => Number.isFinite(value) && value >= 0 && value <= 1)) return null;
+    body = { a: length * (1 - options.antennaFromSternRatio), b: length * options.antennaFromSternRatio,
+      c: width * options.antennaFromPortRatio, d: width * (1 - options.antennaFromPortRatio), height: options.heightMeters };
+  }
+  const { a, b, c, d, height } = body;
+  if (![a, b, c, d].every(value => Number.isFinite(value) && value >= 0)
+    || ![a + b, c + d, height].every(value => Number.isFinite(value) && value > 0)) return null;
+  return { a, b, c, d, height };
+}
+
+export function vesselGeometry(target: VesselTarget, options: VesselGeometryOptions, override?: VesselBodyDimensions) {
+  const body = vesselBodyDimensions(target, options, override), { heading } = target;
+  if (!body || heading === null || !Number.isFinite(heading) || heading < 0 || heading >= 360) return null;
+  const { a, b, c, d, height } = body, length = a + b, width = c + d;
   const forward = (a - b) / 2, right = (d - c) / 2;
   const angle = CesiumMath.toRadians(heading);
   const frame = Transforms.eastNorthUpToFixedFrame(Cartesian3.fromDegrees(target.longitude, target.latitude));
@@ -18,10 +29,10 @@ export function vesselGeometry(target: VesselTarget, options: VesselGeometryOpti
   ), new Cartesian3());
   const cartographic = Cartographic.fromCartesian(center);
   const point = { longitude: CesiumMath.toDegrees(cartographic.longitude), latitude: CesiumMath.toDegrees(cartographic.latitude) };
-  const position = Cartesian3.fromDegrees(point.longitude, point.latitude, options.heightMeters / 2);
-  return { point, position, abcd: { a, b, c, d }, dimensions: new Cartesian3(width, length, options.heightMeters),
+  const position = Cartesian3.fromDegrees(point.longitude, point.latitude, height / 2);
+  return { point, position, abcd: { a, b, c, d }, dimensions: new Cartesian3(width, length, height),
     orientation: Transforms.headingPitchRollQuaternion(position, new HeadingPitchRoll(angle, 0, 0)),
-    vessel: { length, width, heading, height: options.heightMeters } };
+    vessel: { length, width, heading, height } };
 }
 
 export function isInCameraView(pose: CameraPose, position: Cartesian3, maxDistance: number, radius = 0): boolean {

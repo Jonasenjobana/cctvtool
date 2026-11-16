@@ -16,7 +16,7 @@ import { createVideoMaterial } from './video-material';
 import { PlotLayerScene } from './plot-layer-scene';
 import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 import { AisScene } from './ais-scene';
-import type { VesselSourceInfo, VesselTarget } from './ais.models';
+import type { VesselBodyDimensions, VesselSourceInfo, VesselTarget } from './ais.models';
 
 const videoPlaneDistance = 500;
 
@@ -67,6 +67,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @Input() temporaryPoints: readonly TemporaryMapPoint[] = [];
   @Input() vessels: readonly VesselTarget[] = [];
   @Input() vesselSource: VesselSourceInfo | null = null;
+  @Input() vesselBodies: ReadonlyMap<string, VesselBodyDimensions> = new Map();
   @Input() trackedMmsi = '';
   @Output() readonly vesselSelected = new EventEmitter<string>();
   @Output() readonly plotLayerError = new EventEmitter<PlotLayerError>();
@@ -138,7 +139,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         this.plotScene.sync(this.plotLayers);
         this.plotScene.focus(this.plotFocus);
         this.aisScene = new AisScene(this.viewer, mmsi => this.zone.run(() => this.vesselSelected.emit(mmsi)));
-        this.aisScene.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi);
+        this.aisScene.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi, this.vesselBodies);
       } catch (error) {
         this.sceneFailed = true;
         this.problem.set('三维场景初始化失败，请检查显卡与 WebGL 支持');
@@ -154,7 +155,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       this.releaseVideo();
     }
     this.update();
-    this.aisScene?.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi);
+    this.aisScene?.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi, this.vesselBodies);
     if (changes['temporaryPoints']) this.syncTemporaryPoints();
     if (changes['plotLayers']) this.plotScene?.sync(this.plotLayers);
     if (changes['plotFocus']) {

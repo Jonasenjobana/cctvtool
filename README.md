@@ -41,7 +41,7 @@ npm test
 
 ## 项目入口
 
-源码仓库：[Jonasenjobana/cctvtool](https://github.com/Jonasenjobana/cctvtool)。参与开发前阅读[项目工作规则](AGENTS.md)与 [Git 协作规范](CONTRIBUTING.md)。
+源码仓库：[Jonasenjobana/cctvtool](https://github.com/Jonasenjobana/cctvtool)（远端 `origin`）；第二个仓库为 `ssh://linzequan@192.168.1.10:29418/~linzequan/cctv-tool.git`（远端 `internal`）。参与开发前阅读[项目工作规则](AGENTS.md)与 [Git 协作规范](CONTRIBUTING.md)。
 
 | 路径 | 用途 | 阅读时机 |
 | --- | --- | --- |

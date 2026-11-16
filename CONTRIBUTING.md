@@ -3,7 +3,8 @@
 ## 仓库与分支
 
 - 远端 `origin`：<https://github.com/Jonasenjobana/cctvtool.git>。
-- 当前工作副本通过 HTTPS 拉取，通过 `ssh://git@ssh.github.com:443/Jonasenjobana/cctvtool.git` 推送；SSH 命令及密钥选择保存在本地 Git 配置，新工作副本按本机认证方式配置。
+- 第二个远端 `internal`：`ssh://linzequan@192.168.1.10:29418/~linzequan/cctv-tool.git`。
+- 当前工作副本通过 HTTPS 从 `origin` 拉取，通过 `ssh://git@ssh.github.com:443/Jonasenjobana/cctvtool.git` 向 GitHub 推送；`internal` 使用内网 SSH 地址。SSH 命令、按主机区分的配置及密钥选择保存在本地，新工作副本按本机认证方式配置。
 - 主分支为 `master`，用于保存可集成的项目基线。
 - 日常改动从最新 `master` 创建 `feat-<模块>` 分支；功能、修复、文档和维护任务均沿用此命名。
 - 模块名使用小写英文字母、数字及连字符，例如 `feat-ptz`、`feat-calibration`、`feat-mcp`、`feat-docs`。
@@ -68,6 +69,8 @@ git diff --cached
 git commit -m "feat(calibration): 增加海天线样本复核"
 git push -u origin feat-calibration
 ```
+
+向第二个仓库同步已提交的分支时执行 `git push internal <分支名>`，推送前同样检查该远端更新。
 
 在 GitHub 创建以 `master` 为目标分支的 Pull Request，说明改动目的、实际验证结果及未验证项。存在冲突时先核对双方改动并解决，再完成合并。
 

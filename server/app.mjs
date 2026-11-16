@@ -10,7 +10,8 @@ import { LiveGbsClient } from './livegbs.mjs';
 import { readImageInfo } from './image.mjs';
 import { httpError } from './errors.mjs';
 import { playbackSource } from './playback.mjs';
-import { checkHorizonReading, createHorizonScanPlan, createScanPlan, ptzMatches, scanTarget, scanTiltTolerance, waitForScanTarget } from './snapshot-scan.mjs';
+import { checkHorizonReading, ptzMatches, scanPanTolerance, scanTarget, scanTiltTolerance, waitForScanTarget } from './snapshot-scan.mjs';
+import { createPtzPath } from '../shared/snapshot-path.ts';
 import { registerRecognitionRoutes } from './recognition.mjs';
 import { registerPlotLayerRoutes } from './plot-layers.mjs';
 import { registerVesselSourceRoutes } from './vessel-sources.mjs';
@@ -57,7 +58,7 @@ const fieldLabels = {
   pAxisPitch: 'P 轴前后倾', pAxisRoll: 'P 轴左右倾', panOffset: '默认朝向',
   tiltOffset: 'T 偏移', imageRoll: '画面 Roll 修正', maxZoom: '最大倍率 Z',
   command: '控制指令', speed: '控制速度', pan: '目标 P', tilt: '目标 T', zoom: '目标 Z',
-  basePtz: '基础 PTZ', panMin: '起始 P', panMax: '结束 P', settleMs: '稳定等待时间', moveTimeoutMs: '定位超时',
+  controlPoints: 'PTZ 控制点', maxPanStep: '最大 P 间隔', settleMs: '稳定等待时间', moveTimeoutMs: '定位超时',
   sourceFileName: '来源文件名', geojsonText: 'GeoJSON 原文', cameraIds: '关联摄像头', visible: '图层显隐',
 };
 
@@ -82,7 +83,7 @@ export async function createApp({
   const pendingStops = new Map();
   const activeScans = new Map();
   const isBusy = (id) => operations.has(id) || moving.has(id) || pendingStops.has(id);
-  const recognition = registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer, startHorizonScan });
+  const recognition = registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer });
   registerPlotLayerRoutes(app, store);
   registerVesselSourceRoutes(app, ais);
   app.addHook('onClose', async () => {
@@ -206,9 +207,10 @@ export async function createApp({
         scan.controller.signal.throwIfAborted();
         const target = scanTarget(group, index);
         await livegbs.preciseControl(camera, target);
-        await waitForScanTarget(livegbs, camera, target, group, scan.controller.signal);
+        const panTolerance = scanPanTolerance(group, index);
+        await waitForScanTarget(livegbs, camera, target, group, scan.controller.signal, panTolerance);
         await captureSnapshot(camera, group.calibration, {
-          groupId: group.id, index, target, plan: group, panTolerance: Math.min(0.15, group.panStep / 4), signal: scan.controller.signal,
+          groupId: group.id, index, target, plan: group, panTolerance, signal: scan.controller.signal,
         });
       }
     } catch (error) {
@@ -249,25 +251,6 @@ export async function createApp({
       console.error('自动截图分组状态保存失败', error);
       scan.stopError = httpError(500, '自动截图状态保存失败，请检查后端日志');
     });
-  }
-
-  function startHorizonScan(source, task) {
-    const camera = store.getCamera(task.cameraId);
-    if (isBusy(camera.id)) throw httpError(409, '该摄像头正在控制或截图，请先停止后重试');
-    operations.add(camera.id);
-    try {
-      const calibration = { ...calibrationOf(task.fitCamera), ...task.result.installation };
-      const plan = createHorizonScanPlan(source, task, calibration);
-      const group = { id: randomUUID(), cameraId: camera.id, cameraName: camera.name, serial: camera.serial, code: camera.code,
-        kind: 'scan', createdAt: new Date().toISOString(), finishedAt: null, status: 'running',
-        ...plan, calibration, completedCount: 0, error: null };
-      store.addSnapshotGroup(group);
-      startSnapshotGroup(camera, group);
-      return store.getSnapshotGroup(group.id);
-    } catch (error) {
-      if (!activeScans.has(camera.id)) operations.delete(camera.id);
-      throw error;
-    }
   }
 
   app.get('/api/health', async () => ({ status: 'ok', livegbsConfigured: livegbs.configured }));
@@ -339,47 +322,36 @@ export async function createApp({
     store.listGroupSnapshots(request.params.id, pageOptions(request.query)));
   app.post('/api/cameras/:id/snapshot-scans', {
     schema: { body: {
-      type: 'object', additionalProperties: false, required: ['basePtz', 'panMin', 'panMax'],
+      type: 'object', additionalProperties: false, required: ['controlPoints'],
       properties: {
-        basePtz: { type: 'object', additionalProperties: false, required: ['pan', 'tilt', 'zoom'], properties: preciseProperties },
-        panMin: { type: 'number', minimum: 0, maximum: 360 },
-        panMax: { type: 'number', minimum: 0, maximum: 360 },
+        controlPoints: { type: 'array', minItems: 2, maxItems: 10000, items: {
+          type: 'object', additionalProperties: false, required: ['pan', 'tilt', 'zoom'], properties: preciseProperties,
+        } },
+        maxPanStep: { type: 'number', exclusiveMinimum: 0, maximum: 360, default: 5 },
         settleMs: { type: 'integer', minimum: 0, maximum: 10000, default: 1000 },
         moveTimeoutMs: { type: 'integer', minimum: 1000, maximum: 120000, default: 30000 },
         calibration: calibrationSchema,
-        horizon: { type: 'object', additionalProperties: false, required: ['preScanZoom', 'tiltMin', 'tiltMax'], properties: {
-          preScanZoom: { type: 'number', minimum: 1 }, tiltMin: { type: 'number', minimum: -90, maximum: 90 },
-          tiltMax: { type: 'number', minimum: -90, maximum: 90 },
-        } },
       },
     } },
   }, async (request, reply) => {
     const id = request.params.id;
     if (isBusy(id)) throw httpError(409, '该摄像头正在控制或截图，请先停止后重试');
     operations.add(id);
-    const preparation = (async () => {
+    try {
       const camera = store.getCamera(id);
-      const current = await livegbs.readPtz(camera);
-      if (!ptzMatches(current.raw, request.body.basePtz)) {
-        throw httpError(409, '当前 PTZ 与基础 PTZ 不一致，请先调整设备并重新回读');
-      }
-      const plan = createScanPlan(request.body, current.raw.HorizontalFieldAngle, current.raw.VerticalFieldAngle);
+      let plan;
+      try { plan = createPtzPath(request.body.controlPoints, request.body.maxPanStep, camera.maxZoom); }
+      catch (error) { throw httpError(400, error.message); }
       const group = { id: randomUUID(), cameraId: id, cameraName: camera.name, serial: camera.serial, code: camera.code,
         kind: 'scan', createdAt: new Date().toISOString(), finishedAt: null, status: 'running',
-        ...plan, calibration: request.body.calibration || calibrationOf(camera), completedCount: 0, error: null };
+        ...plan, settleMs: request.body.settleMs, moveTimeoutMs: request.body.moveTimeoutMs,
+        calibration: request.body.calibration || calibrationOf(camera), completedCount: 0, error: null };
       store.addSnapshotGroup(group);
       startSnapshotGroup(camera, group);
-      return group;
-    })();
-    pendingControls.set(id, preparation);
-    try {
-      const group = await preparation;
       return reply.code(202).header('Location', `/api/snapshot-groups/${group.id}`).send(store.getSnapshotGroup(group.id));
     } catch (error) {
       if (!activeScans.has(id)) operations.delete(id);
       throw error;
-    } finally {
-      if (pendingControls.get(id) === preparation) pendingControls.delete(id);
     }
   });
   app.post('/api/snapshot-tasks/:id/cancel', async (request) => {

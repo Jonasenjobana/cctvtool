@@ -52,7 +52,20 @@
 .history-context span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .snapshot-list{overflow:auto;padding:0 16px 16px}
 .snapshot-group{border-bottom:1px solid #edf0f3}.snapshot-group-heading{display:flex;flex-direction:column;align-items:flex-start;gap:7px;width:100%;padding:16px 0;text-align:left;font-size:12px}.snapshot-group-heading small{font-size:11px;color:#8b94a1}.snapshot-group-heading:hover{color:#3475da}.load-more{display:flex;margin:12px auto;padding:8px 12px;border:1px solid #dce3ed;border-radius:3px;font-size:12px}
-.scan-baseline{font-size:11px;color:#8b94a1;margin:7px 0 10px}.scan-actions{display:flex;gap:8px;flex-wrap:wrap}.scan-actions button,.scan-progress>button{padding:7px 10px;border:1px solid #dce3ed;border-radius:3px;font-size:12px}.scan-actions button:hover,.scan-progress>button:hover{background:#f4f7fc}.scan-progress{display:flex;flex-direction:column;align-items:flex-start;gap:8px;margin-top:14px;font-size:12px;color:#647084}.scan-progress progress{width:100%;height:7px;accent-color:#3475da}.scan-progress small{font-size:10px;color:#8b94a1}
+.scan-actions{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:14px}
+.scan-actions button,.scan-progress>button{min-height:36px;padding:0 10px;border:1px solid #dce3ed;border-radius:4px;font-size:12px;white-space:nowrap}
+.scan-actions button:hover:not(:disabled),.scan-progress>button:hover:not(:disabled){background:#f4f7fc;border-color:#bdcce1}
+.scan-actions app-icon{width:15px;height:15px}
+.scan-actions .scan-start{background:#3974d7;border-color:#3974d7;color:#fff;font-weight:500}
+.scan-actions .scan-start:hover:not(:disabled){background:#2b65c4;border-color:#2b65c4}
+.scan-progress{display:flex;flex-direction:column;align-items:stretch;gap:9px;margin-top:16px;padding:12px;border:1px solid #e2e7ef;border-radius:6px;background:#f8fafc;font-size:12px;color:#647084}
+.scan-progress-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.scan-progress-heading>strong{color:#344258;font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}
+.scan-progress-heading>strong>span{font-size:12px;font-weight:400;color:#718096}
+.scan-status{padding:3px 7px;border-radius:3px;background:#e9edf3;color:#647084;font-size:11px;line-height:1.5}
+.scan-status.running{background:#e8effc;color:#2f6cd7}.scan-status.completed{background:#e7f3ec;color:#397257}.scan-status.failed{background:#fbece8;color:#aa4f40}
+.scan-task-name{font-size:12px;color:#4d5d72}.scan-progress progress{width:100%;height:6px;accent-color:#3974d7}.scan-progress small{font-size:11px;line-height:1.7;color:#6c798c}
+.scan-progress .inline-error{margin-top:0}.scan-progress>button{min-height:32px;background:#fff}
 .media-dock{position:absolute;left:18px;right:18px;bottom:43px;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;max-height:calc(100% - 110px);overflow-y:auto;pointer-events:none;z-index:2}
 .media-dock>*{flex:1 1 280px;max-width:370px;min-width:0;pointer-events:auto}
 .snapshot-preview{background:#fff;border:1px solid #e0e5ed;border-radius:4px;overflow:hidden;box-shadow:0 3px 14px #1d2e421c}
@@ -135,7 +148,28 @@
 .form-section label:last-child{margin-bottom:0}
 .form-section label>span{color:#a4acb8}
 .form-section input{display:block;flex-basis:100%;width:100%;height:34px;padding:0 9px;font-size:12px;font-variant-numeric:tabular-nums}
-.scan-form select{flex-basis:100%;width:100%;height:34px;padding:0 7px;border:1px solid #dce3ed;border-radius:3px;background:#fff;color:inherit;font-size:12px}.scan-form .scan-baseline{line-height:1.7}
+.scan-form-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.scan-form .scan-form-heading h3{margin:0;color:#37465c;font-size:13px;font-weight:600}
+.scan-form-heading>span{font-size:11px;color:#6c798c;font-variant-numeric:tabular-nums}
+.scan-point-list{display:flex;flex-direction:column;gap:10px}
+.scan-point{padding:10px 12px 12px;border:1px solid #dfe5ee;border-radius:6px;background:#fff}
+.scan-point-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+.scan-point-title{display:flex;align-items:center;gap:7px;min-width:0}.scan-point-title strong{font-size:11px;font-weight:500;color:#4d5d72}
+.scan-point-index{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:4px;background:#edf2fb;color:#386abb;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
+.scan-point-tools{display:flex;gap:3px}.scan-point-tools button{width:28px;height:28px;padding:0;border-radius:4px;color:#738095}.scan-point-tools app-icon{width:16px;height:16px}
+.scan-point-tools button:hover:not(:disabled){background:#edf2fb;color:#356dca}.scan-point-tools .scan-point-remove:hover:not(:disabled){background:#fbece8;color:#aa4f40}
+.scan-point-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.scan-form .scan-point-fields label{margin:0;min-width:0;font-size:11px;color:#5d6b7e}
+.scan-point-fields input{height:34px;padding:0 6px}
+.scan-point .scan-read{width:100%;min-height:30px;margin-top:10px;border:1px solid #e3e8f0;border-radius:4px;background:#f8fafc;font-size:11px;color:#536b91}
+.scan-read app-icon,.scan-add app-icon{width:14px;height:14px}.scan-read:hover:not(:disabled){border-color:#bed0ed;background:#f0f5fd;color:#356dca}
+.scan-add{width:100%;min-height:34px;margin-top:10px;border:1px dashed #cbd6e6;border-radius:4px;font-size:12px;color:#536b91}
+.scan-add:hover:not(:disabled){border-color:#8cabdb;background:#f4f7fc;color:#356dca}
+.scan-options{display:grid;grid-template-columns:minmax(0,1fr) minmax(84px,.8fr);align-items:end;gap:12px;margin-top:16px}
+.scan-form .scan-options label{margin:0;min-width:0;color:#5d6b7e}
+.scan-count{display:flex;flex-direction:column;justify-content:space-between;gap:6px;min-height:56px;padding-left:12px;border-left:1px solid #e4e9f0}
+.scan-count>span{font-size:11px;color:#6c798c}.scan-count strong{display:flex;align-items:baseline;gap:5px;font-size:22px;font-weight:500;line-height:34px;color:#344c70;font-variant-numeric:tabular-nums}
+.scan-count small{font-size:11px;font-weight:400;color:#6c798c}
 .field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 .field-grid label{margin-bottom:0}
 .device-fields input{font-size:11px}

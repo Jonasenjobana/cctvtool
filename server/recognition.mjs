@@ -99,7 +99,7 @@ export function createEssldRecognizer() {
   };
 }
 
-export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHorizonScan, recognizer = createEssldRecognizer() }) {
+export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer = createEssldRecognizer() }) {
   store.interruptRecognitionTasks();
   const queued = [];
   let current = null, closing = false;
@@ -258,36 +258,6 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHo
   app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
     return store.updateRecognitionTask(task.id, installationChanges(task));
-  });
-  app.post('/api/recognition-tasks/:id/horizon-scan', { schema: { body: {
-    ...bodyWithRevision, required: ['revision', 'resultId', 'reviewed'], properties: { ...bodyWithRevision.properties,
-      resultId: { type: 'string', minLength: 1 }, reviewed: { type: 'boolean' } },
-  } } }, async (request, reply) => {
-    const task = editable(request.params.id, request.body.revision);
-    if (!request.body.reviewed) throw httpError(409, '请先人工复核当前版本与计算结果的海天线标注');
-    if (task.result?.status !== 'estimated' || task.resultRevision !== task.revision) {
-      throw httpError(409, '请先生成通过质量检查的最新粗标定结果');
-    }
-    if (task.resultId !== request.body.resultId) throw httpError(409, '计算结果已重新生成，请刷新并复核最新结果');
-    const source = store.getSnapshotGroup(task.sourceTaskId);
-    if (source.kind !== 'scan' || source.status !== 'completed' || source.horizon?.phase !== 'coarse') {
-      throw httpError(409, '只能从已完成的低倍率海天线预扫启动正式扫描');
-    }
-    const camera = store.getCamera(task.cameraId);
-    if ([...calibrationKeys, 'serial', 'code', 'updatedAt'].some((key) => camera[key] !== task.fitCamera?.[key])
-      || source.serial !== camera.serial || source.code !== camera.code) {
-      throw httpError(409, '摄像头配置或通道已变化，请重新生成并复核粗标定');
-    }
-    const items = store.recognitionItems(task.id);
-    const directory = resolve(dataDir, 'snapshots');
-    if (task.result.sourceSnapshotIds.some((id) => {
-      const item = items.find((value) => value.snapshotId === id);
-      if (!item || item.missing) return true;
-      const path = resolve(directory, item.snapshot.fileName);
-      return dirname(path) !== directory || !existsSync(path);
-    })) throw httpError(409, '参与粗标定的源截图或图片文件已删除，请重新生成并复核');
-    const group = startHorizonScan(source, task);
-    return reply.code(202).header('Location', `/api/snapshot-groups/${group.id}`).send(group);
   });
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },

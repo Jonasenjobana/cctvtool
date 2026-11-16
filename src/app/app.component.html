@@ -12,7 +12,7 @@
 
   <main class="map-area">
     @if (page() === 'recognition') {
-      <app-recognition-tasks [taskId]="recognitionTaskId()" (applied)="installationApplied($event)" (scanCreated)="openSnapshotTask($event)" />
+      <app-recognition-tasks [taskId]="recognitionTaskId()" (applied)="installationApplied($event)" />
     } @else if (page() === 'tasks') {
       <app-snapshot-tasks [taskId]="snapshotTaskId()" (opened)="openTaskSnapshot($event)" (removed)="forgetSnapshot($event)" (changed)="loadSnapshots()" (recognitionCreated)="openRecognition($event)" />
     } @else if (page() === 'plotting') {
@@ -221,25 +221,41 @@
         <div class="form-title"><h2>{{ selectedId() ? '安装参数' : '注册摄像头' }}</h2>@if (selectedSnapshot()) { <span>历史参数</span> } @else if (isDirty()) { <span>未保存</span> }</div>
         @if (page() === 'scene' && !selectedSnapshot()) {
           <section class="form-section scan-form">
-            <h3>自动截图</h3>
-            <label for="scan-mode">采样方式<select id="scan-mode" name="scanMode" [disabled]="!!operating() || scanning()" [ngModel]="scanMode()" (ngModelChange)="scanMode.set($event)"><option value="fixed">普通截图（固定 T/Z）</option><option value="horizon">海天线预扫描</option></select></label>
-            <div class="field-grid">
-              <label for="scan-pan-min">{{ scanMode() === 'fixed' ? '起始 P' : '最小 P' }} <span>°</span><input id="scan-pan-min" name="scanPanMin" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMin()" (ngModelChange)="scanPanMin.set($event)"></label>
-              <label for="scan-pan-max">{{ scanMode() === 'fixed' ? '结束 P' : '最大 P' }} <span>°</span><input id="scan-pan-max" name="scanPanMax" type="number" min="0" max="360" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanPanMax()" (ngModelChange)="scanPanMax.set($event)"></label>
+            <div class="scan-form-heading"><h3>自动截图</h3><span>{{ scanPoints().length }} 个控制点</span></div>
+            <div class="scan-point-list">
+              @for (point of scanPoints(); track point.id; let index = $index) {
+                <div class="scan-point">
+                  <div class="scan-point-heading">
+                    <div class="scan-point-title"><span class="scan-point-index">{{ index + 1 }}</span><strong>控制点</strong></div>
+                    <div class="scan-point-tools">
+                      <button type="button" [disabled]="!!operating() || scanning() || index === 0" [attr.aria-label]="'上移控制点 ' + (index + 1)" (click)="moveScanPoint(index, -1)"><app-icon name="up" /></button>
+                      <button type="button" [disabled]="!!operating() || scanning() || index === scanPoints().length - 1" [attr.aria-label]="'下移控制点 ' + (index + 1)" (click)="moveScanPoint(index, 1)"><app-icon name="down" /></button>
+                      <button type="button" class="scan-point-remove" [disabled]="!!operating() || scanning() || scanPoints().length <= 2" [attr.aria-label]="'删除控制点 ' + (index + 1)" (click)="removeScanPoint(point.id)"><app-icon name="close" /></button>
+                    </div>
+                  </div>
+                  <div class="scan-point-fields">
+                    <label [for]="'scan-pan-' + point.id">P <span>°</span><input [id]="'scan-pan-' + point.id" [name]="'scanPan' + point.id" type="number" min="0" max="360" step="any" [disabled]="!!operating() || scanning()" [ngModel]="point.pan" (ngModelChange)="editScanPoint(point.id, 'pan', $event)"></label>
+                    <label [for]="'scan-tilt-' + point.id">T <span>°</span><input [id]="'scan-tilt-' + point.id" [name]="'scanTilt' + point.id" type="number" min="-90" max="90" step="any" [disabled]="!!operating() || scanning()" [ngModel]="point.tilt" (ngModelChange)="editScanPoint(point.id, 'tilt', $event)"></label>
+                    <label [for]="'scan-zoom-' + point.id">Z<input [id]="'scan-zoom-' + point.id" [name]="'scanZoom' + point.id" type="number" min="1" [max]="pointZoomMax()" step="any" [disabled]="!!operating() || scanning()" [ngModel]="point.zoom" (ngModelChange)="editScanPoint(point.id, 'zoom', $event)"></label>
+                  </div>
+                  <button type="button" class="scan-read" [disabled]="!canCapture()" (click)="readScanPoint(point.id)"><app-icon name="refresh" />读取当前 PTZ</button>
+                </div>
+              }
             </div>
-            @if (scanMode() === 'horizon') {
-              <label for="pre-scan-zoom">预扫倍率 <span>Z</span><input id="pre-scan-zoom" name="preScanZoom" type="number" min="1" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="preScanZoom()" (ngModelChange)="preScanZoom.set($event)"></label>
-              <div class="field-grid">
-                <label for="scan-tilt-min">允许最小 T <span>°</span><input id="scan-tilt-min" name="scanTiltMin" type="number" min="-90" max="90" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanTiltMin()" (ngModelChange)="scanTiltMin.set($event)"></label>
-                <label for="scan-tilt-max">允许最大 T <span>°</span><input id="scan-tilt-max" name="scanTiltMax" type="number" min="-90" max="90" step="0.1" [disabled]="!!operating() || scanning()" [ngModel]="scanTiltMax()" (ngModelChange)="scanTiltMax.set($event)"></label>
-              </div>
-              <p class="scan-baseline">先调好 T 并确认低倍率画面含海天线，再恢复正式目标倍率。开始时重新回读当前 Z，预扫倍率须更低；P 覆盖至少 30°，建议 90°以上。允许 T 请按设备实际可达范围填写，且须包含当前 T。</p>
-              <p class="scan-baseline">预扫固定初始 T，缺线或遮挡图可在复核页忽略，必要时重新预扫。</p>
-            } @else { <p class="scan-baseline">开始时读取并固定 T/Z；P 从起始值递增，支持跨 0°。</p> }
-            <div class="scan-actions"><button type="button" [disabled]="!canScan()" (click)="startSnapshotScan()">{{ scanMode() === 'horizon' ? '开始海天线预扫描' : '开始自动截图' }}</button><button type="button" (click)="openPage('tasks')">查看任务</button></div>
+            <button type="button" class="scan-add" [disabled]="!!operating() || scanning() || scanPoints().length >= 10000" (click)="addScanPoint()"><app-icon name="plus" />增加控制点</button>
+            <div class="scan-options">
+              <label for="scan-max-step">最大 P 间隔 <span>°</span><input id="scan-max-step" name="scanMaxPanStep" type="number" min="0" max="360" step="any" [disabled]="!!operating() || scanning()" [ngModel]="scanMaxPanStep()" (ngModelChange)="scanMaxPanStep.set($event)"></label>
+              <div class="scan-count" role="status" aria-live="polite" aria-atomic="true"><span>预计截图</span><strong>{{ scanPlan().plan?.sampleCount ?? '—' }}<small>张</small></strong></div>
+            </div>
+            @if (scanPlan().error) { <p class="inline-error" role="alert">{{ scanPlan().error }}</p> }
+            <div class="scan-actions"><button type="button" class="scan-start" [disabled]="!canScan()" (click)="startSnapshotScan()"><app-icon name="camera" />开始截图</button><button type="button" (click)="openPage('tasks')"><app-icon name="tasks" />查看任务</button></div>
             @if (currentScan(); as task) {
-              <div class="scan-progress"><span>{{ taskName(task) }} · {{ taskStatuses[task.status] }} · 已采样 {{ task.completedCount }}/{{ task.sampleCount }}</span><progress [value]="task.completedCount" [max]="task.sampleCount" aria-label="自动截图进度"></progress>
+              <div class="scan-progress">
+                <div class="scan-progress-heading"><span class="scan-status" [class.running]="task.status === 'running' || task.status === 'pausing'" [class.completed]="task.status === 'completed'" [class.failed]="task.status === 'failed'">{{ taskStatuses[task.status] }}</span><strong>{{ task.completedCount }}<span> / {{ task.sampleCount }}</span></strong></div>
+                <span class="scan-task-name">{{ taskName(task) }}</span>
+                <progress [value]="task.completedCount" [max]="task.sampleCount" [attr.aria-label]="'已采样 ' + task.completedCount + ' / ' + task.sampleCount"></progress>
                 @if (task.horizon; as horizon) { <small>正式目标 Z {{ horizon.targetZoom }} · {{ horizon.phase === 'fine' ? '逐点调整 T' : '固定初始 T 低倍率预扫' }} · 现存 {{ task.snapshotCount }} 张</small> }
+                @else if (task.controlPoints; as points) { <small>{{ points.length }} 个控制点 · 最大 P 间隔 {{ task.maxPanStep }}° · 现存 {{ task.snapshotCount }} 张</small> }
                 @else if (task.basePtz; as base) { <small>本次固定 T {{ base.tilt }}° / Z {{ base.zoom }} · 现存 {{ task.snapshotCount }} 张</small> }
                 @if (task.error) { <p class="inline-error" role="alert">{{ task.error }}</p> }
                 @if (task.recognitionError) { <p class="inline-error" role="alert">自动创建识别任务失败：{{ task.recognitionError }}。可在截图任务页手动创建。</p> }

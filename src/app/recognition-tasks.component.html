@@ -34,7 +34,7 @@
       </div>
       @if (task.error) { <p class="error" role="alert">{{ task.error }}</p> }
       @if (sourceGroup()?.horizon; as horizon) {
-        <p class="stage-info">{{ horizon.phase === 'coarse' ? '低倍率预扫描识别 · 粗标定' : '高倍率正式扫描识别' }} · 正式目标 Z {{ horizon.targetZoom }} · 允许原始 T {{ horizon.tiltMin }}° ～ {{ horizon.tiltMax }}°</p>
+        <p class="stage-info">{{ horizon.phase === 'coarse' ? '历史低倍率预扫描识别 · 粗标定' : '历史高倍率正式扫描识别' }} · 正式目标 Z {{ horizon.targetZoom }} · 允许原始 T {{ horizon.tiltMin }}° ～ {{ horizon.tiltMax }}°</p>
       }
       <div class="workbench">
         <section class="review" aria-label="截图复核">
@@ -203,17 +203,7 @@
           } @else {
             <div class="result-empty"><app-icon name="target" /><p>{{ running() ? '识别完成后可生成安装参数' : '复核标注、忽略异常图片后，点击“生成安装参数”。' }}</p></div>
           }
-          @if (coarse()) {
-            <section class="horizon-scan" aria-label="复核后开始正式扫描">
-              <h3>高倍率正式扫描</h3>
-              <p class="note">粗标定仅用于预测各方向 T，不写入摄像头配置。请逐张复核海天线，忽略缺线或遮挡图；必要时重新预扫。</p>
-              <label class="review-confirmation"><input type="checkbox" [disabled]="!horizonReady()" [ngModel]="horizonReviewed()" (ngModelChange)="confirmHorizonReview($event)">我已复核当前结果使用的全部海天线标注</label>
-              <button type="button" class="primary apply-button" [disabled]="!horizonReady() || !horizonReviewed()" (click)="startHorizonScan()">开始高倍率扫描</button>
-              @if (dirty()) { <p class="note">请先保存标注并重新生成粗标定参数，再确认复核。</p> }
-              @if (sourceGroup()?.status !== 'completed') { <p class="note">预扫描完成后才能开始正式扫描。</p> }
-              <p class="note">使用预扫保存的目标倍率和 P 范围；启动时校验设备冲突及预测余量，创建后转到截图任务查看进度。</p>
-            </section>
-          }
+          @if (coarse()) { <p class="note">历史预扫粗结果仅供查看，不应用到摄像头配置。</p> }
           @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，仍需逐图复核。</p> }
           <p class="note">修改标注后需重新生成安装参数。</p>
         </section>

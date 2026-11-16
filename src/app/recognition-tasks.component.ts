@@ -17,7 +17,6 @@ import { renderTaskPanorama } from './task-panorama';
 export class RecognitionTasksComponent implements OnInit, OnDestroy {
   @Input() taskId = '';
   @Output() readonly applied = new EventEmitter<Camera>();
-  @Output() readonly scanCreated = new EventEmitter<SnapshotGroup>();
   @ViewChild('panoramaViewport') private panoramaViewport?: ElementRef<HTMLDivElement>;
   private readonly api = inject(ApiService);
   readonly tasks = signal<RecognitionTask[]>([]);
@@ -72,15 +71,6 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   });
   readonly running = computed(() => ['queued', 'running'].includes(this.selected()?.status || ''));
   readonly coarse = computed(() => this.sourceGroup()?.horizon?.phase === 'coarse');
-  readonly horizonReady = computed(() => this.coarse() && this.sourceGroup()?.status === 'completed'
-    && !this.running() && !this.busy() && !this.loading() && !this.dirty() && !this.generatingPanorama()
-    && this.selected()?.result?.status === 'estimated' && !!this.selected()?.resultId);
-  private readonly reviewConfirmation = signal<{ taskId: string; revision: number; resultId: string } | null>(null);
-  readonly horizonReviewed = computed(() => {
-    const task = this.selected(), confirmation = this.reviewConfirmation();
-    return !!task && !!confirmation && confirmation.taskId === task.id
-      && confirmation.revision === task.revision && confirmation.resultId === task.resultId;
-  });
   readonly fields = [
     { key: 'pAxisPitch', label: 'P 轴前后倾' }, { key: 'pAxisRoll', label: 'P 轴左右倾' },
     { key: 'tiltOffset', label: 'T 偏移' }, { key: 'imageRoll', label: '画面 Roll 修正' },
@@ -138,9 +128,6 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   private setTask(task: RecognitionTask) {
     const previous = this.selected();
     if (previous?.id !== task.id) this.clearPanorama();
-    if (previous?.id !== task.id || previous.revision !== task.revision || previous.resultId !== task.resultId) {
-      this.reviewConfirmation.set(null);
-    }
     if (previous?.sourceTaskId !== task.sourceTaskId) this.sourceGroup.set(null);
     this.selected.set(task);
     this.tasks.update((tasks) => tasks.some((item) => item.id === task.id)
@@ -348,14 +335,12 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (value === null || !Number.isFinite(value) || value < 0 || value > 1) return;
     this.points.update((points) => points.map((point, i) => i === index ? { ...point, [axis]: value } : point));
     this.dirty.set(true);
-    this.reviewConfirmation.set(null);
     this.message.set('');
   }
-  setIgnored(value: boolean) { this.ignored.set(value); this.dirty.set(true); this.reviewConfirmation.set(null); this.message.set(''); }
+  setIgnored(value: boolean) { this.ignored.set(value); this.dirty.set(true); this.message.set(''); }
   resetLine() {
     this.points.set([{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }]);
     this.dirty.set(true);
-    this.reviewConfirmation.set(null);
   }
   startDrag(event: PointerEvent) {
     if (this.running() || this.busy() || this.loading() || this.generatingPanorama() || this.panoramaDrag || this.item()?.missing || this.points().length !== 2 || event.button !== 0) return;
@@ -402,7 +387,6 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     const task = this.selected();
     if (!task) return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
-    this.reviewConfirmation.set(null);
     try {
       const result = await this.api.generateInstallation(task.id, task.revision);
       if (!this.destroyed) this.setTask(result);
@@ -421,24 +405,6 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.applied.emit(result.camera);
       this.message.set('四项安装参数已应用到摄像头配置');
     } catch (error) { this.problem.set(errorMessage(error)); }
-    finally { this.busy.set(false); }
-  }
-  confirmHorizonReview(reviewed: boolean) {
-    const task = this.selected();
-    this.reviewConfirmation.set(reviewed && this.horizonReady() && task?.resultId
-      ? { taskId: task.id, revision: task.revision, resultId: task.resultId } : null);
-  }
-  async startHorizonScan() {
-    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
-    const task = this.selected();
-    if (!task?.resultId || !this.horizonReady() || !this.horizonReviewed()) return;
-    this.busy.set(true); this.problem.set(''); this.message.set('');
-    try {
-      const group = await this.api.startHorizonScan(task.id, task.revision, task.resultId);
-      if (this.destroyed) return;
-      this.reviewConfirmation.set(null);
-      this.scanCreated.emit(group);
-    } catch (error) { this.reviewConfirmation.set(null); this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
   }
   async cancel() {

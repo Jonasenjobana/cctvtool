@@ -21,12 +21,14 @@ import { AisState } from './ais-state.service';
 import { AisPanelComponent } from './ais-panel.component';
 import { vesselGeometry } from './ais-math';
 import { HoldPtzControl } from './hold-ptz-control';
+import { createPtzPath } from '../../shared/snapshot-path';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
 import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
 import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
 const editableKeys = ['name', 'serial', 'code', 'maxZoom', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'] as const;
 type NumericField = 'maxZoom' | 'longitude' | 'latitude' | 'height' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll';
+interface ScanPointDraft { id: number; pan: number | null; tilt: number | null; zoom: number | null }
 interface PreparedPreciseTarget { target: PreciseTarget; message: string; sent?: () => void }
 
 @Component({
@@ -89,12 +91,9 @@ export class AppComponent implements OnDestroy {
   readonly snapshotTaskId = signal('');
   readonly taskStatuses = snapshotTaskStatus;
   readonly taskName = snapshotTaskName;
-  readonly scanMode = signal<'fixed' | 'horizon'>('fixed');
-  readonly scanPanMin = signal<number | null>(0);
-  readonly scanPanMax = signal<number | null>(150);
-  readonly preScanZoom = signal<number | null>(1);
-  readonly scanTiltMin = signal<number | null>(-90);
-  readonly scanTiltMax = signal<number | null>(90);
+  private nextScanPointId = 0;
+  readonly scanPoints = signal<ScanPointDraft[]>([this.emptyScanPoint(), this.emptyScanPoint()]);
+  readonly scanMaxPanStep = signal<number | null>(5);
   readonly currentScan = computed(() => this.snapshotGroups().find((group) => group.kind === 'scan' && ['running', 'pausing'].includes(group.status))
     || this.snapshotGroups().find((group) => group.kind === 'scan') || null);
   readonly scanning = computed(() => ['running', 'pausing'].includes(this.currentScan()?.status || ''));
@@ -191,18 +190,17 @@ export class AppComponent implements OnDestroy {
       catch (error) { return { point, target: null, framing: null, error: errorMessage(error) }; }
     });
   });
-  readonly canScan = computed(() => {
-    const panMin = this.scanPanMin()!;
-    const panMax = this.scanPanMax()!;
-    const panSpan = panMax - panMin + (panMax < panMin ? 360 : 0);
-    return this.canCapture() && this.inRange(panMin, 0, 360) && this.inRange(panMax, 0, 360) && panSpan > 0
-      && (this.scanMode() === 'fixed' || (!this.stale() && !!this.reading()
-        && panMax - panMin >= 30
-        && this.inRange(this.preScanZoom(), 1, Number.MAX_VALUE) && this.preScanZoom()! < this.reading()!.raw.Zoom
-        && this.inRange(this.scanTiltMin(), -90, 90) && this.inRange(this.scanTiltMax(), -90, 90)
-        && this.scanTiltMin()! < this.scanTiltMax()!
-        && this.inRange(this.reading()!.raw.Tilt, this.scanTiltMin()!, this.scanTiltMax()!)));
+  readonly scanPlan = computed(() => {
+    const points = this.scanPoints(), step = this.scanMaxPanStep();
+    if (step === null || points.some((point) => point.pan === null || point.tilt === null || point.zoom === null)) {
+      return { plan: null, error: '' };
+    }
+    try {
+      const controlPoints = points.map((point) => ({ pan: point.pan!, tilt: point.tilt!, zoom: point.zoom! }));
+      return { plan: createPtzPath(controlPoints, step, this.pointZoomMax()), error: '' };
+    } catch (error) { return { plan: null, error: (error as Error).message }; }
   });
+  readonly canScan = computed(() => this.canCapture() && !!this.scanPlan().plan);
   private readonly pollingPaused = computed(() => this.operating() === 'snapshot');
   private readonly holdControl = new HoldPtzControl(
     (id, command, speed, keepalive) => this.api.control(id, command, speed, keepalive),
@@ -323,6 +321,8 @@ export class AppComponent implements OnDestroy {
     this.operationMessage.set('');
     this.controlTarget.set(null);
     this.preciseTarget.set({ pan: null, tilt: null, zoom: null });
+    this.scanPoints.set([this.emptyScanPoint(), this.emptyScanPoint()]);
+    this.scanMaxPanStep.set(5);
     this.selectedSnapshot.set(null);
     this.lastSnapshot.set(null);
     this.following.set(true);
@@ -353,17 +353,6 @@ export class AppComponent implements OnDestroy {
     this.plotFocusRequest.set(null);
     this.recognitionTaskId.set(id);
     this.page.set('recognition');
-    this.panel.set(null);
-  }
-
-  openSnapshotTask(group: SnapshotGroup) {
-    this.plotNavigationRevision++;
-    this.plotFocusRequest.set(null);
-    this.snapshotTaskId.set(group.id);
-    if (this.selectedId() === group.cameraId) {
-      this.snapshotGroups.update((groups) => [group, ...groups.filter((item) => item.id !== group.id)]);
-    }
-    this.page.set('tasks');
     this.panel.set(null);
   }
 
@@ -541,6 +530,8 @@ export class AppComponent implements OnDestroy {
     this.formMessage.set('');
     this.controlTarget.set(null);
     this.preciseTarget.set({ pan: null, tilt: null, zoom: null });
+    this.scanPoints.set([this.emptyScanPoint(), this.emptyScanPoint()]);
+    this.scanMaxPanStep.set(5);
     this.panel.set(null);
     this.historyRevision++;
     this.historyLoading.set(false);
@@ -762,30 +753,59 @@ export class AppComponent implements OnDestroy {
     } finally { this.operating.set(null); }
   }
 
+  private emptyScanPoint(): ScanPointDraft {
+    return { id: this.nextScanPointId++, pan: null, tilt: null, zoom: null };
+  }
+
+  addScanPoint() {
+    if (this.operating() || this.scanning() || this.scanPoints().length >= 10000) return;
+    this.scanPoints.update((points) => [...points, this.emptyScanPoint()]);
+  }
+
+  removeScanPoint(id: number) {
+    if (this.operating() || this.scanning() || this.scanPoints().length <= 2) return;
+    this.scanPoints.update((points) => points.filter((point) => point.id !== id));
+  }
+
+  moveScanPoint(index: number, direction: number) {
+    if (this.operating() || this.scanning()) return;
+    const points = [...this.scanPoints()], destination = index + direction;
+    if (destination < 0 || destination >= points.length) return;
+    [points[index], points[destination]] = [points[destination], points[index]];
+    this.scanPoints.set(points);
+  }
+
+  editScanPoint(id: number, field: 'pan' | 'tilt' | 'zoom', value: number | null) {
+    this.scanPoints.update((points) => points.map((point) => point.id === id ? { ...point, [field]: value } : point));
+  }
+
+  async readScanPoint(id: number) {
+    if (!this.canCapture()) return;
+    const cameraId = this.selectedId();
+    this.operating.set('scan');
+    this.operationError.set('');
+    try {
+      const { raw } = await firstValueFrom(this.api.ptz(cameraId));
+      if (this.selectedId() !== cameraId) return;
+      this.scanPoints.update((points) => points.map((point) => point.id === id
+        ? { ...point, pan: raw.Pan, tilt: raw.Tilt, zoom: raw.Zoom } : point));
+    } catch (error) { this.operationError.set(errorMessage(error)); }
+    finally { this.operating.set(null); }
+  }
+
   async startSnapshotScan() {
-    if (!this.canScan()) return;
+    const plan = this.scanPlan().plan;
+    if (!this.canScan() || !plan) return;
     const id = this.selectedId();
     const calibration = this.calibration();
-    const panMin = this.scanPanMin()!;
-    const panMax = this.scanPanMax()!;
-    const horizon = this.scanMode() === 'horizon'
-      ? { preScanZoom: this.preScanZoom()!, tiltMin: this.scanTiltMin()!, tiltMax: this.scanTiltMax()! } : undefined;
     this.operating.set('scan');
     this.operationError.set('');
     this.operationMessage.set('');
     try {
-      const reading = await firstValueFrom(this.api.ptz(id));
-      const { Pan: pan, Tilt: tilt, Zoom: zoom } = reading.raw;
-      if (horizon && (horizon.preScanZoom >= zoom || tilt < horizon.tiltMin || tilt > horizon.tiltMax)) {
-        this.operationError.set('当前回读已变化：预扫倍率须低于当前倍率，且当前 T 须位于允许范围内');
-        return;
-      }
-      const group = await this.api.startSnapshotScan(id, { pan, tilt, zoom }, panMin, panMax, calibration, horizon);
+      const group = await this.api.startSnapshotScan(id, plan.controlPoints, plan.maxPanStep, calibration);
       this.snapshotGroups.update((groups) => [group, ...groups]);
       this.snapshotTaskId.set(group.id);
-      this.operationMessage.set(horizon
-        ? `海天线预扫描已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${horizon.preScanZoom}，正式目标 Z ${zoom}`
-        : `自动截图已开始，计划 ${group.sampleCount} 张，固定 T ${tilt}° / Z ${zoom}`);
+      this.operationMessage.set(`自动截图已开始，计划 ${group.sampleCount} 张`);
     } catch (error) { this.operationError.set(errorMessage(error)); }
     finally { this.operating.set(null); }
   }

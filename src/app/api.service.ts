@@ -2,7 +2,7 @@ import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
-import type { HorizonPoint, HorizonScanOptions, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage } from './models';
+import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
 
@@ -101,9 +101,9 @@ export class ApiService {
     return firstValueFrom(this.http.get<SnapshotPage>(`/api/snapshot-groups/${id}/snapshots`, { params: { offset, limit } }).pipe(timeout(10000)));
   }
 
-  startSnapshotScan(id: string, basePtz: PreciseTarget, panMin: number, panMax: number, calibration: Calibration, horizon?: HorizonScanOptions) {
+  startSnapshotScan(id: string, controlPoints: PreciseTarget[], maxPanStep: number, calibration: Calibration) {
     return firstValueFrom(this.http.post<SnapshotGroup>(`/api/cameras/${id}/snapshot-scans`,
-      { basePtz, panMin, panMax, calibration, ...(horizon ? { horizon } : {}) }).pipe(timeout(95000)));
+      { controlPoints, maxPanStep, calibration }).pipe(timeout(95000)));
   }
 
   taskAction(id: string, action: 'pause' | 'start' | 'cancel') {
@@ -135,10 +135,6 @@ export class ApiService {
   }
   applyInstallation(id: string, revision: number, resultId: string) {
     return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/apply`, { revision, resultId }).pipe(timeout(10000)));
-  }
-  startHorizonScan(id: string, revision: number, resultId: string) {
-    return firstValueFrom(this.http.post<SnapshotGroup>(`/api/recognition-tasks/${id}/horizon-scan`,
-      { revision, resultId, reviewed: true }).pipe(timeout(95000)));
   }
   cancelRecognition(id: string) {
     return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/cancel`, {}).pipe(timeout(10000)));

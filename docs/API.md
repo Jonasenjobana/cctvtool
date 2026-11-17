@@ -94,13 +94,17 @@
 
 ### AIS 数据源接口
 
-后端 [project.mjs](../server/project.mjs) 固定部署身份、来源地址、适配器及时间/几何参数；不提供前端来源编辑或摄像头绑定 API。当前项目为 `tianjin-lock / 天津船闸`，来源为 `tianjin-lock-ais / 天津船闸 AIS`。目录响应为：
+后端 [project.mjs](../server/project.mjs) 固定部署身份、来源地址、适配器及时间/几何参数；不提供前端来源编辑或摄像头绑定 API。当前项目为 `tianjin-lock / 天津船闸`，来源按顺序为 `tianjin-lock-ais / 天津船闸 AIS` 和 `dagu-ais / 大沽 AIS`。天津船闸连接 `ws://192.168.1.20:4323/websocket`，大沽连接 `ws://192.168.1.21:5345/websocket`，均复用 `seaoil-ais` 适配器读取 `api=1`。目录响应为：
 
 ```json
 {
   "project": { "id": "tianjin-lock", "name": "天津船闸" },
   "sources": [{
     "id": "tianjin-lock-ais", "name": "天津船闸 AIS", "type": "ais",
+    "geometry": { "antennaFromSternRatio": 0.1, "antennaFromPortRatio": 0.5, "heightMeters": 10 },
+    "maxDistanceMeters": 2000, "expireAfterMs": 600000
+  }, {
+    "id": "dagu-ais", "name": "大沽 AIS", "type": "ais",
     "geometry": { "antennaFromSternRatio": 0.1, "antennaFromPortRatio": 0.5, "heightMeters": 10 },
     "maxDistanceMeters": 2000, "expireAfterMs": 600000
   }]
@@ -118,7 +122,7 @@
 | `length/width` | 船长/船宽，米；缺失或非正值为 `null` |
 | `speed` | 对地航速，节；缺失、负值及本来源不可用编码为 `null`，0 为有效静止值 |
 
-本源无偏移的 `date` 按后端配置 UTC+08:00 解释后输出 ISO；已解码的经纬度和速度不再次按 AIS 位字段缩放。只消费 `api=1`，按 MMSI 合并；同身份较新时间优先，同时间以后到的有效记录为准。空批、其他类别或本批未出现不删除目标；按来源时间超过 10 分钟清除，超过后端当前时间一分钟的未来记录跳过。坏记录和非法 JSON 公开错误，其他有效记录继续可用。
+两路来源无偏移的 `date` 均按后端配置 UTC+08:00 解释后输出 ISO；已解码的经纬度和速度不再次按 AIS 位字段缩放。只消费 `api=1`，在各来源内按 MMSI 合并；同身份较新时间优先，同时间以后到的有效记录为准，不合并不同来源的同 MMSI 船舶。空批、其他类别或本批未出现不删除目标；按来源时间超过 10 分钟清除，超过后端当前时间一分钟的未来记录跳过。坏记录和非法 JSON 公开错误，其他有效记录继续可用。
 
 来源按需连接并在后端共享，断线清空目标后从 2 秒至 30 秒指数退避重连；10 秒连接超时，90 秒无任何消息则重连。SSE 使用 `text/event-stream`，每条 `data:` 为上述完整快照，短批次合并为最多每 250 毫秒一次更新，15 秒注释心跳；慢客户端仅保留一份最新待发快照，不累积增量队列。不依赖 `Last-Event-ID`，重新连接直接取完整状态。未知来源返回 404。服务关闭会结束 SSE 并释放来源连接与定时器。
 

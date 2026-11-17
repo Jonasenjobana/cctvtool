@@ -315,6 +315,66 @@ function optimizeInstallation(initial, camera, geometry, samples) {
   return { parameters, cost, converged, iterations: iterations + 1 };
 }
 
+function horizonVerticalOffset(parameters, camera, geometry, sample) {
+  const nx = sample.points.reduce((sum, point) => sum + point.nx, 0) / sample.points.length;
+  const nz = sample.points.reduce((sum, point) => sum + point.nz, 0) / sample.points.length;
+  const tanV = sample.snapshot.height / (2 * sample.fy);
+  const observedY = (1 - nz / tanV) / 2;
+  const angleAt = (y) => residuals(parameters, camera, geometry,
+    [{ ...sample, points: [{ nx, nz: (1 - 2 * y) * tanV }] }])[0].angle;
+  let top = 0, bottom = 1, topAngle = angleAt(top);
+  const bottomAngle = angleAt(bottom);
+  if (topAngle * bottomAngle > 0) return null;
+  if (topAngle === 0) return observedY * sample.snapshot.height;
+  if (bottomAngle === 0) return (observedY - 1) * sample.snapshot.height;
+  for (let iteration = 0; iteration < 32; iteration++) {
+    const middle = (top + bottom) / 2, angle = angleAt(middle);
+    if (angle * topAngle > 0) { top = middle; topAngle = angle; } else bottom = middle;
+  }
+  // 在标注中点的同一横坐标比较高度；正值表示标注在理论海天线下方。
+  return (observedY - (top + bottom) / 2) * sample.snapshot.height;
+}
+
+export function evaluateInstallation(camera, snapshots, observations, requestedRange) {
+  const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
+  const parameters = [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
+  if (!parameters.every((value, index) => Number.isFinite(value) && Math.abs(value) < (index < 2 ? 89 : 180))) {
+    throw httpError(400, '独立复核需要完整有效的固定安装参数');
+  }
+  const geometry = cameraGeometry(camera);
+  const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
+  const base = { model: 'wgs84-horizon-installation-v1', generatedAt: new Date().toISOString(), ...range,
+    installation: { pAxisPitch: parameters[0], pAxisRoll: parameters[1], tiltOffset: parameters[2], imageRoll: parameters[3] },
+    sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded,
+    ...panCoverage(samples.map((sample) => sample.ptz.Pan)), maximumAcceptedRmsPixels: maximumRmsPixels };
+  if (!samples.length) return { ...base, status: 'insufficient_data', perSnapshot: [], failedSnapshotIds: [],
+    rmsResidualPixels: null, rmsAngularResidualDegrees: null, maximumResidualPixels: null,
+    message: '没有有效的停稳截图和海天线标注，无法独立复核' };
+  // 复核只计算固定参数的残差，不调用优化器，也不按复核结果修改参数。
+  const byId = new Map();
+  for (const value of residuals(parameters, camera, geometry, samples)) {
+    const values = byId.get(value.snapshotId) || [];
+    values.push(value);
+    byId.set(value.snapshotId, values);
+  }
+  const perSnapshot = samples.map((sample) => {
+    const values = byId.get(sample.snapshot.id);
+    return { snapshotId: sample.snapshot.id, pan: sample.ptz.Pan, tilt: sample.ptz.Tilt, zoom: sample.ptz.Zoom,
+      width: sample.snapshot.width, height: sample.snapshot.height,
+      rmsResidualPixels: Math.sqrt(values.reduce((sum, value) => sum + value.pixels ** 2, 0) / values.length),
+      rmsAngularResidualDegrees: Math.sqrt(values.reduce((sum, value) => sum + value.angle ** 2, 0) / values.length) / rad,
+      verticalOffsetPixels: horizonVerticalOffset(parameters, camera, geometry, sample) };
+  });
+  const rms = (key) => Math.sqrt(perSnapshot.reduce((sum, item) => sum + item[key] ** 2, 0) / perSnapshot.length);
+  const failedSnapshotIds = perSnapshot.filter((item) => !Number.isFinite(item.rmsResidualPixels)
+    || item.rmsResidualPixels > maximumRmsPixels).map((item) => item.snapshotId);
+  return { ...base, status: failedSnapshotIds.length ? 'failed' : 'passed', perSnapshot, failedSnapshotIds,
+    rmsResidualPixels: rms('rmsResidualPixels'), rmsAngularResidualDegrees: rms('rmsAngularResidualDegrees'),
+    maximumResidualPixels: Math.max(...perSnapshot.map((item) => item.rmsResidualPixels)),
+    message: failedSnapshotIds.length ? `${failedSnapshotIds.length}/${samples.length} 张截图的残差超过 ${maximumRmsPixels} 像素，独立复核未通过`
+      : `当前 ${samples.length} 张独立截图的逐图残差均不超过 ${maximumRmsPixels} 像素` };
+}
+
 export function estimateInstallation(camera, snapshots, observations, requestedRange) {
   const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
   const geometry = cameraGeometry(camera);
@@ -354,6 +414,11 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
   const accepted = solution.converged && conditionNumber !== null && conditionNumber < 1e8
     && Number.isFinite(rmsResidualPixels) && rmsResidualPixels <= maximumRmsPixels;
   const [pAxisPitch, pAxisRoll, tiltOffset, imageRoll] = solution.parameters;
+  const failures = [];
+  if (conditionNumber === null || conditionNumber >= 1e8) failures.push('四参数不可可靠辨识');
+  if (!Number.isFinite(rmsResidualPixels) || rmsResidualPixels > maximumRmsPixels) {
+    failures.push(`均方根残差 ${rmsResidualPixels.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素门槛`);
+  }
   return { ...base, status: accepted ? 'estimated' : 'unreliable',
     installation: accepted ? { pAxisPitch, pAxisRoll, tiltOffset, imageRoll } : null,
     diagnostics: { converged: solution.converged, iterations: solution.iterations, conditionNumber,
@@ -362,6 +427,7 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
       '经纬度、高度与默认朝向采用当前配置，海天线不能独立标定安装高度或绝对朝向',
       '截图与 PTZ 尚未确认严格同步；未建模潮汐、折射、畸变或稳像裁剪',
       '样本较少或采样方向集中时，结果对标注和固定参数误差更敏感'],
-    message: accepted ? '已生成四项安装参数，请复核后点击应用' : '拟合未通过收敛、可辨识性或 5 像素残差检查，请调整标注或忽略误识别图片',
+    message: accepted ? '已生成四项安装参数，请复核后点击应用'
+      : [solution.converged ? '拟合已收敛' : '拟合未收敛', ...failures].join('；'),
   };
 }

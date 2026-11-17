@@ -288,7 +288,58 @@
           }
           @if (coarse()) { <p class="note">历史预扫粗结果仅供查看，不应用到摄像头配置。</p> }
           @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，仍需逐图复核。</p> }
-          <p class="note">修改标注后需重新生成安装参数。</p>
+          <p class="note">修改标注后需重新计算或独立复核。</p>
+          <section class="validation-section" aria-label="独立复核安装参数">
+            <div class="section-heading"><h2>独立复核</h2></div>
+            <label class="validation-source">标定来源
+              <select [ngModel]="validationReferenceId()" (ngModelChange)="validationReferenceId.set($event)"
+                [disabled]="busy() || loading() || running() || generatingPanorama()">
+                <option value="">选择已生成的合格结果</option>
+                @for (reference of validationSources(); track reference.id) {
+                  <option [value]="reference.id">{{ reference.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference) }} · {{ reference.result?.sourceSnapshotIds?.length }} 张</option>
+                }
+              </select>
+            </label>
+            @if (nextTaskOffset() !== null) {
+              <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多标定任务</button>
+            }
+            <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || !validationSource()"
+              (click)="validate()">复核本任务截图</button>
+            @if (validation(); as assessment) {
+              <p class="result-message" [class.error]="assessment.status !== 'passed'" role="status">{{ assessment.message }}</p>
+              <dl class="result-metrics">
+                <div><dt>独立截图</dt><dd>{{ assessment.sourceSnapshotIds.length }}<small>张</small></dd></div>
+                <div><dt>超出门槛</dt><dd>{{ assessment.failedSnapshotIds.length }}<small>张</small></dd></div>
+                @if (assessment.rmsResidualPixels !== null) {
+                  <div class="residual"><dt>复核 RMS</dt><dd>{{ assessment.rmsResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div>
+                  <div class="residual"><dt>最大逐图 RMS</dt><dd>{{ assessment.maximumResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div>
+                  <div class="residual"><dt>角度 RMS</dt><dd>{{ assessment.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div>
+                }
+              </dl>
+              <details><summary>本次固定参数</summary><table><tbody>
+                @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ assessment.installation[field.key] | number:'1.4-4' }}°</td></tr> }
+              </tbody></table></details>
+              <div class="validation-table" tabindex="0" role="region" aria-label="逐图独立复核误差">
+                <table><thead><tr><th scope="col">P</th><th scope="col">T</th><th scope="col">Z</th><th scope="col">尺寸</th>
+                  <th scope="col">RMS(px)</th><th scope="col">垂直偏差(px，下为正)</th><th scope="col">角度 RMS(°)</th></tr></thead><tbody>
+                  @for (row of assessment.perSnapshot; track row.snapshotId) {
+                    <tr [class.validation-failed]="row.rmsResidualPixels > assessment.maximumAcceptedRmsPixels">
+                      <th scope="row"><button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="openValidationItem(row.snapshotId)"
+                        [attr.aria-label]="'打开 P ' + row.pan + ' 度的截图'">{{ row.pan | number:'1.2-2' }}°</button></th>
+                      <td>{{ row.tilt | number:'1.2-2' }}°</td><td>{{ row.zoom | number:'1.1-1' }}</td><td>{{ row.width }}×{{ row.height }}</td>
+                      <td>{{ row.rmsResidualPixels | number:'1.2-2' }}</td><td>{{ row.verticalOffsetPixels === null ? '—' : (row.verticalOffsetPixels | number:'1.2-2') }}</td>
+                      <td>{{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td>
+                    </tr>
+                  }
+                </tbody></table>
+              </div>
+              @if (assessment.excluded.length) {
+                <details><summary>排除 {{ assessment.excluded.length }} 张截图</summary><ul>
+                  @for (excluded of assessment.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }
+                </ul></details>
+              }
+            }
+          </section>
         </section>
       </div>
     } @else { <div class="detail-empty"><app-icon name="horizon" /><h2>{{ loading() ? '正在加载识别任务…' : '选择识别任务' }}</h2></div> }

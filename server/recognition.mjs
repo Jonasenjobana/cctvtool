@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { httpError } from './errors.mjs';
 import { calibrationKeys, calibrationOf } from './store.mjs';
-import { estimateInstallation } from './tilt-calibration.mjs';
+import { estimateInstallation, evaluateInstallation } from './tilt-calibration.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
@@ -286,6 +286,47 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
     return store.updateRecognitionTask(task.id, installationChanges(task));
+  });
+  app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {
+      ...bodyWithRevision.properties, referenceTaskId: { type: 'string', minLength: 1 }, referenceResultId: { type: 'string', minLength: 1 },
+    },
+  } } }, async (request) => {
+    const task = editable(request.params.id, request.body.revision);
+    const reference = store.getRecognitionTask(request.body.referenceTaskId);
+    if (reference.id === task.id || reference.cameraId !== task.cameraId) {
+      throw httpError(409, '请选择同一摄像头的另一识别任务作为标定来源');
+    }
+    if (activeStatuses.includes(reference.status) || reference.result?.status !== 'estimated'
+      || reference.result.model !== 'wgs84-horizon-installation-v1' || reference.resultRevision !== reference.revision
+      || reference.resultId !== request.body.referenceResultId) {
+      throw httpError(409, '标定来源没有合格的最新结果，或结果已变化，请刷新后重试');
+    }
+    if (store.getSnapshotGroup(reference.sourceTaskId).horizon?.phase === 'coarse') {
+      throw httpError(409, '历史预扫粗结果仅供查看，请选择正式标定结果');
+    }
+    const camera = store.getCamera(task.cameraId);
+    if (['longitude', 'latitude', 'height', 'panOffset', 'serial', 'code'].some((key) => camera[key] !== reference.fitCamera?.[key])) {
+      throw httpError(409, '安装位置、默认朝向或设备通道已变化，请重新生成标定来源结果');
+    }
+    const fittedIds = new Set(reference.result.sourceSnapshotIds);
+    if (store.recognitionItems(reference.id).some((item) => fittedIds.has(item.snapshotId) && item.missing)) {
+      throw httpError(409, '标定来源的参与截图已删除，请重新生成标定结果');
+    }
+    const items = store.recognitionItems(task.id);
+    const selected = items.filter((item) => !item.ignored && !item.missing && validPoints(item.points));
+    if (selected.some((item) => fittedIds.has(item.snapshotId))) {
+      throw httpError(409, '复核图片与拟合图片存在重叠，请使用未参与拟合的独立截图');
+    }
+    const dates = items.map((item) => +new Date(item.snapshot.createdAt));
+    const result = evaluateInstallation({ ...camera, ...reference.fitCamera, ...reference.result.installation },
+      selected.map((item) => item.snapshot), selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
+        startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
+      });
+    result.excluded.push(...items.filter((item) => item.ignored || item.missing).map((item) => ({ snapshotId: item.snapshotId,
+      reason: item.missing ? '源截图已删除' : item.ignoreReason })));
+    return { ...result, taskId: task.id, revision: task.revision, reference: { taskId: reference.id, resultId: reference.resultId,
+      revision: reference.revision, createdAt: reference.createdAt } };
   });
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },

@@ -4,7 +4,7 @@ import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
-import type { Camera, HorizonPoint, RecognitionItem, RecognitionTask, SnapshotGroup } from './models';
+import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, SnapshotGroup } from './models';
 import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
   panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
@@ -37,6 +37,19 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly message = signal('');
   readonly nextTaskOffset = signal<number | null>(null);
   readonly nextItemOffset = signal<number | null>(null);
+  readonly validationReferenceId = signal('');
+  private readonly validationResult = signal<InstallationValidation | null>(null);
+  readonly validationSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
+    && task.cameraId === this.selected()?.cameraId && task.result?.status === 'estimated'
+    && task.result.model === 'wgs84-horizon-installation-v1' && task.resultRevision === task.revision
+    && !['queued', 'running'].includes(task.status)));
+  readonly validationSource = computed(() => this.validationSources().find((entry) => entry.id === this.validationReferenceId()));
+  readonly validation = computed(() => {
+    const result = this.validationResult(), task = this.selected();
+    const reference = this.validationSource();
+    return result && task && reference && !this.dirty() && result.taskId === task.id && result.revision === task.revision
+      && result.reference.taskId === reference.id && result.reference.resultId === reference.resultId ? result : null;
+  });
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
   readonly generatingPanorama = signal(false);
   readonly panoramaProgress = signal('');
@@ -200,6 +213,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   async loadTask(id: string, save = true) {
     if (this.busy() || (save && !await this.save())) return;
+    this.validationResult.set(null);
     this.clearPanorama();
     const revision = ++this.revision;
     this.loading.set(true);
@@ -248,7 +262,9 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   private setTask(task: RecognitionTask) {
     const previous = this.selected();
+    if (previous?.id !== task.id || previous.revision !== task.revision) this.validationResult.set(null);
     if (previous?.id !== task.id) {
+      this.validationReferenceId.set('');
       this.clearPanorama();
       this.guide.set(null);
       this.savedGuide = null;
@@ -792,7 +808,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         this.guideRevision = result.revision;
         this.guideDirty.set(false);
       }
-      this.message.set(saveAnnotation ? `${saveGuide ? '标注和全景参考线' : '标注'}已保存，请重新生成安装参数` : '全景参考线已保存');
+      this.message.set(saveAnnotation ? `${saveGuide ? '标注和全景参考线' : '标注'}已保存，请重新计算或独立复核` : '全景参考线已保存');
       return true;
     } catch (error) { this.problem.set(errorMessage(error)); return false; }
     finally { this.busy.set(false); }
@@ -810,6 +826,28 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       if (!this.destroyed) this.setTask(result);
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
+  }
+  async validate() {
+    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
+    const task = this.selected(), reference = this.validationSource();
+    if (!task || !reference?.resultId) return;
+    const revision = this.revision;
+    this.busy.set(true); this.problem.set(''); this.message.set(''); this.validationResult.set(null);
+    try {
+      const result = await this.api.validateInstallation(task.id, task.revision, reference.id, reference.resultId);
+      if (!this.destroyed && revision === this.revision) this.validationResult.set(result);
+    } catch (error) { if (!this.destroyed) this.problem.set(errorMessage(error)); }
+    finally { this.busy.set(false); }
+  }
+  async openValidationItem(snapshotId: string) {
+    const item = this.items().find((entry) => entry.snapshotId === snapshotId);
+    if (item) await this.openItem(item);
+  }
+  calibrationZoom(task: RecognitionTask) {
+    const values = task.result?.diagnostics?.perSnapshot.flatMap((row) => row.zoom === undefined ? [] : [row.zoom]) || [];
+    if (!values.length) return '—';
+    const min = Math.min(...values), max = Math.max(...values);
+    return min === max ? min.toFixed(1) : `${min.toFixed(1)}～${max.toFixed(1)}`;
   }
   async apply() {
     const task = this.selected();

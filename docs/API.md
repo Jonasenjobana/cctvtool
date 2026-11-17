@@ -50,6 +50,7 @@
 | `PUT /api/recognition-tasks/:id/panorama-guide` | 保存或删除 `{ guide, revision }`，返回独立版本递增后的参考线状态 |
 | `POST /api/recognition-tasks/:id/cancel` | 取消排队或运行中的本地模型识别，保留已有结果 |
 | `POST /api/recognition-tasks/:id/generate` | `{ revision }` 联合生成四项安装修正，返回任务及结果，不写设备配置 |
+| `POST /api/recognition-tasks/:id/validate` | `{ revision, referenceTaskId, referenceResultId }` 使用另一任务的固定参数独立复核本任务截图，不写入配置、任务或标注 |
 | `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId }` 应用服务端保存的最新合格结果，返回 `{ task, camera }` |
 
 设备创建与保存的请求体为：
@@ -103,11 +104,11 @@
   "sources": [{
     "id": "tianjin-lock-ais", "name": "天津船闸 AIS", "type": "ais",
     "geometry": { "antennaFromSternRatio": 0.1, "antennaFromPortRatio": 0.5, "heightMeters": 10 },
-    "maxDistanceMeters": 2000, "expireAfterMs": 600000
+    "expireAfterMs": 600000
   }, {
     "id": "dagu-ais", "name": "大沽 AIS", "type": "ais",
     "geometry": { "antennaFromSternRatio": 0.1, "antennaFromPortRatio": 0.5, "heightMeters": 10 },
-    "maxDistanceMeters": 2000, "expireAfterMs": 600000
+    "expireAfterMs": 600000
   }]
 }
 ```
@@ -127,7 +128,7 @@
 
 来源按需连接并在后端共享，断线清空目标后从 2 秒至 30 秒指数退避重连；10 秒连接超时，90 秒无任何消息则重连。SSE 使用 `text/event-stream`，每条 `data:` 为上述完整快照，短批次合并为最多每 250 毫秒一次更新，15 秒注释心跳；慢客户端仅保留一份最新待发快照，不累积增量队列。不依赖 `Last-Event-ID`，重新连接直接取完整状态。未知来源返回 404。服务关闭会结束 SSE 并释放来源连接与定时器。
 
-浏览器页面单选来源，选择按项目保存在当前浏览器，不写摄像头或数据库。页面以 `addEventListener` 注册 SSE 事件，兼容代理包装的 EventSource；初始化异常时释放订阅并显示“连接失败”、具体原因及重新连接入口，此为页面本地状态。历史模式和离页关闭订阅；切源隔离旧回调。ABCD/船高属于展示边界，默认按目录参数与有效船长宽估算，也可在前端按数据源与 MMSI 手动覆盖。A/B/C/D 为报告位置至船艏、船艉、左舷、右舷的非负米制距离，A+B、C+D 及船高须大于 0；手动尺寸只保留在当前网页内存，切源或 AIS 更新不覆盖，刷新清除。原始 AIS 记录保持八个字段，手动参数不提交后端、不入库或写浏览器存储；尺寸与有效船艏共同决定长方体和中心偏移。
+浏览器页面单选来源，选择按项目保存在当前浏览器，不写摄像头或数据库。AIS 显示按当前摄像头真实 PTZ/HFOV/VFOV 和椭球遮挡判断，不设距离上限。页面以 `addEventListener` 注册 SSE 事件，兼容代理包装的 EventSource；初始化异常时释放订阅并显示“连接失败”、具体原因及重新连接入口，此为页面本地状态。历史模式和离页关闭订阅；切源隔离旧回调。ABCD/船高属于展示边界，默认按目录参数与有效船长宽估算，也可在前端按数据源与 MMSI 手动覆盖。A/B/C/D 为报告位置至船艏、船艉、左舷、右舷的非负米制距离，A+B、C+D 及船高须大于 0；手动尺寸只保留在当前网页内存，切源或 AIS 更新不覆盖，刷新清除。原始 AIS 记录保持八个字段，手动参数不提交后端、不入库或写浏览器存储；尺寸与有效船艏共同决定长方体和中心偏移。
 
 页面开启 AIS 追踪后立即定位，每次调用结束等待 1 秒检查目标；经纬度或船艏变化时再次回读 PTZ、刷新来源快照并调用 `/api/cameras/:id/precise`。每次定位重新计算 P/T/Z，有有效几何时按估算或手动尺寸瞄准盒中心，中心高度取当前船高的一半，并计算受摄像头最大 Z 限制的倍率；无几何时保留倍率，定位报告点。正在追踪时，手动应用尺寸或恢复估算也触发重新定位，并使旧参数下未下发的请求失效。调用串行，不积压中间更新，不因来源时间、速度或长宽变化单独定位；来源过滤的 0 船艏不会单独引发定位。停止追踪、人工控制、配置保存、截图扫描、目标／来源／摄像头切换、历史、离页、网页隐藏或目标失效后不再下发旧请求；定位失败不自动重发，需要用户重新开启。追踪状态和定时器仅存在当前页面，不写数据库或新增设备控制接口。交互和估算边界见 [README](../README.md#ais-数据源与追踪船体)。
 
@@ -237,7 +238,13 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 
 `generate` 使用当前设备经纬度、高度及默认朝向，以及未忽略截图的真实 PTZ/FOV。模型 `wgs84-horizon-installation-v1` 联合求解 `pAxisPitch/pAxisRoll/tiltOffset/imageRoll`，复用共用旋转链、WGS84 残差和稳健损失。`result.status` 为 `estimated/insufficient_data/unreliable`，只有 `estimated` 包含 `installation` 四项数值。有效样本参与拟合后，必须收敛、未加阻尼的四参数矩阵条件数小于 `1e8`，各图等权的 RMS 不超过 5 像素；否则返回 `unreliable`。没有有效样本时返回 `insufficient_data`。张数、不同 P 方向数和覆盖范围用于查看分布，样本较少或方向集中时对标注及固定参数误差更敏感。`diagnostics.perSnapshot` 给出逐图像素残差，`diagnostics.rmsAngularResidualDegrees` 给出参与样本真实射线的角度均方根残差，排除项列在 `excluded`。低倍率的像素门槛不直接保证高倍率精度。
 
-`generate` 每次产生新的 `resultId` 并清除当前结果的应用状态。`apply` 必须同时提交读取的 `revision` 与 `resultId`，只读取服务端保存的合格结果，不接收前端角度值；校验标注版本、结果编号、计算参考的当前设备配置、设备通道、源记录仍存在以及设备未被控制/截图占用。在同一事务中更新四项修正与应用状态，其他设备字段保持原值；不调用 LiveGBS 控制、修改原始 PTZ 或回写历史截图。成功后记录 `appliedAt/appliedRevision`；无合格结果、配置改变、源图删除、过期版本或重复应用返回 409。此写入能力仅属于本地网页流程，MCP 工具继续只读且只估计两个 P 轴倾角。
+`generate` 的失败消息区分未收敛、不可辨识和 RMS 超限；已收敛但残差超限会明确显示实际 RMS 与 5 像素门槛。每次生成新的 `resultId` 并清除当前结果的应用状态。
+
+`validate` 固定另一任务已生成的合格 `wgs84-horizon-installation-v1` 结果，按本任务全部有效标注计算残差，不调用优化器。请求的 `revision` 对应验证任务；来源必须是同一摄像头的另一任务，`referenceResultId` 与来源当前结果编号一致，来源 `resultRevision` 等于其标注版本且不在识别中。历史预扫粗结果不能作为来源。当前经纬度、高度、默认朝向和设备通道必须与来源 `fitCamera` 一致，来源参与截图仍须存在；验证图与来源实际参与拟合的截图有重叠时返回 409。只使用未忽略、源记录存在且点位有效的验证图，其余排除原因列在 `excluded`。
+
+复核响应包含 `taskId/revision/generatedAt`、`reference:{ taskId, resultId, revision, createdAt }`、本次固定的 `installation`、实际使用的 `sourceSnapshotIds`、`perSnapshot`、`failedSnapshotIds`、总体 `rmsResidualPixels/rmsAngularResidualDegrees`、最大逐图 RMS `maximumResidualPixels` 及门槛 `maximumAcceptedRmsPixels=5`。逐图返回实际 `pan/tilt/zoom/width/height`、像素与角度 RMS、`verticalOffsetPixels`；垂直偏差在标注中点的同一横坐标与理论海天线比较，向下为正，理论海天线未穿过该图像竖线时为 `null`。像素按每张原图尺寸计算，跨倍率或分辨率对照可同时参考角度残差。全部有效图的逐图 RMS 均不超过 5 像素时 `status=passed`，有超差图时为 `failed`；无有效图为 `insufficient_data`，总体误差为 `null`。验证任务可以只有单张图，响应只评价实际参与的这些样本，不将其视为全姿态或现场精度验收。结果仅返回客户端，不持久化，不清除本任务拟合结果、不应用参数，也不调用 LiveGBS；客户端在标注或来源变化后重新执行复核。
+
+`apply` 必须同时提交读取的 `revision` 与 `resultId`，只读取服务端保存的合格结果，不接收前端角度值；校验标注版本、结果编号、计算参考的当前设备配置、设备通道、源记录仍存在以及设备未被控制/截图占用。在同一事务中更新四项修正与应用状态，其他设备字段保持原值；不调用 LiveGBS 控制、修改原始 PTZ 或回写历史截图。成功后记录 `appliedAt/appliedRevision`；无合格结果、配置改变、源图删除、过期版本或重复应用返回 409。此写入能力仅属于本地网页流程，MCP 工具继续只读且只估计两个 P 轴倾角。
 
 ### 实时播放地址
 

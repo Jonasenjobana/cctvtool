@@ -52,6 +52,74 @@ const post = async (f, id, action, revision) => {
     payload: { revision, ...(task ? { resultId: task.resultId || 'no-result' } : {}) } });
 };
 
+async function independentValidationFixture(t) {
+  const f = await fixture(t);
+  const source = await createAndWait(f);
+  const generated = await post(f, source.id, 'generate', 0);
+  assert.equal(generated.statusCode, 200, generated.body);
+  f.reference = generated.json();
+  await f.app.close();
+  const store = new CameraStore(f.dataDir);
+  try {
+    const task = { ...source, id: 'validation-task', sourceTaskId: 'validation-source', result: null, resultId: null };
+    store.addSnapshotGroup({ id: task.sourceTaskId, cameraId: f.camera.id, cameraName: f.camera.name,
+      kind: 'scan', status: 'completed', createdAt: source.createdAt, sampleCount: f.snapshots.length, completedCount: f.snapshots.length });
+    const items = f.snapshots.map((snapshot, index) => {
+      const copy = { ...snapshot, id: `validation-${index}`, groupId: task.sourceTaskId, fileName: `validation-${index}.jpg` };
+      store.addSnapshot(copy);
+      const points = f.observations[index].points.filter((_, column) => column !== 1);
+      return { snapshotId: copy.id, snapshot: copy, detectedPoints: points, points, ignored: false, source: 'manual', ignoreReason: '' };
+    });
+    store.addRecognitionTask(task, items);
+    f.validationTask = task;
+  } finally { store.close(); }
+  f.app = await createApp(f.options);
+  f.validate = (changes = {}) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.validationTask.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.reference.resultId, ...changes } });
+  return f;
+}
+
+test('独立复核使用另一任务的固定结果，不改变设备、标注、拟合或应用状态', async (t) => {
+  const f = await independentValidationFixture(t);
+  const camerasBefore = (await f.app.inject('/api/cameras')).json();
+  const itemsUrl = `/api/recognition-tasks/${f.validationTask.id}/items`;
+  const itemsBefore = (await f.app.inject(itemsUrl)).json();
+  const referenceBefore = (await f.app.inject(`/api/recognition-tasks/${f.reference.id}`)).json();
+  const response = await f.validate();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().status, 'passed');
+  assert.equal(response.json().reference.resultId, f.reference.resultId);
+  assert.deepEqual(response.json().installation, f.reference.result.installation);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), camerasBefore);
+  assert.deepEqual((await f.app.inject(itemsUrl)).json(), itemsBefore);
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${f.reference.id}`)).json(), referenceBefore);
+  const id = f.validationTask.id;
+  const edit = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${id}/items/validation-0`,
+    payload: { revision: 0, points: itemsBefore.items[0].points.map((point) => ({ ...point, y: point.y + 30 / itemsBefore.items[0].snapshot.height })) } });
+  assert.equal(edit.statusCode, 200, edit.body);
+  const failed = await f.validate({ revision: 1 });
+  assert.equal(failed.statusCode, 200, failed.body);
+  assert.equal(failed.json().status, 'failed');
+  assert.ok(failed.json().failedSnapshotIds.includes('validation-0'));
+  assert.deepEqual(failed.json().installation, f.reference.result.installation);
+});
+
+test('独立复核拒绝复用拟合图片、旧标注版本、旧结果编号与已变化的固定配置', async (t) => {
+  const f = await independentValidationFixture(t);
+  const overlap = await f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.reference.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.reference.resultId } });
+  assert.equal(overlap.statusCode, 409, overlap.body);
+  const duplicate = await createAndWait(f);
+  const duplicateCheck = await f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${duplicate.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.reference.resultId } });
+  assert.equal(duplicateCheck.statusCode, 409, duplicateCheck.body);
+  assert.equal((await f.validate({ revision: 1 })).statusCode, 409);
+  assert.equal((await f.validate({ referenceResultId: 'old-result' })).statusCode, 409);
+  assert.equal((await f.validate({ installation: f.reference.result.installation })).statusCode, 400);
+  await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: { ...f.input, height: f.input.height + 1 } });
+  assert.equal((await f.validate()).statusCode, 409);
+});
+
 test('全景参考线对已有识别任务缺省为空，未知任务返回 404', async (t) => {
   const f = await fixture(t);
   const task = await createAndWait(f);

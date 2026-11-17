@@ -146,8 +146,8 @@ export function registerVesselSourceRoutes(app, {
   app.addHook('onClose', async () => { for (const source of sources.values()) source.close(); });
   app.get('/api/data-sources', async () => ({
     project: { id: project.id, name: project.name },
-    sources: project.sources.map(({ id, name, geometry, maxDistanceMeters, expireAfterMs }) => ({
-      id, name, type: 'ais', geometry, maxDistanceMeters, expireAfterMs,
+    sources: project.sources.map(({ id, name, geometry, expireAfterMs }) => ({
+      id, name, type: 'ais', geometry, expireAfterMs,
     })),
   }));
   app.get('/api/data-sources/:id/snapshot', async request => {

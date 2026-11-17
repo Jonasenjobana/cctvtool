@@ -78,7 +78,7 @@ export class AisScene {
         const geometry = tracked ? vesselGeometry(target, source.geometry, bodies.get(target.mmsi)) : null;
         const position = geometry?.position ?? Cartesian3.fromDegrees(target.longitude, target.latitude);
         const radius = geometry ? Cartesian3.magnitude(geometry.dimensions) / 2 : 0;
-        if (!isInCameraView(pose, position, source.maxDistanceMeters, radius)) continue;
+        if (!isInCameraView(pose, position, radius)) continue;
         visible.add(target.mmsi);
         const key = JSON.stringify([target.longitude, target.latitude, geometry?.position, geometry?.dimensions, geometry?.orientation, tracked]);
         const previous = this.entities.get(target.mmsi);

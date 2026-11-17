@@ -368,6 +368,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {
       ...bodyWithRevision.properties, referenceTaskId: { type: 'string', minLength: 1 }, referenceResultId: { type: 'string', minLength: 1 },
+      referenceKind: { type: 'string', enum: ['ordinary', 'refinement'] },
     },
   } } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
@@ -375,19 +376,33 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     if (reference.id === task.id || reference.cameraId !== task.cameraId) {
       throw httpError(409, '请选择同一摄像头的另一识别任务作为标定来源');
     }
-    if (activeStatuses.includes(reference.status) || reference.result?.status !== 'estimated'
-      || reference.result.model !== 'wgs84-horizon-installation-v1' || reference.resultRevision !== reference.revision
-      || reference.resultId !== request.body.referenceResultId) {
-      throw httpError(409, '标定来源没有合格的最新结果，或结果已变化，请刷新后重试');
-    }
-    if (store.getSnapshotGroup(reference.sourceTaskId).horizon?.phase === 'coarse') {
-      throw httpError(409, '历史预扫粗结果仅供查看，请选择正式标定结果');
+    const kind = request.body.referenceKind || 'ordinary';
+    let fittedResult = reference.result, fitCamera = reference.fitCamera, resultId = reference.resultId;
+    if (kind === 'refinement') {
+      fittedResult = reference.refinement;
+      fitCamera = fittedResult?.baseCamera;
+      resultId = fittedResult?.resultId;
+      if (activeStatuses.includes(reference.status) || fittedResult?.status !== 'estimated'
+        || fittedResult.model !== 'wgs84-horizon-refinement-v1' || resultId !== request.body.referenceResultId) {
+        throw httpError(409, '精修来源没有合格的最新候选，或候选编号已变化，请刷新后重试');
+      }
+      const changed = refinementStaleReasons(store, reference);
+      if (changed.length) throw httpError(409, changed.join('；'));
+    } else {
+      if (activeStatuses.includes(reference.status) || reference.result?.status !== 'estimated'
+        || reference.result.model !== 'wgs84-horizon-installation-v1' || reference.resultRevision !== reference.revision
+        || reference.resultId !== request.body.referenceResultId) {
+        throw httpError(409, '标定来源没有合格的最新结果，或结果已变化，请刷新后重试');
+      }
+      if (store.getSnapshotGroup(reference.sourceTaskId).horizon?.phase === 'coarse') {
+        throw httpError(409, '历史预扫粗结果仅供查看，请选择正式标定结果');
+      }
     }
     const camera = store.getCamera(task.cameraId);
-    if (['longitude', 'latitude', 'height', 'panOffset', 'serial', 'code'].some((key) => camera[key] !== reference.fitCamera?.[key])) {
+    if (['longitude', 'latitude', 'height', 'panOffset', 'serial', 'code'].some((key) => camera[key] !== fitCamera?.[key])) {
       throw httpError(409, '安装位置、默认朝向或设备通道已变化，请重新生成标定来源结果');
     }
-    const fittedIds = new Set(reference.result.sourceSnapshotIds);
+    const fittedIds = new Set(fittedResult.sourceSnapshotIds);
     if (store.recognitionItems(reference.id).some((item) => fittedIds.has(item.snapshotId) && item.missing)) {
       throw httpError(409, '标定来源的参与截图已删除，请重新生成标定结果');
     }
@@ -397,15 +412,37 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       throw httpError(409, '复核图片与拟合图片存在重叠，请使用未参与拟合的独立截图');
     }
     const dates = items.length ? items.map((item) => +new Date(item.snapshot.createdAt)) : [+new Date(task.createdAt)];
-    const result = evaluateInstallation({ ...camera, ...reference.fitCamera, ...reference.result.installation },
+    const result = evaluateInstallation({ ...camera, ...fitCamera, ...fittedResult.installation },
       selected.map((item) => item.snapshot), selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
         startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
       });
     result.excluded.push(...items.filter((item) => item.ignored || item.missing || !validPoints(item.points)).map((item) => ({ snapshotId: item.snapshotId,
       reason: item.missing ? '源截图已删除' : item.ignored ? item.ignoreReason : '海天线正式标注无效或横向跨度不足图片宽度的 10%' })));
-    return { ...result, taskId: task.id, revision: task.revision, reference: { taskId: reference.id, resultId: reference.resultId,
-      revision: reference.revision, createdAt: reference.createdAt } };
+    return { ...result, taskId: task.id, revision: task.revision, reference: { kind, taskId: reference.id, resultId,
+      revision: reference.revision, createdAt: reference.createdAt,
+      ...(kind === 'refinement' ? { selectionRevision: fittedResult.selectionRevision, sources: fittedResult.sources } : {}) } };
   });
+  app.post('/api/recognition-tasks/:id/refinement-apply', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },
+  } } }, async (request) => store.transaction(() => {
+    // 写锁取得后重读候选、全部来源及完整相机版本，校验和两项写入属于同一次事务。
+    const task = editable(request.params.id, request.body.revision);
+    const candidate = task.refinement;
+    if (!candidate || candidate.resultId !== request.body.resultId) throw httpError(409, '精修候选编号已变化，请刷新并复核最新结果');
+    if (candidate.status !== 'estimated' || candidate.model !== 'wgs84-horizon-refinement-v1') throw httpError(409, '请先生成通过质量检查的精修候选');
+    if (candidate.applied || candidate.appliedAt) throw httpError(409, '本版精修候选已经应用');
+    const changed = refinementStaleReasons(store, task);
+    if (changed.length) throw httpError(409, changed.join('；'));
+    const camera = store.getCamera(task.cameraId);
+    if (Object.keys(camera).some((key) => camera[key] !== candidate.generatedCamera[key])) {
+      throw httpError(409, '摄像头配置已变化，请重新生成精修候选后再应用');
+    }
+    if (isBusy(task.cameraId)) throw httpError(409, '该摄像头正在控制或截图，请停止后再应用');
+    const installation = Object.fromEntries(fittedKeys.map((key) => [key, candidate.installation[key]]));
+    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id);
+    const updated = store.updateRecognitionTask(task.id, { refinement: { ...candidate, applied: true, appliedAt: new Date().toISOString() } });
+    return { task: withRefinementState(store, updated), camera: updatedCamera };
+  }));
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },
   } } }, async (request) => {

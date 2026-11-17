@@ -12,6 +12,11 @@ import type { PanoramaFrame, PanoramaPlan } from './panorama-math';
 import { renderTaskPanorama, renderTaskPanoramaFrame } from './task-panorama';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
 
+interface ValidationSource {
+  key: string; kind: 'ordinary' | 'refinement'; task: RecognitionTask; resultId: string;
+  installation: InstallationValidation['installation']; sourceSnapshotIds: string[];
+}
+
 @Component({
   selector: 'app-recognition-tasks', standalone: true,
   imports: [DatePipe, DecimalPipe, FormsModule, IconComponent], changeDetection: ChangeDetectionStrategy.OnPush,
@@ -49,16 +54,29 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     && task.id !== this.selected()?.refinementSelection?.base?.taskId && task.cameraId === this.selected()?.cameraId
     && !['queued', 'running'].includes(task.status)));
   readonly refinementGroups = [{ key: 'overall', label: '总体（两组等权）' }, { key: 'base', label: '基础组' }, { key: 'high', label: '高倍组' }] as const;
-  readonly validationSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
+  readonly refinementBaseSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
     && task.cameraId === this.selected()?.cameraId && task.result?.status === 'estimated'
     && task.result.model === 'wgs84-horizon-installation-v1' && task.resultRevision === task.revision
     && !['queued', 'running'].includes(task.status)));
-  readonly validationSource = computed(() => this.validationSources().find((entry) => entry.id === this.validationReferenceId()));
+  readonly validationSources = computed<ValidationSource[]>(() => [
+    ...this.refinementBaseSources().flatMap((task) => task.resultId && task.result?.installation ? [{
+      key: `ordinary:${task.id}`, kind: 'ordinary' as const, task, resultId: task.resultId,
+      installation: task.result.installation, sourceSnapshotIds: task.result.sourceSnapshotIds,
+    }] : []),
+    ...this.tasks().flatMap((task) => task.id !== this.selected()?.id && task.cameraId === this.selected()?.cameraId
+      && !['queued', 'running'].includes(task.status) && task.refinement?.status === 'estimated' && !task.refinement.stale
+      && task.refinement.model === 'wgs84-horizon-refinement-v1' && task.refinement.installation ? [{
+        key: `refinement:${task.id}`, kind: 'refinement' as const, task, resultId: task.refinement.resultId,
+        installation: task.refinement.installation, sourceSnapshotIds: task.refinement.sourceSnapshotIds,
+      }] : []),
+  ]);
+  readonly validationSource = computed(() => this.validationSources().find((entry) => entry.key === this.validationReferenceId()));
   readonly validation = computed(() => {
     const result = this.validationResult(), task = this.selected();
     const reference = this.validationSource();
     return result && task && reference && !this.dirty() && result.taskId === task.id && result.revision === task.revision
-      && result.reference.taskId === reference.id && result.reference.resultId === reference.resultId ? result : null;
+      && result.reference.kind === reference.kind && result.reference.taskId === reference.task.id
+      && result.reference.resultId === reference.resultId ? result : null;
   });
   readonly refinementMeasurement = computed(() => {
     const result = this.refinementMeasurementResult(), task = this.selected();
@@ -70,7 +88,12 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     ?.perSnapshot.find((row) => row.snapshotId === this.selectedItemId()));
   readonly measurementExclusion = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
     ?.excluded.find((row) => row.snapshotId === this.selectedItemId())?.reason);
-  readonly measurementLabel = computed(() => this.comparisonMode() === 'after' ? '候选海天线对照' : '基准海天线对照');
+  readonly theoreticalLabel = computed(() => this.comparisonMode() === 'validation'
+    ? this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
+    : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
+  readonly measurementLabel = computed(() => this.comparisonMode() === 'validation'
+    ? this.validationSource()?.kind === 'refinement' ? '精修候选独立复核' : '普通结果独立复核'
+    : this.comparisonMode() === 'after' ? '候选海天线对照' : '基准海天线对照');
   readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
   readonly generatingPanorama = signal(false);
@@ -266,13 +289,15 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       }
       if (this.destroyed || revision !== this.revision || this.hasDraft()) return;
       this.setTask(page.task);
-      const sourceIds = [page.task.refinementSelection?.base?.taskId, ...page.task.refinementSelection?.supplemental.map((source) => source.taskId) || []]
-        .filter((source): source is string => !!source);
+      const sourceIds = [...new Set([this.validationSource()?.task.id, page.task.refinementSelection?.base?.taskId,
+        ...page.task.refinementSelection?.supplemental.map((source) => source.taskId) || []]
+        .filter((source): source is string => !!source))];
       const sourceResults = await Promise.allSettled(sourceIds.map((source) => this.api.recognitionTask(source)));
       if (this.destroyed || revision !== this.revision) return;
       const sources = sourceResults.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
-      for (const result of sourceResults) if (result.status === 'rejected') this.problem.set(`精修来源读取失败：${errorMessage(result.reason)}`);
+      for (const result of sourceResults) if (result.status === 'rejected') this.problem.set(`标定来源读取失败：${errorMessage(result.reason)}`);
       this.tasks.update((tasks) => [...tasks.filter((task) => !sourceIds.includes(task.id)), ...sources]);
+      if (this.validationReferenceId() && !this.validationSource() && !this.problem()) this.problem.set('所选独立复核来源已失效，请选择合格的最新结果');
       this.items.set(entries);
       this.nextItemOffset.set(offset);
       this.selectItem(entries.find((item) => item.snapshotId === this.selectedItemId()) || entries[0]);
@@ -887,9 +912,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   async validate() {
     if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
     this.comparisonMode.set('validation');
+    this.problem.set('');
     await this.measure();
   }
   selectValidationSource(id: string) {
+    this.problem.set('');
     this.comparisonMode.set('validation');
     this.validationReferenceId.set(id);
     void this.measure();
@@ -903,16 +930,17 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     const task = this.selected(), reference = this.validationSource();
     if (!task || !reference?.resultId || this.dirty() || this.running()) return;
     const revision = this.revision;
-    this.measuring.set(true); this.problem.set('');
+    this.measuring.set(true);
     try {
-      const result = await this.api.validateInstallation(task.id, task.revision, reference.id, reference.resultId);
+      const result = await this.api.validateInstallation(task.id, task.revision, reference.task.id, reference.resultId, reference.kind);
       if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
-        && task.revision === this.selected()?.revision && reference.id === this.validationSource()?.id
+        && task.revision === this.selected()?.revision && reference.key === this.validationSource()?.key
         && reference.resultId === this.validationSource()?.resultId) this.validationResult.set(result);
     } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
     finally { if (request === this.validationRequest) this.measuring.set(false); }
   }
   selectComparisonMode(mode: 'before' | 'after') {
+    this.problem.set('');
     this.comparisonMode.set(mode);
     void this.measure();
   }
@@ -925,7 +953,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (!task?.refinementSelection?.base || this.dirty() || this.running() || mode === 'validation'
       || (mode === 'after' && (!task.refinement || task.refinement.stale))) return;
     const revision = this.revision, selectionRevision = task.refinementSelection.revision;
-    this.measuring.set(true); this.problem.set('');
+    this.measuring.set(true);
     try {
       const result = await this.api.measureRefinement(task.id, task.revision, selectionRevision, mode, task.refinement?.resultId);
       if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
@@ -997,6 +1025,20 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     return min === max ? min.toFixed(1) : `${min.toFixed(1)}～${max.toFixed(1)}`;
   }
   signedResidual(value: number | null) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(2)}`; }
+  async applyRefinement() {
+    const task = this.selected(), candidate = task?.refinement;
+    if (!task || !candidate || candidate.status !== 'estimated' || candidate.stale || candidate.applied
+      || this.busy() || this.loading() || this.dirty() || this.running() || this.generatingPanorama()) return;
+    this.busy.set(true); this.problem.set(''); this.message.set('');
+    try {
+      const result = await this.api.applyRefinement(task.id, task.revision, candidate.resultId);
+      if (this.destroyed) return;
+      this.setTask(result.task);
+      this.applied.emit(result.camera);
+      this.message.set('精修四项安装参数已应用到摄像头配置');
+    } catch (error) { this.problem.set(errorMessage(error)); }
+    finally { this.busy.set(false); }
+  }
   async apply() {
     const task = this.selected();
     if (!task || !task.resultId || this.busy() || this.loading() || this.dirty() || this.running() || this.generatingPanorama()

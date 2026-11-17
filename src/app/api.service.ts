@@ -152,9 +152,13 @@ export class ApiService {
     return firstValueFrom(this.http.post<RefinementMeasurement>(`/api/recognition-tasks/${id}/refinement-measure`,
       { revision, selectionRevision, mode, ...(resultId ? { resultId } : {}) }).pipe(timeout(95000)));
   }
-  validateInstallation(id: string, revision: number, referenceTaskId: string, referenceResultId: string) {
+  validateInstallation(id: string, revision: number, referenceTaskId: string, referenceResultId: string, referenceKind: 'ordinary' | 'refinement' = 'ordinary') {
     return firstValueFrom(this.http.post<InstallationValidation>(`/api/recognition-tasks/${id}/validate`,
-      { revision, referenceTaskId, referenceResultId }).pipe(timeout(95000)));
+      { revision, referenceTaskId, referenceResultId, referenceKind }).pipe(timeout(95000)));
+  }
+  applyRefinement(id: string, revision: number, resultId: string) {
+    return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/refinement-apply`,
+      { revision, resultId }).pipe(timeout(10000)));
   }
   applyInstallation(id: string, revision: number, resultId: string) {
     return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/apply`, { revision, resultId }).pipe(timeout(10000)));

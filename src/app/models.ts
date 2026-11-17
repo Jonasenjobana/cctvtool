@@ -170,7 +170,8 @@ export interface InstallationEstimate {
 }
 export interface InstallationValidation {
   taskId: string; revision: number; generatedAt: string;
-  reference: { taskId: string; resultId: string; revision: number; createdAt: string };
+  reference: { kind: 'ordinary' | 'refinement'; taskId: string; resultId: string; revision: number; createdAt: string;
+    selectionRevision?: number; sources?: InstallationRefinement['sources'] };
   status: 'passed' | 'failed' | 'insufficient_data'; message: string;
   installation: Pick<Calibration, 'pAxisPitch' | 'pAxisRoll' | 'tiltOffset' | 'imageRoll'>;
   sourceSnapshotIds: string[]; excluded: { snapshotId: string; reason: string }[];

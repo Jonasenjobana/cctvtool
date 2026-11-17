@@ -53,7 +53,8 @@
 | `PUT /api/recognition-tasks/:id/refinement-sources` | 保存联合精修的基础来源、补充任务及选择版本；返回任务，不计算或写设备配置 |
 | `POST /api/recognition-tasks/:id/refine` | `{ revision, selectionRevision }` 从已保存基础结果联合生成独立精修候选，返回任务 |
 | `POST /api/recognition-tasks/:id/refinement-measure` | `{ revision, selectionRevision, mode, resultId? }` 只读计算参与图的基准或候选理论线与偏差，不作为独立复核 |
-| `POST /api/recognition-tasks/:id/validate` | `{ revision, referenceTaskId, referenceResultId }` 固定另一任务的合格参数，返回原图理论线、偏差和独立复核误差；不写入配置、任务或标注 |
+| `POST /api/recognition-tasks/:id/validate` | `{ revision, referenceTaskId, referenceResultId, referenceKind? }` 固定另一任务的合格普通结果或精修候选，返回原图理论线、偏差和独立复核误差；不写入配置、任务或标注 |
+| `POST /api/recognition-tasks/:id/refinement-apply` | `{ revision, resultId }` 在同一写事务内核对全部来源、完整配置版本与占用，仅应用精修四参数及其独立应用状态，返回 `{ task, camera }` |
 | `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId }` 应用服务端保存的最新合格结果，返回 `{ task, camera }` |
 
 设备创建与保存的请求体为：
@@ -279,33 +280,33 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 | --- | --- |
 | `model/resultId/generatedAt/selectionRevision` | 精修模型、独立结果编号、生成时间和本次来源选择版本 |
 | `baseCamera` | 基础结果的 `fitCamera` 与基础四参数，固定条件及初值；不采用当前相机四项修正或逐图历史配置 |
-| `generatedCamera` | 本次生成时当前相机的完整已保存配置，包括 `updatedAt`，供后续应用冲突校验使用；不用于普通读取的过期判定 |
+| `generatedCamera` | 本次生成时当前相机的完整已保存配置，包括 `updatedAt`，用于应用冲突校验；不用于普通读取的过期判定 |
 | `sources` | 基础、主任务及补充任务各项 `{role:base/high,taskId,revision,resultId?,inputSnapshotIds,sourceSnapshotIds}`，基础额外冻结普通结果编号；`inputSnapshotIds` 为拟检查图片，`sourceSnapshotIds` 为过滤后实际参与图 |
-| `sourceSnapshotIds` | 基础和高倍全部实际参与图片的并集，供后续独立复核排除参与图 |
+| `sourceSnapshotIds` | 基础和高倍全部实际参与图片的并集，独立复核按此排除参与图 |
 | `before/after` | 同一批有效观测的基础／候选四参数、`objective`、`overall/base/high` 摘要及 `perSnapshot` 原图测量 |
 | `overall/base/high` | `sampleCount/zoomRange:{min,max}/distinctPanCount/panCoverageDegrees/rmsResidualPixels/rmsAngularResidualDegrees`，无有效观测的误差与范围为 `null`；overall 的两种 RMS 为两组均方误差等权合并 |
 | `perSnapshot` | 沿用下文 `HorizonMeasurement` 的理论线、左中右偏差、方向差、像素和角度残差、真实姿态、尺寸、FOV 及同步状态，补充 `taskId/group:base/high`；前后数组顺序一致 |
 | `status/installation` | `estimated` 合格时为新四参数；`no_change` 保留基础四参数；`insufficient_data/unreliable` 的 `installation=null`，尝试参数与残差仍留在 `after` |
 | `diagnostics` | `converged/conditionNumber/failures`，分别保留收敛、可辨识性、分组超差和目标未改善原因 |
 | `stale/staleReasons` | 每次读取实时计算的输入过期状态与原因；保留诊断供查看，不可继续当作有效候选 |
-| `applied/appliedAt` | 本任务仅初始化为 `false/null`，未开放精修配置应用 |
+| `applied/appliedAt` | 精修独立应用状态与时间，初始为 `false/null`，成功手动应用后为 `true/ISO 时间`；普通应用状态保持原值 |
 
 合格候选须收敛，未加阻尼四参数矩阵条件数小于 `1e8`，总体、基础组和高倍组 RMS 均不超过 5 原图像素，且联合稳健目标降低超过 `1e-12×(1+基准目标)`、参数变化不小于 `1e-7` 度。基准已满足质量要求且无实际改善时返回 `no_change`，`before/after` 保留基础值；无有效组或没有有效较高倍率返回 `insufficient_data`，其他质量失败为 `unreliable`。不因某组或单图误差上升单独拒绝，前后值如实显示；不能用总体低误差掩盖某组超差。
 
-计算在写事务之外完成。保存前在 `BEGIN IMMEDIATE` 内重新核对选择版本、全部正式标注版本、基础结果编号、参与源图和完整当前相机配置；冲突返回 409 且不产生部分候选。列表、任务详情和条目响应均实时核对精修来源；任一来源正式标注或忽略状态、基础结果编号、实际参与图、来源选择或当前固定条件变化后标为过期。全景参考线独立版本，以及普通应用更新任务 `updatedAt`，不会自行使精修过期。相机四项修正不同不会替换初值，也不作为读取过期条件；生成时完整配置另留作后续应用冲突依据。
+计算在写事务之外完成。保存前在 `BEGIN IMMEDIATE` 内重新核对选择版本、全部正式标注版本、基础结果编号、参与源图和完整当前相机配置；冲突返回 409 且不产生部分候选。列表、任务详情和条目响应均实时核对精修来源；任一来源正式标注或忽略状态、基础结果编号、实际参与图、来源选择或当前固定条件变化后标为过期。全景参考线独立版本，以及普通应用更新任务 `updatedAt`，不会自行使精修过期。相机四项修正不同不会替换初值，也不作为读取过期条件；生成时完整配置用于应用冲突校验。
 
 `refinement-measure` 的 `mode=before` 使用当前已保存选择中的基础参数；`mode=after` 必须额外提交精修 `resultId`，校验候选身份和全部来源有效性后使用其 `after.installation`，包含失败求解留下的可审查参数。响应为固定参数测量，补充 `taskId/revision/selectionRevision/mode/resultId`；before 的 `resultId=null`。选项或正式标注改变后可重新计算 before；过期 after 返回 409。该接口允许计算参与图，目的为精修前后对照，不调用优化器、不持久化、不写设备配置，也不构成独立复核。旧任务无精修字段时仍按原单任务接口读取与操作，MCP 范围保持不变。
 
-`validate` 固定另一任务已生成的合格 `wgs84-horizon-installation-v1` 结果，按本任务全部有效标注计算残差，不调用优化器。请求的 `revision` 对应验证任务；来源必须是同一摄像头的另一任务，`referenceResultId` 与来源当前结果编号一致，来源 `resultRevision` 等于其标注版本且不在识别中。历史预扫粗结果不能作为来源。当前经纬度、高度、默认朝向和设备通道必须与来源 `fitCamera` 一致，来源参与截图仍须存在；验证图与来源实际参与拟合的截图有重叠时返回 409。只使用未忽略、源记录存在且点位有效的验证图，其余排除原因列在 `excluded`。
+`validate` 的 `referenceKind` 可为 `ordinary` 或 `refinement`，缺省为 `ordinary`，固定另一任务的合格参数按本任务全部有效标注计算残差，不调用优化器。请求的 `revision` 对应验证任务；来源必须是同一摄像头的另一任务，`referenceResultId` 与所选类型的当前结果编号一致且来源不在识别中。普通来源沿用 `wgs84-horizon-installation-v1`、`resultRevision=revision` 和历史预扫粗结果不能作为来源的规则。精修来源要求 `wgs84-horizon-refinement-v1`、`status=estimated`，并实时校验来源选择、全部来源正式标注版本、基础结果编号和全部实际参与图；已应用候选仍可复核。当前经纬度、高度、默认朝向和设备通道必须与普通来源的 `fitCamera` 或精修的 `baseCamera` 一致。验证图与普通拟合参与图或精修的基础及全部高倍实际参与图并集有重叠时返回 409，同一图片从其他任务重复引用仍拒绝，重新拍摄产生的新图片允许参与。只使用未忽略、源记录存在且点位有效的验证图，其余排除原因列在 `excluded`。
 
-复核响应包含 `taskId/revision/generatedAt`、`reference:{ taskId, resultId, revision, createdAt }`、本次固定的 `installation`、实际使用的 `sourceSnapshotIds`、`perSnapshot`、`failedSnapshotIds`、总体 `rmsResidualPixels/rmsAngularResidualDegrees`、最大逐图 RMS `maximumResidualPixels` 及门槛 `maximumAcceptedRmsPixels=5`。逐图测量字段如下：
+复核响应包含 `taskId/revision/generatedAt`、`reference:{ kind, taskId, resultId, revision, createdAt }`、本次固定的 `installation`、实际使用的 `sourceSnapshotIds`、`perSnapshot`、`failedSnapshotIds`、总体 `rmsResidualPixels/rmsAngularResidualDegrees`、最大逐图 RMS `maximumResidualPixels` 及门槛 `maximumAcceptedRmsPixels=5`。精修 `reference` 额外返回冻结的 `selectionRevision/sources`。逐图测量字段如下：
 
 | 字段 | 口径 |
 | --- | --- |
 | `pan/tilt/zoom/width/height` | 该张截图实际保存的 P/T/Z 与原图尺寸 |
 | `horizontalFieldAngle/verticalFieldAngle` | 该图保存的 HFOV/VFOV，单位度；不按倍率比例推算 |
 | `timeAlignment` | 保存的画面与姿态同步状态；缺省 `unverified`，读数稳定不等于严格同步 |
-| `theoreticalHorizon` | 原图中可见的理论海天线片段数组，每段为归一化 `{x,y}` 点数组，无可见片段时为 `[]`。使用来源 `fitCamera` 的固定安装条件、来源结果四参数与本图实际 P/T/FOV，沿用共享旋转链和 WGS84 海平面几何；不混入该图历史安装参数 |
+| `theoreticalHorizon` | 原图中可见的理论海天线片段数组，每段为归一化 `{x,y}` 点数组，无可见片段时为 `[]`。使用普通来源 `fitCamera` 或精修 `baseCamera` 的固定安装条件、来源结果四参数与本图实际 P/T/FOV，沿用共享旋转链和 WGS84 海平面几何；不混入该图历史安装参数 |
 | `verticalResiduals` | 按 `left/center/right` 排列的三项 `{position,x,observedY,theoreticalY,offsetPixels,unavailableReason}`。`x` 为正式标注横向范围左端、中点、右端；`observedY` 按正式标注插值，坐标均归一化。`offsetPixels=(observedY-theoreticalY)×height`，原图向下为正，不向标注范围外推算测量 |
 | `verticalOffsetPixels` | 兼容字段，等于 `verticalResiduals` 中点的 `offsetPixels` |
 | `directionDifferenceDegrees` | 实拍标注与理论线在标注两端连线的方向角之差，单位度，图像向右为参考、顺时针为正。理论线未经过两端对应竖线时为 `null` |
@@ -316,6 +317,8 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 全部有效图的逐图 RMS 均不超过 5 像素时 `status=passed`，有超差图时为 `failed`；无有效图（含无截图条目的历史任务）为 `insufficient_data`，总体误差为 `null`。忽略、缺图和无效正式标注，以及几何有效性检查排除的姿态、通道、尺寸等原因列在 `excluded`。验证任务可以只有单张图，响应只评价实际参与的这些样本，不将其视为全姿态或现场精度验收。结果仅返回客户端，不持久化，不生成精修候选，不清除本任务拟合结果、不应用参数，也不调用 LiveGBS；客户端切换来源或图片、保存正式标注后重新请求，草稿未保存时隐藏旧测量。旧版本、过期来源或固定条件冲突不能继续作为有效对照，历史原图、PTZ 和拍摄时参数副本保持原值。
 
 `apply` 必须同时提交读取的 `revision` 与 `resultId`，只读取服务端保存的合格结果，不接收前端角度值；校验标注版本、结果编号、计算参考的当前设备配置、设备通道、源记录仍存在以及设备未被控制/截图占用。在同一事务中更新四项修正与应用状态，其他设备字段保持原值；不调用 LiveGBS 控制、修改原始 PTZ 或回写历史截图。成功后记录 `appliedAt/appliedRevision`；无合格结果、配置改变、源图删除、过期版本或重复应用返回 409。此写入能力仅属于本地网页流程，MCP 工具继续只读且只估计两个 P 轴倾角。
+
+`refinement-apply` 只接受主任务 `revision` 和精修 `resultId`，角度取自服务端保存的候选。在 `BEGIN IMMEDIATE` 取得写锁后重新读取候选编号、全部来源版本和基础结果编号、来源选择、参与图存在性、固定条件、当前完整相机配置与生成时 `generatedCamera`（含 `updatedAt`），并检查设备控制／截图占用。仅未应用、未过期且 `status=estimated` 的精修候选可应用；`no_change`、质量失败、旧编号、来源或配置变化、占用及重复应用均返回 409，额外角度等非法输入返回 400。一次事务只保存四项安装修正与 `refinement.applied/appliedAt`，任一失败整体回滚；普通 `result/resultId/appliedRevision/appliedAt`、其他来源任务、原始 PTZ 和历史采样副本不变。成功返回新摄像头配置供页面同步预览，不调用 LiveGBS；应用后的候选可继续固定参数独立复核。
 
 ### 实时播放地址
 

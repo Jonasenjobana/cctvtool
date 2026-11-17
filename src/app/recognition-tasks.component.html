@@ -224,7 +224,7 @@
                 </div>
               }
               <div class="legend reference-legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span>
-                @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>{{ comparisonMode() === 'after' ? '候选' : '基准' }}理论海天线</span> }
+                @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>{{ theoreticalLabel() }}</span> }
                 <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
                 <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
                 @for (reference of neighbors(); track reference.side) {
@@ -333,7 +333,7 @@
               <select [ngModel]="refinementBaseId()" (ngModelChange)="selectRefinementBase($event)"
                 [disabled]="busy() || loading() || running() || generatingPanorama()">
                 <option value="">选择合格基础结果</option>
-                @for (reference of validationSources(); track reference.id) {
+                @for (reference of refinementBaseSources(); track reference.id) {
                   <option [value]="reference.id">{{ reference.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference) }} · {{ reference.result?.sourceSnapshotIds?.length }} 张</option>
                 }
               </select>
@@ -369,6 +369,9 @@
                     <td>{{ candidate.after.installation[field.key] | number:'1.4-4' }}°</td></tr>
                 }
               </tbody></table>
+              <button type="button" class="primary apply-button" (click)="applyRefinement()"
+                [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || candidate.status !== 'estimated' || candidate.stale || candidate.applied">
+                <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '精修已应用' : '应用精修到摄像头' }}</button>
               <div class="validation-table" tabindex="0" role="region" aria-label="联合精修分组前后误差">
                 <table><thead><tr><th scope="col">组</th><th scope="col">有效图</th><th scope="col">Z</th><th scope="col">P 覆盖</th>
                   <th scope="col">RMS 前→后(px)</th><th scope="col">角度 RMS 前→后(°)</th></tr></thead><tbody>
@@ -414,15 +417,29 @@
           </section>
           <section class="validation-section" aria-label="独立复核安装参数">
             <div class="section-heading"><h2>独立复核</h2></div>
-            <label class="validation-source">基准标定来源
+            <label class="validation-source">独立复核来源
               <select [ngModel]="validationReferenceId()" (ngModelChange)="selectValidationSource($event)"
                 [disabled]="busy() || loading() || running() || generatingPanorama()">
                 <option value="">选择已生成的合格结果</option>
-                @for (reference of validationSources(); track reference.id) {
-                  <option [value]="reference.id">{{ reference.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference) }} · {{ reference.result?.sourceSnapshotIds?.length }} 张</option>
+                @for (reference of validationSources(); track reference.key) {
+                  <option [value]="reference.key">{{ reference.kind === 'refinement' ? '精修候选' : '普通结果' }} · {{ reference.task.createdAt | date:'MM-dd HH:mm:ss' }} · {{ reference.sourceSnapshotIds.length }} 张</option>
                 }
               </select>
             </label>
+            @if (validationSource(); as reference) {
+              <p class="result-message">{{ reference.kind === 'refinement' ? '精修候选' : '普通结果' }}有效
+                · {{ (reference.kind === 'refinement' ? reference.task.refinement?.applied : reference.task.result?.applied) ? '已应用' : '未应用' }}</p>
+              <table><thead><tr><th scope="col">固定参数</th><th scope="col">值</th></tr></thead><tbody>
+                @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ reference.installation[field.key] | number:'1.4-4' }}°</td></tr> }
+              </tbody></table>
+              @if (reference.kind === 'refinement') {
+                <details><summary>精修来源（{{ reference.task.refinement?.sources.length }} 个任务）</summary><ul>
+                  @for (source of reference.task.refinement?.sources; track source.taskId) {
+                    <li>{{ source.role === 'base' ? '基础' : '高倍' }} · {{ source.taskId }} · {{ source.sourceSnapshotIds.length }} 张参与图</li>
+                  }
+                </ul></details>
+              }
+            }
             @if (nextTaskOffset() !== null) {
               <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多标定任务</button>
             }

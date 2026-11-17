@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { CameraStore } from '../server/store.mjs';
 import { createApp } from '../server/app.mjs';
 import { fixtureCamera, syntheticSnapshots } from './calibration-fixtures.mjs';
 
-async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot, seed = () => {}, groupPans = {}, ptzFor = () => ({}) } = {}) {
+async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot, seed = () => {}, groupPans = {}, ptzFor = () => ({}),
+  livegbs = { configured: false }, includeValidation = false } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-refinement-test-'));
   const store = new CameraStore(dataDir);
   const input = Object.fromEntries(['name', 'serial', 'code', 'longitude', 'latitude', 'height',
@@ -16,7 +18,8 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
   const actual = { ...camera, tiltOffset: 1.1, imageRoll: -0.8 };
   const groups = new Map(), observations = new Map();
   for (const [name, defaultPans] of [['base', [0, 60, 120, 180, 240, 300]],
-    ['main', [173, 9, 291, 38, 212]], ['extra', [338, 111, 69]]]) {
+    ['main', [173, 9, 291, 38, 212]], ['extra', [338, 111, 69]],
+    ...(includeValidation || groupPans.validation ? [['validation', [17, 143, 267, 313]]] : [])]) {
     const pans = groupPans[name] || defaultPans;
     const snapshots = pans.map((pan, index) => {
       const high = name !== 'base';
@@ -41,7 +44,7 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
   }
   seed(store, camera, groups);
   store.close();
-  const options = { dataDir, webDir: join(dataDir, 'missing-web'), livegbs: { configured: false }, recognizer: {
+  const options = { dataDir, webDir: join(dataDir, 'missing-web'), livegbs, recognizer: {
     async run(images, { onResult }) { for (const image of images) onResult({ snapshotId: image.snapshotId, points: observations.get(image.snapshotId) }); },
   } };
   const f = { app: await createApp(options), options, dataDir, camera, input, groups, observations };
@@ -76,6 +79,285 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
   f.extra = await f.task('extra');
   return f;
 }
+
+test('有效精修候选可供新截图固定参数独立复核，复核保持候选、设备和来源原值', async (t) => {
+  const f = await fixture(t, { includeValidation: true, ptzFor: (name, index) => name === 'validation' && index % 2 === 0
+    ? { Zoom: 4, HorizontalFieldAngle: 24, VerticalFieldAngle: 13.5, Tilt: 2 } : {} });
+  f.main = (await f.post(f.main, 'generate')).json();
+  assert.equal(f.main.result.status, 'estimated');
+  await f.select(f.main, f.base, [f.extra]);
+  const generated = await f.post(f.main, 'refine', { selectionRevision: 1 });
+  assert.equal(generated.statusCode, 200, generated.body);
+  const main = generated.json(), candidate = main.refinement;
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  const validation = await f.task('validation');
+  const before = await Promise.all([f.get(main.id), f.get(f.base.id), f.get(f.extra.id), f.get(validation.id)]);
+  const cameras = (await f.app.inject('/api/cameras')).json();
+  const ordinary = await f.post(validation, 'validate', { referenceTaskId: main.id, referenceResultId: main.resultId });
+  assert.equal(ordinary.statusCode, 200, ordinary.body);
+  assert.equal(ordinary.json().reference.kind, 'ordinary');
+  assert.deepEqual(ordinary.json().installation, main.result.installation);
+  const response = await f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+    referenceResultId: candidate.resultId });
+  assert.equal(response.statusCode, 200, response.body);
+  const result = response.json();
+  assert.equal(result.status, 'passed', result.message);
+  assert.equal(result.reference.kind, 'refinement');
+  assert.equal(result.reference.resultId, candidate.resultId);
+  assert.equal(result.reference.selectionRevision, candidate.selectionRevision);
+  assert.deepEqual(result.reference.sources, candidate.sources);
+  assert.deepEqual(result.installation, candidate.installation);
+  assert.equal(result.sourceSnapshotIds.length, 4);
+  assert.ok(result.perSnapshot.every((row) => row.rmsResidualPixels <= 5 && row.verticalResiduals.length === 3
+    && Number.isFinite(row.rmsAngularResidualDegrees) && Number.isFinite(row.horizontalFieldAngle)));
+  assert.deepEqual(await Promise.all([f.get(main.id), f.get(f.base.id), f.get(f.extra.id), f.get(validation.id)]), before);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameras);
+});
+
+test('手动应用精修只保存四项修正和独立应用状态，保留普通结果、其他任务与历史采样并拒绝重复请求', async (t) => {
+  const f = await fixture(t, { includeValidation: true });
+  const ordinary = (await f.post(f.main, 'generate')).json();
+  assert.equal(ordinary.result.status, 'estimated');
+  await f.select(ordinary, f.base, [f.extra]);
+  const main = (await f.post(ordinary, 'refine', { selectionRevision: 1 })).json();
+  assert.equal(main.refinement.status, 'estimated', main.refinement.message);
+  const cameras = (await f.app.inject('/api/cameras')).json(), camera = cameras.find((entry) => entry.id === main.cameraId);
+  const snapshots = (await f.app.inject(`/api/cameras/${camera.id}/snapshots`)).json();
+  const sources = await Promise.all([f.get(f.base.id), f.get(f.extra.id)]);
+  const items = (await f.app.inject(`/api/recognition-tasks/${main.id}/items`)).json().items;
+  assert.equal((await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId, installation: main.refinement.installation })).statusCode, 400);
+  assert.equal((await f.post(main, 'refinement-apply', { revision: main.revision + 1, resultId: main.refinement.resultId })).statusCode, 409);
+  const requests = await Promise.all([f.post(main, 'refinement-apply', { resultId: main.refinement.resultId }),
+    f.post(main, 'refinement-apply', { resultId: main.refinement.resultId })]);
+  assert.deepEqual(requests.map((response) => response.statusCode).sort(), [200, 409]);
+  const applied = requests.find((response) => response.statusCode === 200).json();
+  assert.deepEqual(applied.camera, { ...camera, ...main.refinement.installation, updatedAt: applied.camera.updatedAt });
+  assert.deepEqual(applied.task, { ...main, updatedAt: applied.task.updatedAt,
+    refinement: { ...main.refinement, applied: true, appliedAt: applied.task.refinement.appliedAt } });
+  assert.ok(applied.task.refinement.appliedAt);
+  assert.deepEqual(await f.get(main.id), applied.task);
+  assert.deepEqual(await Promise.all([f.get(f.base.id), f.get(f.extra.id)]), sources);
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${main.id}/items`)).json().items, items);
+  assert.deepEqual((await f.app.inject(`/api/cameras/${camera.id}/snapshots`)).json(), snapshots);
+  const validation = await f.task('validation');
+  const result = await f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+    referenceResultId: main.refinement.resultId });
+  assert.equal(result.statusCode, 200, result.body);
+  assert.equal(result.json().status, 'passed');
+  await f.app.close();
+  f.app = await createApp(f.options);
+  assert.deepEqual(await f.get(main.id), applied.task);
+  assert.equal((await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId })).statusCode, 409);
+});
+
+test('精修应用状态写入失败时回滚相机修正，故障解除后同一候选可重试', async (t) => {
+  const f = await fixture(t);
+  await f.select(f.main, f.base, [f.extra]);
+  const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+  assert.equal(main.refinement.status, 'estimated', main.refinement.message);
+  const cameras = (await f.app.inject('/api/cameras')).json();
+  // 在真实测试库边界注入第二次写入故障，全部结果仍由 HTTP 观察。
+  const database = new DatabaseSync(join(f.dataDir, 'cctv.sqlite'));
+  try {
+    database.exec(`CREATE TRIGGER reject_refinement_application BEFORE UPDATE OF metadata ON recognition_tasks
+      WHEN json_extract(NEW.metadata, '$.refinement.applied') = 1
+      BEGIN SELECT RAISE(ABORT, '测试精修应用状态写入失败'); END`);
+    const response = await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId });
+    assert.equal(response.statusCode, 500, response.body);
+    assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameras);
+    assert.deepEqual(await f.get(main.id), main);
+    database.exec('DROP TRIGGER reject_refinement_application');
+  } finally { database.close(); }
+  const retry = await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId });
+  assert.equal(retry.statusCode, 200, retry.body);
+  assert.equal(retry.json().task.refinement.applied, true);
+});
+
+test('精修独立复核排除基础、主任务和补充任务全部参与图，允许新标识的重复姿态截图', async (t) => {
+  const f = await fixture(t, { groupPans: { validation: [173, 9, 291, 38, 212] } });
+  await f.select(f.main, f.base, [f.extra]);
+  const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+  assert.equal(main.refinement.status, 'estimated');
+  for (const name of ['base', 'main', 'extra']) {
+    const duplicate = await f.task(name);
+    const response = await f.post(duplicate, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+      referenceResultId: main.refinement.resultId });
+    assert.equal(response.statusCode, 409, response.body);
+    assert.match(response.json().message, /重叠/);
+  }
+  const independent = await f.task('validation');
+  const result = await f.post(independent, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+    referenceResultId: main.refinement.resultId });
+  assert.equal(result.statusCode, 200, result.body);
+  assert.equal(result.json().status, 'passed', result.body);
+  assert.deepEqual(result.json().perSnapshot.map((row) => row.pan), [173, 9, 291, 38, 212]);
+});
+
+test('精修独立复核按逐图门槛拒绝单图超差，无有效验证观测时不宣称通过', async (t) => {
+  const f = await fixture(t, { includeValidation: true });
+  await f.select(f.main, f.base, [f.extra]);
+  const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+  let validation = await f.task('validation');
+  const items = (await f.app.inject(`/api/recognition-tasks/${validation.id}/items`)).json().items;
+  const first = items[0];
+  const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${validation.id}/items/${first.snapshotId}`,
+    payload: { revision: validation.revision, points: first.points.map((point) => ({ ...point, y: point.y + 8 / first.snapshot.height })) } });
+  assert.equal(edited.statusCode, 200, edited.body);
+  validation = edited.json().task;
+  const validate = () => f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+    referenceResultId: main.refinement.resultId });
+  const response = await validate();
+  assert.equal(response.statusCode, 200, response.body);
+  const result = response.json();
+  assert.ok(result.rmsResidualPixels < 5, response.body);
+  assert.equal(result.status, 'failed');
+  assert.deepEqual(result.failedSnapshotIds, [first.snapshotId]);
+  assert.deepEqual(result.installation, main.refinement.installation);
+  for (const item of items) {
+    const ignored = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${validation.id}/items/${item.snapshotId}`,
+      payload: { revision: validation.revision, ignored: true } });
+    assert.equal(ignored.statusCode, 200, ignored.body);
+    validation = ignored.json().task;
+  }
+  const empty = await validate();
+  assert.equal(empty.statusCode, 200, empty.body);
+  assert.equal(empty.json().status, 'insufficient_data');
+  assert.equal(empty.json().rmsResidualPixels, null);
+  assert.equal(empty.json().excluded.length, items.length);
+  assert.deepEqual(await f.get(main.id), main);
+});
+
+test('精修复核与应用逐项拒绝全部来源标注、基础重算、选择变化和旧候选编号，冲突保持数据原值', async (t) => {
+  const f = await fixture(t, { includeValidation: true }), validation = await f.task('validation');
+  let main = f.main, base = f.base, extra = f.extra;
+  const generate = async () => {
+    const selected = await f.select(main, base, [extra]);
+    assert.equal(selected.statusCode, 200, selected.body);
+    main = selected.json();
+    const generated = await f.post(main, 'refine', { selectionRevision: main.refinementSelection.revision });
+    assert.equal(generated.statusCode, 200, generated.body);
+    main = generated.json();
+    assert.equal(main.refinement.status, 'estimated', main.refinement.message);
+  };
+  const reject = async (resultId = main.refinement.resultId) => {
+    main = await f.get(main.id);
+    const cameras = (await f.app.inject('/api/cameras')).json();
+    const assessment = await f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id, referenceResultId: resultId });
+    assert.equal(assessment.statusCode, 409, assessment.body);
+    const application = await f.post(main, 'refinement-apply', { resultId });
+    assert.equal(application.statusCode, 409, application.body);
+    assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameras);
+    assert.deepEqual(await f.get(main.id), main);
+  };
+  for (const sourceId of [base.id, main.id, extra.id]) {
+    await generate();
+    const source = await f.get(sourceId);
+    const item = (await f.app.inject(`/api/recognition-tasks/${sourceId}/items`)).json().items[0];
+    const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${sourceId}/items/${item.snapshotId}`,
+      payload: { revision: source.revision, ...(sourceId === extra.id ? { ignored: true }
+        : { points: item.points.map((point) => ({ ...point, y: point.y + 1 / item.snapshot.height })) }) } });
+    assert.equal(edited.statusCode, 200, edited.body);
+    await reject();
+    if (sourceId === base.id) {
+      const recalculated = await f.post(edited.json().task, 'generate');
+      assert.equal(recalculated.statusCode, 200, recalculated.body);
+      base = recalculated.json();
+    } else if (sourceId === extra.id) extra = edited.json().task;
+  }
+  await generate();
+  base = (await f.post(base, 'generate')).json();
+  await reject();
+  await generate();
+  const changed = await f.select(main, base, []);
+  assert.equal(changed.statusCode, 200, changed.body);
+  main = changed.json();
+  await reject();
+  await generate();
+  const previousId = main.refinement.resultId;
+  main = (await f.post(main, 'refine', { selectionRevision: main.refinementSelection.revision })).json();
+  assert.notEqual(main.refinement.resultId, previousId);
+  await reject(previousId);
+});
+
+test('精修应用核对完整配置和更新时间，当前四修正改变仍可固定候选独立复核', async (t) => {
+  const f = await fixture(t, { includeValidation: true }), validation = await f.task('validation');
+  await f.select(f.main, f.base, [f.extra]);
+  let input = { ...f.input };
+  for (const change of [{ name: '改名后的设备' }, { maxZoom: f.camera.maxZoom + 1 },
+    { pAxisPitch: 8, pAxisRoll: 4, tiltOffset: 3, imageRoll: 2 }, {}]) {
+    const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+    assert.equal(main.refinement.status, 'estimated', main.refinement.message);
+    input = { ...input, ...change };
+    await new Promise((accept) => setTimeout(accept, 2));
+    const updated = await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: input });
+    assert.equal(updated.statusCode, 200, updated.body);
+    assert.notEqual(updated.json().updatedAt, main.refinement.generatedCamera.updatedAt);
+    const response = await f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+      referenceResultId: main.refinement.resultId });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().status, 'passed', response.body);
+    assert.deepEqual(response.json().installation, main.refinement.installation);
+    const application = await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId });
+    assert.equal(application.statusCode, 409, application.body);
+    assert.match(application.json().message, /配置已变化/);
+    assert.deepEqual(await f.get(main.id), main);
+    assert.deepEqual((await f.app.inject('/api/cameras')).json().find((camera) => camera.id === f.camera.id), updated.json());
+  }
+});
+
+test('基础、主任务、补充参与图删除或固定安装条件变化后，精修复核与应用均拒绝且不部分写入', async (t) => {
+  for (const changed of ['base', 'main', 'extra', 'fixed']) {
+    const f = await fixture(t, { includeValidation: true }), validation = await f.task('validation');
+    await f.select(f.main, f.base, [f.extra]);
+    const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+    assert.equal(main.refinement.status, 'estimated', main.refinement.message);
+    if (changed === 'fixed') {
+      const update = await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: { ...f.input, height: f.camera.height + 1 } });
+      assert.equal(update.statusCode, 200, update.body);
+    } else {
+      const source = main.refinement.sources.find((entry) => entry.taskId === f[changed].id);
+      const deletion = await f.app.inject({ method: 'DELETE', url: `/api/snapshots/${source.sourceSnapshotIds[0]}` });
+      assert.equal(deletion.statusCode, 204, deletion.body);
+    }
+    const current = await f.get(main.id), cameras = (await f.app.inject('/api/cameras')).json();
+    assert.equal(current.refinement.stale, true, changed);
+    assert.match(current.refinement.staleReasons.join('；'), changed === 'fixed' ? /固定安装条件/ : /参与截图已删除/);
+    const response = await f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+      referenceResultId: main.refinement.resultId });
+    assert.equal(response.statusCode, 409, response.body);
+    const application = await f.post(current, 'refinement-apply', { resultId: main.refinement.resultId });
+    assert.equal(application.statusCode, 409, application.body);
+    assert.deepEqual(await f.get(main.id), current);
+    assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameras);
+  }
+});
+
+test('精修应用拒绝正在执行的设备操作，占用解除后可应用且复核和应用不另发设备动作', async (t) => {
+  let notify, release, controls = 0;
+  const started = new Promise((accept) => { notify = accept; });
+  const hold = new Promise((accept) => { release = accept; });
+  const f = await fixture(t, { includeValidation: true, livegbs: { configured: true, async preciseControl() { controls++; notify(); await hold; } } });
+  await f.select(f.main, f.base, [f.extra]);
+  const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+  const validation = await f.task('validation');
+  const cameras = (await f.app.inject('/api/cameras')).json();
+  const motion = f.app.inject({ method: 'POST', url: `/api/cameras/${f.camera.id}/precise`, payload: { pan: 17, tilt: 2, zoom: 4 } });
+  await started;
+  try {
+    const application = await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId });
+    assert.equal(application.statusCode, 409, application.body);
+    assert.match(application.json().message, /正在控制或截图/);
+    const assessment = await f.post(validation, 'validate', { referenceKind: 'refinement', referenceTaskId: main.id,
+      referenceResultId: main.refinement.resultId });
+    assert.equal(assessment.statusCode, 200, assessment.body);
+    assert.equal(controls, 1);
+    assert.deepEqual(await f.get(main.id), main);
+    assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameras);
+  } finally { release(); await motion; }
+  const applied = await f.post(main, 'refinement-apply', { resultId: main.refinement.resultId });
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.equal(controls, 1);
+});
 
 test('联合精修来源独立持久化，重启恢复并拒绝旧选择版本', async (t) => {
   const f = await fixture(t);
@@ -300,6 +582,7 @@ test('基准已应用仍可精修，精确观测在终止精度内返回无需�
   assert.deepEqual(task.result, ordinary.result);
   assert.equal(task.resultId, ordinary.resultId);
   assert.equal(task.refinement.stale, false);
+  assert.equal((await f.post(task, 'refinement-apply', { resultId: task.refinement.resultId })).statusCode, 409);
 });
 
 test('参与图原图测量在正式标注保存后重算基准，旧候选对照被拒绝且不借用独立复核', async (t) => {
@@ -372,6 +655,7 @@ test('有效高倍组为空或只有低倍率时返回明确原因，过滤掉�
     assert.equal(result.installation, null);
     assert.ok(result.diagnostics.failures.length > 0);
     assert.ok(result.before.base.sampleCount > 0);
+    assert.equal((await f.post(response.json(), 'refinement-apply', { resultId: result.resultId })).statusCode, 409);
   }
 });
 
@@ -401,6 +685,7 @@ test('总体低误差不能掩盖高倍组超差，固定模型保留相反方�
   assert.match(result.message, /高倍组 RMS/);
   assert.ok(result.after.perSnapshot.some((row) => row.verticalOffsetPixels > 0));
   assert.ok(result.after.perSnapshot.some((row) => row.verticalOffsetPixels < 0));
+  assert.equal((await f.post(response.json(), 'refinement-apply', { resultId: result.resultId })).statusCode, 409);
 });
 
 test('高倍观测集中且量级悬殊时保留四参数不可辨识诊断，不用阻尼制造合格候选', async (t) => {

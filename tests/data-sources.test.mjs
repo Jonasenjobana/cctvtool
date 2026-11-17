@@ -10,7 +10,7 @@ import { createApp } from '../server/app.mjs';
 import { httpError } from '../server/errors.mjs';
 
 const source = { id: 'test-ais', name: '测试 AIS', adapter: 'seaoil-ais', url: 'ws://upstream.invalid/websocket',
-  timeOffsetMinutes: 480, expireAfterMs: 600000, maxDistanceMeters: 10000,
+  timeOffsetMinutes: 480, expireAfterMs: 600000,
   geometry: { antennaFromSternRatio: 0.1, antennaFromPortRatio: 0.5, heightMeters: 10 } };
 const row = { mmsi: '123456789', date: '2026-11-13 15:59:50', lng: 117, lat: 39,
   heading: 0, shipLength: 100, shipWidth: 20, speed: 0, shipName: '合成测试船', cog: 90 };
@@ -219,7 +219,7 @@ test('数据源目录给出固定项目与展示参数，不向前端暴露上�
   assert.equal(response.statusCode, 200, response.body);
   assert.deepEqual(response.json(), { project: { id: 'test-harbour', name: '测试海域' }, sources: [
     { id: source.id, name: source.name, type: 'ais', geometry: source.geometry,
-      maxDistanceMeters: 10000, expireAfterMs: 600000 },
+      expireAfterMs: 600000 },
   ] });
   assert.equal(f.sockets.length, 0);
   assert.equal((await f.app.inject('/api/data-sources/missing/snapshot')).statusCode, 404);

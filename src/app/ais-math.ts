@@ -35,9 +35,8 @@ export function vesselGeometry(target: VesselTarget, options: VesselGeometryOpti
     vessel: { length, width, heading, height } };
 }
 
-export function isInCameraView(pose: CameraPose, position: Cartesian3, maxDistance: number, radius = 0): boolean {
+export function isInCameraView(pose: CameraPose, position: Cartesian3, radius = 0): boolean {
   const ray = Cartesian3.subtract(position, pose.position, new Cartesian3());
-  if (Cartesian3.magnitude(ray) - radius > maxDistance) return false;
   const depth = Cartesian3.dot(ray, pose.direction);
   if (depth + radius <= 0) return false;
   const tanH = Math.tan(CesiumMath.toRadians(pose.horizontalFov / 2));

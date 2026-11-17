@@ -28,7 +28,6 @@ export interface VesselSourceInfo {
   name: string;
   type: 'ais';
   geometry: VesselGeometryOptions;
-  maxDistanceMeters: number;
   expireAfterMs: number;
 }
 

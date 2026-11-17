@@ -54,18 +54,23 @@ test('手动尺寸可补足缺失的 AIS 长宽，允许零边距并拒绝退化
   }
 });
 
-test('显示按摄像头实际 FOV 和距离筛选，追踪船体部分进入视场时仍保留', () => {
+test('显示按摄像头实际 FOV 筛选并保留 2 公里外目标，追踪船体部分进入视场时仍保留', () => {
   const camera = { name: '', serial: '', code: '', longitude: 0, latitude: 0, height: 100,
     pAxisPitch: 0, pAxisRoll: 0, panOffset: 0, tiltOffset: 0, imageRoll: 0 };
   const pose = createCameraPose(camera, { Pan: 0, Tilt: 5.2, Zoom: 4, HorizontalFieldAngle: 20, VerticalFieldAngle: 10 });
   const inside = Cartesian3.fromDegrees(0, 0.01);
-  assert.equal(isInCameraView(pose, inside, 10000), true);
-  assert.equal(isInCameraView(pose, inside, 1000), false);
-  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0.01, 0.01), 10000), false);
-  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0, -0.01), 10000), false);
+  assert.equal(isInCameraView(pose, inside), true);
+  for (const latitude of [0.03, 0.1]) {
+    const far = Cartesian3.fromDegrees(0, latitude);
+    assert.ok(Cartesian3.distance(pose.position, far) > 2000);
+    assert.equal(isInCameraView(pose, far), true);
+  }
+  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0.01, 0.01)), false);
+  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0, -0.01)), false);
+  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0, 1)), false);
   const edge = Cartesian3.fromDegrees(0.0022, 0.01, 5);
-  assert.equal(isInCameraView(pose, edge, 10000), false);
-  assert.equal(isInCameraView(pose, edge, 10000, 80), true);
+  assert.equal(isInCameraView(pose, edge), false);
+  assert.equal(isInCameraView(pose, edge, 80), true);
 });
 
 test('追踪可瞄准估算长方体的空间中心，普通海面点仍保持零高程', () => {

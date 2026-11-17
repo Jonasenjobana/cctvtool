@@ -33,7 +33,7 @@
 | `POST /api/cameras/:id/snapshots` | 接收 `{ calibration? }`，完成前后回读、抓图、图片和元数据保存，返回 HTTP 201 及截图记录 |
 | `GET /api/snapshots/:id/image` | 读取已保存图片的二进制内容 |
 | `DELETE /api/snapshots/:id` | 删除单张截图及图片文件，成功返回 HTTP 204；扫描或控制期间返回 409 |
-| `POST /api/cameras/:id/snapshot-scans` | 按当前基础 PTZ 和 P 范围创建普通任务；带 `horizon` 时创建海天线低倍率预扫，HTTP 202 返回任务组 |
+| `POST /api/cameras/:id/snapshot-scans` | 按有序 PTZ 控制点与最大 P 间隔创建逐点截图任务，HTTP 202 返回任务组 |
 | `GET /api/cameras/:id/snapshot-groups` | 截图分组分页，含扫描组与手动／旧截图的单张组 |
 | `GET /api/snapshot-groups/:id` | 读取任务／分组摘要和当前进度 |
 | `GET /api/snapshot-groups/:id/snapshots` | 读取组内截图分页 |
@@ -46,10 +46,11 @@
 | `GET /api/recognition-tasks/:id` | 任务状态、模型进度、标注版本和计算结果 |
 | `GET /api/recognition-tasks/:id/items` | 图片与标注分页，返回 `{ task, items, total, offset, nextOffset }` |
 | `PUT /api/recognition-tasks/:id/items/:snapshotId` | 保存 `{ revision, points?, ignored? }`，返回 `{ task, item }` |
+| `GET /api/recognition-tasks/:id/panorama-guide` | 获取全景参考线及独立版本 `{ guide, revision }` |
+| `PUT /api/recognition-tasks/:id/panorama-guide` | 保存或删除 `{ guide, revision }`，返回独立版本递增后的参考线状态 |
 | `POST /api/recognition-tasks/:id/cancel` | 取消排队或运行中的本地模型识别，保留已有结果 |
 | `POST /api/recognition-tasks/:id/generate` | `{ revision }` 联合生成四项安装修正，返回任务及结果，不写设备配置 |
 | `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId }` 应用服务端保存的最新合格结果，返回 `{ task, camera }` |
-| `POST /api/recognition-tasks/:id/horizon-scan` | `{ revision, resultId, reviewed: true }` 用已复核粗结果创建高倍率正式扫描，HTTP 202 返回截图任务组 |
 
 设备创建与保存的请求体为：
 
@@ -118,15 +119,17 @@
 | `mmsi` | 九位字符串，不转换为数字 |
 | `time` | 带时区的 ISO 来源记录时间，不保证是船端发射或定位时刻 |
 | `longitude/latitude` | WGS84 十进制度的原始报告位置 |
-| `heading` | 真北顺时针船艏度数，0～359°范围；不可用为 `null`，不用 COG 替代 |
+| `heading` | 真北顺时针船艏度数；本源的 0 值沿用同船当前缓存中的旧船艏，没有旧值时为 `null`；其他不可用值为 `null`，不用 COG 替代 |
 | `length/width` | 船长/船宽，米；缺失或非正值为 `null` |
 | `speed` | 对地航速，节；缺失、负值及本来源不可用编码为 `null`，0 为有效静止值 |
 
-两路来源无偏移的 `date` 均按后端配置 UTC+08:00 解释后输出 ISO；已解码的经纬度和速度不再次按 AIS 位字段缩放。只消费 `api=1`，在各来源内按 MMSI 合并；同身份较新时间优先，同时间以后到的有效记录为准，不合并不同来源的同 MMSI 船舶。空批、其他类别或本批未出现不删除目标；按来源时间超过 10 分钟清除，超过后端当前时间一分钟的未来记录跳过。坏记录和非法 JSON 公开错误，其他有效记录继续可用。
+两路来源无偏移的 `date` 均按后端配置 UTC+08:00 解释后输出 ISO；已解码的经纬度和速度不再次按 AIS 位字段缩放。只消费 `api=1`，在各来源内按 MMSI 合并；同身份较新时间优先，同时间以后到的有效记录为准，不合并不同来源的同 MMSI 船舶。适配器将误报为 0 的船艏替换为同船尚未过期的旧船艏，其他字段照常更新；后续有效非零船艏可以替换旧值，456/511 等无效船艏仍输出 `null`。空批、其他类别或本批未出现不删除目标；按来源时间超过 10 分钟清除，旧船艏随目标过期或来源断开清除，超过后端当前时间一分钟的未来记录跳过。坏记录和非法 JSON 公开错误，其他有效记录继续可用。
 
 来源按需连接并在后端共享，断线清空目标后从 2 秒至 30 秒指数退避重连；10 秒连接超时，90 秒无任何消息则重连。SSE 使用 `text/event-stream`，每条 `data:` 为上述完整快照，短批次合并为最多每 250 毫秒一次更新，15 秒注释心跳；慢客户端仅保留一份最新待发快照，不累积增量队列。不依赖 `Last-Event-ID`，重新连接直接取完整状态。未知来源返回 404。服务关闭会结束 SSE 并释放来源连接与定时器。
 
-浏览器页面单选来源，选择按项目保存在当前浏览器，不写摄像头或数据库。页面以 `addEventListener` 注册 SSE 事件，兼容代理包装的 EventSource；初始化异常时释放订阅并显示“连接失败”、具体原因及重新连接入口，此为页面本地状态。历史模式和离页关闭订阅；切源隔离旧回调。目标和估算 ABCD 均不入库；ABCD/模拟高度属于展示边界，从目录参数与有效船长宽/船艏派生，保持统一 AIS 业务字段精简。点选追踪复用 `/api/cameras/:id/precise`，有有效几何时瞄准估算盒中心并计算受摄像头最大 Z 限制的倍率；无几何时保留倍率，定位报告点。交互和估算边界见 [README](../README.md#ais-数据源与追踪船体)。
+浏览器页面单选来源，选择按项目保存在当前浏览器，不写摄像头或数据库。页面以 `addEventListener` 注册 SSE 事件，兼容代理包装的 EventSource；初始化异常时释放订阅并显示“连接失败”、具体原因及重新连接入口，此为页面本地状态。历史模式和离页关闭订阅；切源隔离旧回调。ABCD/船高属于展示边界，默认按目录参数与有效船长宽估算，也可在前端按数据源与 MMSI 手动覆盖。A/B/C/D 为报告位置至船艏、船艉、左舷、右舷的非负米制距离，A+B、C+D 及船高须大于 0；手动尺寸只保留在当前网页内存，切源或 AIS 更新不覆盖，刷新清除。原始 AIS 记录保持八个字段，手动参数不提交后端、不入库或写浏览器存储；尺寸与有效船艏共同决定长方体和中心偏移。
+
+页面开启 AIS 追踪后立即定位，每次调用结束等待 1 秒检查目标；经纬度或船艏变化时再次回读 PTZ、刷新来源快照并调用 `/api/cameras/:id/precise`。每次定位重新计算 P/T/Z，有有效几何时按估算或手动尺寸瞄准盒中心，中心高度取当前船高的一半，并计算受摄像头最大 Z 限制的倍率；无几何时保留倍率，定位报告点。正在追踪时，手动应用尺寸或恢复估算也触发重新定位，并使旧参数下未下发的请求失效。调用串行，不积压中间更新，不因来源时间、速度或长宽变化单独定位；来源过滤的 0 船艏不会单独引发定位。停止追踪、人工控制、配置保存、截图扫描、目标／来源／摄像头切换、历史、离页、网页隐藏或目标失效后不再下发旧请求；定位失败不自动重发，需要用户重新开启。追踪状态和定时器仅存在当前页面，不写数据库或新增设备控制接口。交互和估算边界见 [README](../README.md#ais-数据源与追踪船体)。
 
 ### GeoJSON 标绘接口
 
@@ -144,55 +147,61 @@
 
 图层及关联保存在 SQLite 的 `plot_layers`、`plot_layer_cameras` 表。可写启动时自动建立新表；只读 MCP 不执行迁移，也不依赖新表读取已有业务。名称、关联和显隐的修改都不回写 GeoJSON properties。未知图层、摄像头或未建立的关联返回 404；无效输入返回 400；错误体统一为 `{ "message": "错误说明" }`，不返回导入原文或内部堆栈。HTTP 公开边界回归见[标绘接口测试](../tests/plot-layers.test.mjs)。
 
-### 自动扇区截图与任务接口
+### 自动截图与任务接口
 
-页面从**实时画面右侧表单**发起自动截图，开始时重新读取所选摄像头的当前 PTZ；任务页提供进度、状态、暂停／继续及关联截图查看。HTTP 调用流程相同：先 `GET /api/cameras/:id/ptz`，再将当前的 P/T/Z 传给启动接口。以下为请求结构示例，实际基础值必须来自当前设备回读：
+实时页使用至少两个有序 PTZ 控制点启动自动截图。控制点可手填或由页面显式回读当前 PTZ 填入；启动接口直接使用提交的目标，不要求当前设备姿态与起点相同。
 
 ```http
 POST /api/cameras/<CAMERA_ID>/snapshot-scans
 Content-Type: application/json
 
 {
-  "basePtz": { "pan": 60, "tilt": 2.8, "zoom": 15 },
-  "panMin": 0,
-  "panMax": 150,
+  "controlPoints": [
+    { "pan": 10, "tilt": 0, "zoom": 2 },
+    { "pan": 20, "tilt": 4, "zoom": 6 }
+  ],
+  "maxPanStep": 3,
   "settleMs": 1000,
   "moveTimeoutMs": 30000
 }
 ```
 
-| 字段 | 约定 |
+| 字段 | 约束 |
 | --- | --- |
-| `basePtz` | 必填，当前已调好的 `{ pan, tilt, zoom }`；P 为 0～360°，T 为 -90～90°，Z ≥ 1。若与新的回读不符返回 409 |
-| `panMin`、`panMax` | 必填，设备原始 P，均为 0～360°，不叠加安装偏移。普通模式分别表示起始／结束 P，结束值小于起始值时沿 P 递增方向跨 0°；海天线模式表示最小／最大 P，要求最小值小于最大值且不跨 0° |
-| `settleMs` | 可选，稳定等待时间，默认 1000 毫秒，0～10000；即使为 0 也至少要求两次到位回读 |
-| `moveTimeoutMs` | 可选，每点定位稳定等待上限，默认 30000 毫秒，1000～120000 |
-| `calibration` | 可选，完整安装参数副本，语义与单张截图一致；省略用已保存配置。实时表单提交当前草稿 |
-| `horizon` | 可选，`{ preScanZoom, tiltMin, tiltMax }` 创建低倍率预扫；预扫倍率 ≥ 1 且小于当前 Z，-90 ≤ 最小 T < 最大 T ≤ 90，当前 T 须在其中；P 覆盖至少 30°，建议 90°以上。允许 T 可按设备进一步机械限制收窄 |
+| `controlPoints` | 至少两个有序 `{ pan, tilt, zoom }`；P 为 0～360°，T 为 -90～90°有符号角，Z 为 1～该摄像头已保存的最大倍率 |
+| `maxPanStep` | 最大 P 间隔，默认 5°，须大于 0°且不超过 360° |
+| `settleMs` | 稳定等待时间，默认 1000 毫秒，范围 0～10000；设为 0 仍要求至少两次回读到位 |
+| `moveTimeoutMs` | 每点定位和停稳超时，默认 30000 毫秒，范围 1000～120000 |
+| `calibration` | 可选的完整安装标定副本；省略时使用已保存的摄像头参数 |
 
-普通模式省略 `horizon`。HFOV 从启动时当前倍率的 PTZ 接口读取，必须为 0°～180°之间的有效值。跨度 `D = panMax - panMin`，负值时加 360°，要求 `D > 0`；相同起止值和 `360 → 0` 返回 400，`0 → 360` 表示完整一周。张数 `N = ceil(D / HFOV)`，步长 `S = D / N`，第 `i` 个目标为 `(panMin + (i + 0.5) × S) % 360`（`i` 从 0 开始）。0° → 150°、30°视场角产生 5 张，目标 P 为 15°、45°、75°、105°、135°；347° → 9° 的跨度为 22°，8°视场角产生 3 张，目标 P 约为 350.667°、358°、5.333°。普通模式每次提交精确 PTZ 时固定任务原始的 T/Z；停稳检查中 P 按环形角比较，T 按有符号差值直接比较。上限为 10000 张，超限返回 400；海天线模式见[分阶段接口](#海天线预扫描与正式扫描接口)。
+每段跨度 D=结束 P-起始 P，负值加 360°，要求 D>0。相邻点 P 相同和 360°→0°无效；0°→360°表示整圈。P 始终递增，350°→10°走 20°，10°→350°走 340°，不自动取最短路。
 
-启动成功返回 HTTP 202 和 `Location: /api/snapshot-groups/<GROUP_ID>`。任务摘要含 `id`、`cameraId`、`kind: "scan"`、`status`、`basePtz`、`panMin/panMax`、`horizontalFieldAngle`、`sampleCount`、`panStep`、`completedCount`、`snapshotCount`、`createdAt`、`finishedAt` 和 `error`。`panMin/panMax` 保留提交的原始起止值，跨 0° 任务的 `panStep` 仍为正值。`completedCount` 是已完成采样点数；`snapshotCount` 是当前未删除的图片数，两者在删图后可能不同。
+每段划分 N=ceil(D/maxPanStep) 个间隔，实际步长为 D/N；进度 u=i/N（i=0..N），目标 P=(起始 P+uD)%360、T=起始 T+u×T差、Z=起始 Z+u×Z差。包含所有控制点，相邻段共用点只拍一次；总张数为 1+各段 N 之和，超过 10000 在任何设备操作前返回 400。上述示例生成 (10°,0°,2)、(12.5°,1°,3)、(15°,2°,4)、(17.5°,3°,5)、(20°,4°,6) 共五张。0°→360°、间隔 5°共 73 张，首尾分别拍摄。
 
-海天线任务额外返回 `horizon`，含 `phase: "coarse" | "fine"`、`targetZoom`、`tiltMin/tiltMax`、`targetHorizontalFov/targetVerticalFov`；正式阶段另含 `sourceRecognitionTaskId/sourceRevision/sourceResultId`。任务摘要可带 `recognitionTaskId` 或 `recognitionError`，分别用于打开自动创建的识别任务或显示创建失败。创建识别失败不更改已完成截图的状态，现存截图仍可手动创建识别。
+规划不使用未知倍率的推算 FOV；最大 P 间隔定义目标密度，无法保证画面覆盖无缝。设备在精确定位之间的运动轨迹由设备执行，线性插值只约束采样目标。
 
-每个位置依次执行“精确 PTZ → 回读到位并稳定 → 截图前回读 → 抓图 → 截图后回读 → 保存”。截图期间姿态变化则本张不保存并终止任务。样本增加 `groupId`、从 0 开始的 `scanIndex`、`scanTarget`；实际 `ptz/ptzAfter`、图片尺寸、时间、标定副本等仍遵循单张截图契约，时间对应保持 `unverified`。图片元数据与任务进度在同一数据库事务中更新，文件写入失败不提交记录。
+启动返回 HTTP 202、`Location: /api/snapshot-groups/<GROUP_ID>` 及任务摘要。摘要保留 `kind: "scan"`、`status`、`controlPoints`、`maxPanStep`、`sampleCount`、`completedCount`、`snapshotCount`、时间、错误和标定副本；冻结的 `targets` 保存完整 PTZ 目标，`targetPanSteps` 保存各目标对应的实际 P 间隔，连接点取两侧较小值。
 
-任务状态为 `running`（执行）、`pausing`（等待暂停）、`paused`（暂停）、`completed`（完成）、`failed`（失败）、`cancelled`（取消）或 `interrupted`（异常重启中断）。暂停接口等待在途请求结束并停止云台，再返回 `paused`；继续接口从 `completedCount` 对应的下一点开始，使用原任务采样计划、FOV 和标定副本，普通及预扫阶段固定原 T/Z，正式阶段沿用冻结的逐点 T。暂停／失败／中断的任务若已拍满，`start` 仅重新发送 stop 并保存 `completed`，不重复定位或抓图；海天线任务随后自动关联识别，正式阶段仍要求 `completed` 来源。新建普通或预扫任务才重新采用当前基础姿态。完成后停在最后采样位置。终止或暂停均保留已存截图，停止失败时保留设备锁，需用 `/control` 的 `stop` 重试成功后才可继续或收尾；该 stop 会取消执行中的自动任务。通道标识改变后不能继续原任务。正常关机会取消活动任务，异常重启不自动恢复转动；一个数据目录只运行一个业务后端。
+每点执行精确定位、稳定回读、截图前回读、抓图、截图后回读和持久化。P 按环形角比较，到位容差为 min(0.15°,当前实际 P 间隔/4)，T 为 0.15°，Z 为 max(0.01,目标 Z×0.001)。前后 P/T/Z/FOV 变化时本张不保存、任务失败；实际 `ptz/ptzAfter`、`scanIndex`、`scanTarget` 与标定副本一起保存，图片与姿态严格同步继续为 `unverified`。
 
-分组、任务及组内截图接口均支持 `limit`（1～100）和 `offset`（从 0 开始）。任务／分组列表默认每页 30 条，返回 `{ total, groups, offset, nextOffset }`；组内图片默认 50 张，返回 `{ group, total, snapshots, offset, nextOffset }`。分组按时间倒序，组内图片按时间正序。`kind: "single"` 以单张截图 ID 作为组 ID，兼容旧数据，原始元数据不改写。旧 `/api/cameras/:id/snapshots` 保持兼容的完整列表，页面采用分组分页接口。
+任务状态为 `running/pausing/paused/completed/failed/cancelled/interrupted`。暂停等待在途请求和 stop，成功后释放设备；继续使用原冻结目标，从 `completedCount` 开始。删除已拍图片不重拍，已拍满任务继续时只完成停止收尾。完成保持最后位置。停止失败保留设备占用，手动 stop 成功后才能恢复；通道变更返回 409。正常关闭取消执行任务，异常重启标为中断，均不自动驱动设备。
 
-任务页的“生成全景图”使用组内分页接口读取全部现存截图，再通过各记录的 `imageUrl` 获取原图；暂停或结束的任务至少两张可生成。前端按保存的安装旋转、真实 P/T 和视场角作圆柱投影及重叠融合，可预览并下载 PNG，原始图片和记录不修改。生成中可取消，切换任务、删除图片或继续任务后清除旧预览；记录变化或任一图片读取失败时终止生成并显示错误。输出最多 16384×4096、1600 万像素，按比例缩小，缺失视野保持透明。全景生成在浏览器完成，不新增后端写接口；实现及局限见 [README](../README.md#自动扇区截图与任务)。
+分组和任务列表支持 `limit=1..100`、`offset>=0`，默认每页 30 条，返回 `{ total, groups, offset, nextOffset }`；组内图片默认 50 张，返回 `{ group, total, snapshots, offset, nextOffset }`。分组倒序、组内图片正序，`kind: "single"` 以单张图片 ID 为组 ID。原摄像头截图列表接口仍可读取完整列表。
 
-截图记录与任务页中的图片支持右键删除；`DELETE /api/snapshots/:id` 成功返回 204，只删除这一张。设备正在扫描、控制、保存或截图时返回 409，暂停后可删除。后端在截图目录中暂存图片，数据库拒绝删除时恢复原图；成功后清理暂存文件，清理失败明确返回错误。删除已完成点不会让任务继续时重拍该点，也不修改其他截图或标定配置。
+`DELETE /api/snapshots/:id` 删除单图及文件，成功返回 204，设备扫描或控制中返回 409。文件暂存与数据库删除保持一致，数据库拒绝时恢复原图；删除仅减少 `snapshotCount`，不改变 `completedCount` 或其他样本。
 
-PowerShell 调用示例：
+PowerShell 示例：
 
 ```powershell
 $baseUrl = 'http://127.0.0.1:3000'
 $cameraId = '<CAMERA_ID>'
-$reading = Invoke-RestMethod "$baseUrl/api/cameras/$cameraId/ptz"
-$scanBody = @{ basePtz = @{ pan = $reading.raw.Pan; tilt = $reading.raw.Tilt; zoom = $reading.raw.Zoom }; panMin = 0; panMax = 150 } | ConvertTo-Json
+$scanBody = @{
+  controlPoints = @(
+    @{ pan = 10; tilt = 0; zoom = 2 },
+    @{ pan = 20; tilt = 4; zoom = 6 }
+  )
+  maxPanStep = 3
+} | ConvertTo-Json -Depth 4
 $task = Invoke-RestMethod "$baseUrl/api/cameras/$cameraId/snapshot-scans" -Method Post -ContentType 'application/json' -Body $scanBody
 Invoke-RestMethod "$baseUrl/api/snapshot-groups/$($task.id)"
 Invoke-RestMethod "$baseUrl/api/snapshot-groups/$($task.id)/snapshots?limit=50&offset=0"
@@ -200,24 +209,7 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/pause" -Method Post
 Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 ```
 
-### 海天线预扫描与正式扫描接口
-
-预扫仍使用 `POST /api/cameras/:id/snapshot-scans`，在普通请求中加入 `"horizon": { "preScanZoom": 2, "tiltMin": 0, "tiltMax": 90 }`。示例 T 范围须按设备实际能力填写。`basePtz` 来自启动时当前高倍率真实回读，保存其 Z 与 HFOV/VFOV 供正式阶段恢复；后端读取低倍率实际 FOV，按包含两端、间隔不超过 15°的均匀 P 点采样，至少三个方向。预扫固定初始 T，每张保存实际低倍率 P/T/Z/FOV；人工须事先调好 T，缺线或遮挡样本可在复核页忽略，必要时重新预扫。
-
-预扫完成后自动创建本地识别。海天线任务自动创建的识别在模型结束后自动计算候选安装结果，失败或不可靠结果正常保留，不自动应用配置。识别页通过 `sourceTaskId` 读取来源截图任务，展示预扫／正式阶段；粗结果仅用于下一阶段控制。手动新建同一已完成预扫的识别任务，也可复核后启动正式扫描。
-
-```http
-POST /api/recognition-tasks/<RECOGNITION_TASK_ID>/horizon-scan
-Content-Type: application/json
-
-{ "revision": 0, "resultId": "<CURRENT_RESULT_ID>", "reviewed": true }
-```
-
-接口只接受源预扫状态为 `completed`、识别已结束且结果为 `estimated` 的当前版本。必须显式提交 `reviewed: true` 和匹配的 `revision/resultId`；源图片、设备通道、安装位置及拟合参考配置须仍有效，且设备未被其他操作占用。页面先保存标注，存在未保存内容、排队／识别中、无效结果或未确认复核时不能启动；确认绑定当前任务、版本和结果，任何编辑或重新生成均清除确认。无效请求或冲突明确返回错误，页面不伪造任务成功。
-
-校验成功后返回 HTTP 202 和普通 `SnapshotGroup` 摘要。服务端恢复原预扫保存的目标倍率及 P 范围，按目标 HFOV 等分中心点，使用 `fitCamera` 与粗结果组成控制标定副本，不写摄像头配置。先求解全部目标 T：保持与参考 T 相同的俯仰分支，选择允许区间内最接近参考 T 的解；不可达时拒绝，不硬截到范围边缘或将负角度自动包装成 360°。逐点目标、控制副本、来源识别版本／结果和残差余量在 SQLite 中冻结，之后修改粗标注不追溯改变已创建计划，续扫仍校验通道。
-
-正式扫描使用完整原始 P/T/Z 精确定位，以实际 FOV 检查到位和截图前后稳定。T 容差为 `min(0.15°, 0.05 × 实际 VFOV)`；模型余量为 `max(0.02°, 3 × 粗拟合角度 RMS)`，要求 `abs(中心海天线角度差) + 余量 + 到位容差 < 0.35 × 实际 VFOV`。无效 FOV 或余量不足时失败并保留已完成样本；余量是模型检查，不是经标定的概率置信度。原始 `ptz/ptzAfter` 始终来自真实回读。海天线居中指画面横向中部接近中心，不要求整条线水平，也不执行在线真实海天线检测。正式阶段完成后自动创建最终识别，复核后的候选参数仍由用户点击“应用到摄像头”保存。
+已有普通及两阶段海天线任务仍按原存储字段读取和恢复。旧普通任务保留区间中心采样，旧预扫／正式任务保留冻结目标；正式阶段继续检查实际 FOV、原角度余量及 min(0.15°,0.05×VFOV) 的 T 容差。历史海天线任务完成后的自动识别关联保留；页面对历史预扫粗结果保留只查看限制。新任务采用多点请求并手动创建识别；新建请求只接受本节字段。
 
 ### 本地识别任务与四参数标定
 
@@ -229,7 +221,19 @@ Content-Type: application/json
 
 每个识别条目包含 `snapshotId`、采样元数据副本 `snapshot`、模型原始 `detectedPoints`、当前 `points`、`source=model/manual`、`ignored/ignoreReason`、原图是否已删除 `missing` 及原始检测参数 `detection`。提交的点位固定为两个 `{x,y}`，均在 0～1 内；参与计算时横向跨度至少 10%，被忽略的图片可暂存尚未满足跨度的标注。只修改忽略状态时可省略 `points`，人工点位不会覆盖模型原始输出。源记录删除后 `missing=true`，重新生成会排除此图。
 
-模型无有效点位、采样姿态变化或同组局部倾角/归一化高度突变时默认忽略。邻域、MAD 和最小门槛见 README。突变过滤只比较同一 T/Z/FOV，变 T 的正式扫描不能获得与固定 T 扫描相同的支持，不按图像行位置直接比较不同 T 样本。自动忽略可手动恢复，恢复前必须有合法点位。过滤不保证边界一定是真正海天线。
+全景参考线通过独立的 `panorama-guide` 接口保存，不进入单图 `points`、`detectedPoints`、忽略状态或安装拟合。无参考线的旧任务返回 `{ "guide": null, "revision": 0 }`。PUT 请求和响应均为 `{ guide, revision }`；请求的 `revision` 必须等于当前参考线版本，成功后加一，`guide:null` 表示删除并同样递增版本。版本冲突返回 409，未知任务返回 404，识别排队或运行中不可修改。
+
+`guide.kind` 支持以下形状，点位顺序决定曲线，不按方位重新排序：
+
+| kind | points |
+| --- | --- |
+| `line` | 两个端点 |
+| `quadratic` | 起点、弯曲控制点、终点，兼容已保存的三点弧线 |
+| `bezier` | 5～65 个点且为奇数，按起点、控制点、连接节点、控制点、……、终点交替排列；每一对相邻节点及中间的控制点组成一段二次贝塞尔，相邻段共用连接节点，最多 32 段 |
+
+每点包含有限的 `heading`（展开方位，弧度）和 `elevation`（射线垂直分量与水平长度之比），独立于全景 PNG 尺寸；起终点方位差的绝对值须大于 `1e-9` 弧度，全部点的方位最大值与最小值之差不得超过 `2π`，保留展开值。点数、结构或坐标无效返回 400 且不改变版本。参考线保存在独立的 `recognition_panorama_guides` 表，保存不会改变识别任务的 `revision`、`updatedAt`、计算结果编号或应用状态。该能力仅保存人工复核参照，不覆盖正式标注，不触发重识别或设备控制。
+
+模型无有效点位、采样姿态变化或同组局部倾角/归一化高度突变时默认忽略。邻域、MAD 和最小门槛见 README。突变过滤只比较同一 T/Z/FOV，多点路径的 T/Z 可能逐点变化，须逐图复核不同姿态的样本。自动忽略可手动恢复，恢复前必须有合法点位。过滤不保证边界一定是真正海天线。
 
 `generate` 使用当前设备经纬度、高度及默认朝向，以及未忽略截图的真实 PTZ/FOV。模型 `wgs84-horizon-installation-v1` 联合求解 `pAxisPitch/pAxisRoll/tiltOffset/imageRoll`，复用共用旋转链、WGS84 残差和稳健损失。`result.status` 为 `estimated/insufficient_data/unreliable`，只有 `estimated` 包含 `installation` 四项数值。有效样本参与拟合后，必须收敛、未加阻尼的四参数矩阵条件数小于 `1e8`，各图等权的 RMS 不超过 5 像素；否则返回 `unreliable`。没有有效样本时返回 `insufficient_data`。张数、不同 P 方向数和覆盖范围用于查看分布，样本较少或方向集中时对标注及固定参数误差更敏感。`diagnostics.perSnapshot` 给出逐图像素残差，`diagnostics.rmsAngularResidualDegrees` 给出参与样本真实射线的角度均方根残差，排除项列在 `excluded`。低倍率的像素门槛不直接保证高倍率精度。
 

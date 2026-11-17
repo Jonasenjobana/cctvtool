@@ -15,10 +15,10 @@
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 仓库、分支、提交与合并规范 | 创建分支、提交、推送或合并前 |
 | [docs/API.md](docs/API.md) | 本工具与 LiveGBS 的接口、控制和持久化契约 | 修改前后端接口或设备接入时 |
 | [docs/MCP使用说明.md](docs/MCP使用说明.md) | MCP 配置、认证、模型调用与排错 | 修改 MCP 或 ESSLD 接入时 |
-| [GLOSSARY.md](GLOSSARY.md) | 监控数据源、海天线采样、标定与标绘术语 | 讨论数据源选择、预扫描、标定或标绘关系时 |
-| [.scratch/horizon-aware-scan/map.md](.scratch/horizon-aware-scan/map.md) | 高倍率采样方案的决策地图与本地决策票 | 继续该方案研究时；其中候选方案不代表当前产品行为 |
+| [GLOSSARY.md](GLOSSARY.md) | 监控数据源、PTZ 截图路径、海天线、标定与标绘术语 | 讨论数据源选择、自动截图、标定或标绘关系时 |
+| [.scratch/horizon-aware-scan/map.md](.scratch/horizon-aware-scan/map.md) | 多点 PTZ 自动截图规格与决策入口 | 修改控制点、插值采样或旧扫描恢复时 |
 | [.scratch/horizon-vertical-drift/map.md](.scratch/horizon-vertical-drift/map.md) | 海天线变倍与转向垂直偏差的证据、验证与修正决策 | 排查低倍对齐后高倍或转向出现上下错位时 |
-| [.scratch/ais-data-source/spec.md](.scratch/ais-data-source/spec.md)、[决策地图](.scratch/ais-data-source/map.md) | AIS 项目适配、统一数据与监控页面船舶展示约定 | 修改 AIS 接入、显示及单次追踪时 |
+| [.scratch/ais-data-source/spec.md](.scratch/ais-data-source/spec.md)、[决策地图](.scratch/ais-data-source/map.md) | AIS 项目适配、统一数据与监控页面船舶展示约定 | 修改 AIS 接入、显示及定时追踪时 |
 
 ## 环境与验证
 

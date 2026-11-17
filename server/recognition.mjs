@@ -99,7 +99,7 @@ export function createEssldRecognizer() {
   };
 }
 
-export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHorizonScan, recognizer = createEssldRecognizer() }) {
+export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer = createEssldRecognizer() }) {
   store.interruptRecognitionTasks();
   const queued = [];
   let current = null, closing = false;
@@ -209,6 +209,13 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHo
 
   const revisionSchema = { type: 'integer', minimum: 0 };
   const bodyWithRevision = { type: 'object', additionalProperties: false, required: ['revision'], properties: { revision: revisionSchema } };
+  const guidePoint = { type: 'object', additionalProperties: false, required: ['heading', 'elevation'],
+    properties: { heading: { type: 'number' }, elevation: { type: 'number' } } };
+  const guideSchema = { anyOf: [{ type: 'null' }, ...[['line', 2, 2], ['quadratic', 3, 3], ['bezier', 5, 65]].map(([kind, minimum, maximum]) => ({
+    type: 'object', additionalProperties: false, required: ['kind', 'points'], properties: {
+      kind: { type: 'string', const: kind }, points: { type: 'array', minItems: minimum, maxItems: maximum, items: guidePoint },
+    },
+  }))] };
   const paging = { type: 'object', additionalProperties: false, properties: {
     limit: { type: 'string', pattern: '^(?:[1-9]|[1-9][0-9]|100)$' }, offset: { type: 'string', pattern: '^(?:0|[1-9][0-9]{0,8})$' },
   } };
@@ -221,6 +228,27 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHo
   });
   app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => store.listRecognitionTasks(pageOptions(request.query)));
   app.get('/api/recognition-tasks/:id', async (request) => store.getRecognitionTask(request.params.id));
+  app.get('/api/recognition-tasks/:id/panorama-guide', async (request) => store.getRecognitionPanoramaGuide(request.params.id));
+  app.put('/api/recognition-tasks/:id/panorama-guide', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'guide'], properties: {
+      revision: { ...revisionSchema, maximum: Number.MAX_SAFE_INTEGER - 1 }, guide: guideSchema,
+    },
+  } } }, async (request) => {
+    const task = store.getRecognitionTask(request.params.id);
+    if (activeStatuses.includes(task.status)) throw httpError(409, '请等待识别结束或取消后再编辑');
+    const { guide, revision } = request.body;
+    if (guide) {
+      if (guide.kind === 'bezier' && guide.points.length % 2 !== 1) throw httpError(400, '分段贝塞尔需要交替排列控制点与连接节点');
+      if (guide.points.some((point) => !Number.isFinite(point.heading) || !Number.isFinite(point.elevation))) {
+        throw httpError(400, '全景参考线坐标必须为有限数值');
+      }
+      const headings = guide.points.map((point) => point.heading);
+      if (Math.abs(headings.at(-1) - headings[0]) <= 1e-9 || Math.max(...headings) - Math.min(...headings) > 2 * Math.PI) {
+        throw httpError(400, '全景参考线起终点需要有效方位跨度，全部点的方位范围不能超过一周');
+      }
+    }
+    return store.saveRecognitionPanoramaGuide(task.id, revision, guide);
+  });
   app.get('/api/recognition-tasks/:id/items', { schema: { querystring: paging } }, async (request) => {
     const task = store.getRecognitionTask(request.params.id);
     const options = pageOptions(request.query);
@@ -258,36 +286,6 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, startHo
   app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
     return store.updateRecognitionTask(task.id, installationChanges(task));
-  });
-  app.post('/api/recognition-tasks/:id/horizon-scan', { schema: { body: {
-    ...bodyWithRevision, required: ['revision', 'resultId', 'reviewed'], properties: { ...bodyWithRevision.properties,
-      resultId: { type: 'string', minLength: 1 }, reviewed: { type: 'boolean' } },
-  } } }, async (request, reply) => {
-    const task = editable(request.params.id, request.body.revision);
-    if (!request.body.reviewed) throw httpError(409, '请先人工复核当前版本与计算结果的海天线标注');
-    if (task.result?.status !== 'estimated' || task.resultRevision !== task.revision) {
-      throw httpError(409, '请先生成通过质量检查的最新粗标定结果');
-    }
-    if (task.resultId !== request.body.resultId) throw httpError(409, '计算结果已重新生成，请刷新并复核最新结果');
-    const source = store.getSnapshotGroup(task.sourceTaskId);
-    if (source.kind !== 'scan' || source.status !== 'completed' || source.horizon?.phase !== 'coarse') {
-      throw httpError(409, '只能从已完成的低倍率海天线预扫启动正式扫描');
-    }
-    const camera = store.getCamera(task.cameraId);
-    if ([...calibrationKeys, 'serial', 'code', 'updatedAt'].some((key) => camera[key] !== task.fitCamera?.[key])
-      || source.serial !== camera.serial || source.code !== camera.code) {
-      throw httpError(409, '摄像头配置或通道已变化，请重新生成并复核粗标定');
-    }
-    const items = store.recognitionItems(task.id);
-    const directory = resolve(dataDir, 'snapshots');
-    if (task.result.sourceSnapshotIds.some((id) => {
-      const item = items.find((value) => value.snapshotId === id);
-      if (!item || item.missing) return true;
-      const path = resolve(directory, item.snapshot.fileName);
-      return dirname(path) !== directory || !existsSync(path);
-    })) throw httpError(409, '参与粗标定的源截图或图片文件已删除，请重新生成并复核');
-    const group = startHorizonScan(source, task);
-    return reply.code(202).header('Location', `/api/snapshot-groups/${group.id}`).send(group);
   });
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },

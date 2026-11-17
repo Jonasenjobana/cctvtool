@@ -1,7 +1,8 @@
 import { Injectable, computed, inject, signal } from '@angular/core';
 import type { OnDestroy } from '@angular/core';
 import { ApiService, errorMessage } from './api.service';
-import type { VesselSnapshot, VesselSourceCatalog, VesselTarget } from './ais.models';
+import { vesselBodyDimensions } from './ais-math';
+import type { VesselBodyDimensions, VesselSnapshot, VesselSourceCatalog, VesselTarget } from './ais.models';
 
 @Injectable({ providedIn: 'root' })
 export class AisState implements OnDestroy {
@@ -12,12 +13,16 @@ export class AisState implements OnDestroy {
   readonly selectedMmsi = signal('');
   readonly trackedMmsi = signal('');
   readonly selectionRevision = signal(0);
+  readonly bodyRevision = signal(0);
   readonly status = signal<VesselSnapshot['status'] | 'error'>('idle');
   readonly problem = signal('');
   readonly preferenceError = signal('');
   readonly loading = signal(false);
   readonly selectedSource = computed(() => this.catalog()?.sources.find(source => source.id === this.selectedId()) ?? null);
   readonly selectedTarget = computed(() => this.targets().find(target => target.mmsi === this.selectedMmsi()) ?? null);
+  private readonly bodySettings = signal<ReadonlyMap<string, ReadonlyMap<string, VesselBodyDimensions>>>(new Map());
+  readonly bodyOverrides = computed(() => this.bodySettings().get(this.selectedId()) ?? new Map<string, VesselBodyDimensions>());
+  readonly selectedBodyOverride = computed(() => this.bodyOverrides().get(this.selectedMmsi()) ?? null);
   private active = false;
   private stream?: EventSource;
 
@@ -75,7 +80,7 @@ export class AisState implements OnDestroy {
           this.problem.set(snapshot.error ?? '');
           this.targets.set(snapshot.status === 'connected' ? snapshot.targets : []);
           if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectTarget('');
-          if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.trackedMmsi.set('');
+          if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.clearTracking();
         } catch (error) {
           this.status.set('reconnecting');
           this.targets.set([]);
@@ -100,10 +105,38 @@ export class AisState implements OnDestroy {
   }
 
   selectTarget(mmsi: string) {
-    if (mmsi !== this.selectedMmsi()) this.selectionRevision.update(revision => revision + 1);
+    if (mmsi !== this.selectedMmsi()) {
+      this.selectionRevision.update(revision => revision + 1);
+      this.clearTracking();
+    }
     this.selectedMmsi.set(mmsi);
   }
-  clearTracking() { this.trackedMmsi.set(''); }
+  clearTracking() {
+    if (this.trackedMmsi()) this.selectionRevision.update(revision => revision + 1);
+    this.trackedMmsi.set('');
+  }
+
+  setBodyDimensions(mmsi: string, dimensions: VesselBodyDimensions) {
+    const ship = this.targets().find(target => target.mmsi === mmsi), source = this.selectedSource();
+    if (!ship || !source) throw new Error('该 AIS 目标已失效或未选择数据源');
+    if (!vesselBodyDimensions(ship, source.geometry, dimensions)) {
+      throw new Error('ABCD 须为非负数，A+B、C+D 和船高须大于 0');
+    }
+    const settings = new Map(this.bodySettings()), bodies = new Map(settings.get(source.id));
+    bodies.set(mmsi, { ...dimensions });
+    settings.set(source.id, bodies);
+    this.bodySettings.set(settings);
+    this.bodyRevision.update(revision => revision + 1);
+  }
+
+  resetBodyDimensions(mmsi: string) {
+    if (!this.bodyOverrides().has(mmsi)) return;
+    const settings = new Map(this.bodySettings()), bodies = new Map(settings.get(this.selectedId()));
+    bodies.delete(mmsi);
+    settings.set(this.selectedId(), bodies);
+    this.bodySettings.set(settings);
+    this.bodyRevision.update(revision => revision + 1);
+  }
 
   private disconnect() {
     this.selectionRevision.update(revision => revision + 1);

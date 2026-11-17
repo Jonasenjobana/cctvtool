@@ -89,6 +89,8 @@ export interface SnapshotGroup {
   snapshotCount: number;
   coverId: string | null;
   error: string | null;
+  controlPoints?: PreciseTarget[];
+  maxPanStep?: number;
   basePtz?: PreciseTarget;
   panMin?: number;
   panMax?: number;
@@ -109,11 +111,9 @@ export interface SnapshotGroup {
   recognitionError?: string | null;
 }
 
-export interface HorizonScanOptions { preScanZoom: number; tiltMin: number; tiltMax: number }
-
 export function snapshotTaskName(group: SnapshotGroup): string {
-  return group.horizon ? group.horizon.phase === 'coarse' ? '海天线预扫描' : '高倍率正式扫描'
-    : group.kind === 'scan' ? '自动截图' : '单张截图';
+  return group.horizon ? group.horizon.phase === 'coarse' ? '历史海天线预扫描' : '历史高倍率正式扫描'
+    : group.controlPoints ? '多点 PTZ 截图' : group.kind === 'scan' ? '自动截图' : '单张截图';
 }
 
 export interface SnapshotGroupPage {

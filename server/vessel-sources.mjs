@@ -54,12 +54,17 @@ class VesselSource {
       try {
         const batch = decodeSeaoilAis(JSON.parse(event.data), this.config);
         if (!batch) { this.notify(); return; }
+        this.prune();
         for (const target of batch.targets) {
           const age = this.now() - Date.parse(target.time);
           if (age < -60000) { batch.invalidCount++; continue; }
           if (age >= this.config.expireAfterMs) continue;
           const previous = this.targets.get(target.mmsi);
-          if (!previous || target.time >= previous.time) this.targets.set(target.mmsi, target);
+          if (!previous || target.time >= previous.time) {
+            // 此来源会将缺失船艏误报为 0，仅沿用同船尚未过期的船艏。
+            if (target.heading === 0) target.heading = previous?.heading ?? null;
+            this.targets.set(target.mmsi, target);
+          }
         }
         this.error = batch.invalidCount ? `跳过 ${batch.invalidCount} 条无效 AIS 记录` : null;
       } catch (error) { this.error = error instanceof SyntaxError ? 'AIS 来源返回了无效 JSON' : error.message; }

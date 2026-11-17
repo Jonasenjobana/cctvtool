@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, ElementRef, Input, ViewChild, signal } from '@angular/core';
 import type { AfterViewInit, OnDestroy } from '@angular/core';
 
-type HelpTopic = 'p-axis' | 'tilt-offset' | 'image-roll';
+type HelpTopic = 'p-axis' | 'tilt-offset' | 'image-roll' | 'ais-body';
 const helpContent = {
   'p-axis': {
     title: 'P 轴安装倾斜',
@@ -21,6 +21,12 @@ const helpContent = {
     alt: '镜头绕最终光轴的旋转与海天线斜率变化的手绘示意图，P 轴保持不变',
     description: '补偿绕最终光轴的固定旋转，主要用于对齐模型与实拍中海天线的斜率。镜头朝向保持不变，实拍视频不会被旋正。',
   },
+  'ais-body': {
+    title: 'AIS 船体尺寸：ABCD 与船高',
+    image: '/help/ais-abcd.png',
+    alt: '船艏朝上的船舶俯视图，以 AIS 天线为参考，A 指向船艏、B 指向船艉、C 指向左舷、D 指向右舷；侧视图标出海面至模型顶部的船高',
+    description: 'A/B 分别是 AIS 天线到船艏／船艉的纵向距离；C/D 分别是到左舷／右舷的横向距离。船高从海面量到模型顶部。',
+  },
 } as const;
 
 @Component({
@@ -36,7 +42,7 @@ const helpContent = {
       <strong>{{ content.title }}</strong>
       <img [src]="content.image" [alt]="content.alt" width="1536" height="1024" loading="lazy" (load)="position()">
       <p>{{ content.description }}</p>
-      <small>仅校准三维模型，不会控制云台移动。</small>
+      <small>{{ topic === 'ais-body' ? '船长 = A + B，船宽 = C + D，单位：米。' : '仅校准三维模型，不会控制云台移动。' }}</small>
     </div>
   `,
   styles: `

@@ -58,6 +58,10 @@ export class CameraStore {
         taskId TEXT NOT NULL REFERENCES recognition_tasks(id), snapshotId TEXT NOT NULL,
         position INTEGER NOT NULL, metadata TEXT NOT NULL, PRIMARY KEY(taskId, snapshotId)
       );
+      CREATE TABLE IF NOT EXISTS recognition_panorama_guides (
+        taskId TEXT PRIMARY KEY REFERENCES recognition_tasks(id), guide TEXT,
+        revision INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS plot_layers (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, sourceFileName TEXT NOT NULL, geojsonText TEXT NOT NULL,
         byteLength INTEGER NOT NULL, featureCount INTEGER NOT NULL, geometryTypes TEXT NOT NULL,
@@ -346,6 +350,25 @@ export class CameraStore {
     const row = this.db.prepare('SELECT metadata FROM recognition_tasks WHERE id = ?').get(id);
     if (!row) throw httpError(404, '识别任务不存在');
     return JSON.parse(row.metadata);
+  }
+
+  getRecognitionPanoramaGuide(id) {
+    this.getRecognitionTask(id);
+    const row = this.db.prepare('SELECT guide, revision FROM recognition_panorama_guides WHERE taskId = ?').get(id);
+    return row ? { guide: JSON.parse(row.guide), revision: row.revision } : { guide: null, revision: 0 };
+  }
+
+  saveRecognitionPanoramaGuide(id, revision, guide) {
+    return this.transaction(() => {
+      const previous = this.getRecognitionPanoramaGuide(id);
+      if (previous.revision !== revision) throw httpError(409, '全景参考线已被修改，请刷新后重试');
+      const state = { guide, revision: revision + 1 };
+      // 删除也保留版本，阻止旧草稿在删除后重新覆盖参考线。
+      this.db.prepare(`INSERT INTO recognition_panorama_guides (taskId, guide, revision) VALUES (?, ?, ?)
+        ON CONFLICT(taskId) DO UPDATE SET guide = excluded.guide, revision = excluded.revision`)
+        .run(id, JSON.stringify(guide), state.revision);
+      return state;
+    });
   }
 
   updateRecognitionTask(id, changes) {

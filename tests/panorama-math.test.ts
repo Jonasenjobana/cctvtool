@@ -4,7 +4,7 @@ import { createLocalRigRotation } from '#camera-rotation';
 import { blendPanoramaFrame, createPanoramaFrame, createPanoramaPlan, extendHorizonLine, imagePointToPanoramaPoint,
   movePanoramaEndpoint, panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel,
   projectImageLine, projectPanoramaGuide, projectPanoramaLine,
-  samplePanoramaGuide } from '../src/app/panorama-math.ts';
+  samplePanoramaGuide, addPanoramaGuideNode, removePanoramaGuideNode } from '../src/app/panorama-math.ts';
 import type { PanoramaImage, PanoramaPlan } from '../src/app/panorama-math.ts';
 import type { Snapshot } from '../src/app/models.ts';
 import type { PanoramaGuide } from '../shared/panorama-guide.ts';
@@ -111,6 +111,55 @@ test('直线与二次弧线按展开方位采样，控制点决定实际弯曲�
   const curve = samplePanoramaGuide({ kind: 'quadratic', points: [start, control, end] }, 2);
   assert.deepEqual(line, [start, { heading: radians(360), elevation: 0 }, end]);
   assert.deepEqual(curve, [start, { heading: radians(360), elevation: 0.2 }, end]);
+});
+
+test('弧线增加节点时保持原形状，每段有独立控制点，删除新增节点可恢复原弧线', () => {
+  const original: PanoramaGuide = { kind: 'quadratic', points: [
+    { heading: 0, elevation: 0 }, { heading: 2, elevation: 2 }, { heading: 4, elevation: 0 },
+  ] };
+  const before = JSON.stringify(original);
+  const expanded = addPanoramaGuideNode(original, 0);
+  assert.deepEqual(expanded, { kind: 'bezier', points: [
+    { heading: 0, elevation: 0 }, { heading: 1, elevation: 1 }, { heading: 2, elevation: 1 },
+    { heading: 3, elevation: 1 }, { heading: 4, elevation: 0 },
+  ] });
+  assert.deepEqual(samplePanoramaGuide(expanded, 4), samplePanoramaGuide(original, 8));
+  const edited = structuredClone(expanded);
+  edited.points[1].elevation = 3;
+  assert.deepEqual(samplePanoramaGuide(edited, 4).slice(4), samplePanoramaGuide(expanded, 4).slice(4));
+  assert.deepEqual(removePanoramaGuideNode(expanded, 2), original);
+  assert.equal(JSON.stringify(original), before);
+});
+
+test('多段贝塞尔跨正北映射时保留每段曲率，只裁切当前截图内的片段', () => {
+  const shot = snapshot(0, 0);
+  shot.ptz.raw.HorizontalFieldAngle = shot.ptz.raw.VerticalFieldAngle = 90;
+  const guide: PanoramaGuide = { kind: 'bezier', points: [
+    { heading: -Math.PI / 2, elevation: 0 }, { heading: -Math.PI / 4, elevation: 0.4 },
+    { heading: 0, elevation: 0 }, { heading: Math.PI / 4, elevation: -0.4 },
+    { heading: Math.PI / 2, elevation: 0 },
+  ] };
+  const fragments = projectPanoramaGuide(createPanoramaFrame(shot), guide);
+  assert.equal(fragments.length, 2);
+  assert.ok(Math.abs(fragments[0][0].x) < 1e-12);
+  assert.ok(Math.abs(fragments[0].at(-1)!.x - 0.5) < 1e-12);
+  assert.ok(Math.abs(fragments[1][0].x - 0.5) < 1e-12);
+  assert.ok(Math.abs(fragments[1].at(-1)!.x - 1) < 1e-12);
+  assert.ok(fragments[0].some((point) => point.y < 0.49));
+  assert.ok(fragments[1].some((point) => point.y > 0.51));
+  assert.ok(fragments.flat().every((point) => point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1));
+});
+
+test('增删弧线节点保留端点，限制复杂度且拒绝无效节点选择', () => {
+  const guide: PanoramaGuide = { kind: 'bezier', points: Array.from({ length: 65 }, (_, index) => ({ heading: index / 16, elevation: 0 })) };
+  assert.throws(() => addPanoramaGuideNode(guide, 0), /最多/);
+  assert.throws(() => removePanoramaGuideNode(guide, 0), /连接节点/);
+  assert.throws(() => removePanoramaGuideNode(guide, 64), /连接节点/);
+  assert.throws(() => removePanoramaGuideNode(guide, 1), /连接节点/);
+  const reduced = removePanoramaGuideNode(guide, 2);
+  assert.equal(reduced.points.length, 63);
+  assert.deepEqual(reduced.points[0], guide.points[0]);
+  assert.deepEqual(reduced.points.at(-1), guide.points.at(-1));
 });
 
 test('邻图参照按各自 T、FOV 和 Roll 映射，原始端点在画面外仍保留裁切参考线', () => {

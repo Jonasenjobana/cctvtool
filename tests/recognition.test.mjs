@@ -101,6 +101,33 @@ test('全景参考线独立保存并在重启后恢复，不改变正式标注�
   assert.deepEqual((await f.app.inject('/api/cameras')).json(), appliedCamera);
 });
 
+test('多控制点贝塞尔参考线可保存和重启恢复，点数边界不影响已保存结果', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const url = `/api/recognition-tasks/${task.id}/panorama-guide`;
+  const guide = { kind: 'bezier', points: [
+    { heading: 6.1, elevation: 0 }, { heading: 6.2, elevation: 0.02 },
+    { heading: 6.3, elevation: 0 }, { heading: 6.4, elevation: -0.01 },
+    { heading: 6.5, elevation: 0 },
+  ] };
+  const before = (await f.app.inject(`/api/recognition-tasks/${task.id}`)).json();
+  const saved = await f.app.inject({ method: 'PUT', url, payload: { guide, revision: 0 } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.deepEqual(saved.json(), { guide, revision: 1 });
+  await f.app.close();
+  f.app = await createApp(f.options);
+  assert.deepEqual((await f.app.inject(url)).json(), { guide, revision: 1 });
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${task.id}`)).json(), before);
+  for (const length of [3, 4, 6, 67]) {
+    const invalid = { kind: 'bezier', points: Array.from({ length }, (_, index) => ({ heading: index / 20, elevation: 0 })) };
+    const response = await f.app.inject({ method: 'PUT', url, payload: { guide: invalid, revision: 1 } });
+    assert.equal(response.statusCode, 400, `点数 ${length}：${response.body}`);
+  }
+  assert.deepEqual((await f.app.inject(url)).json(), { guide, revision: 1 });
+  const maximum = { kind: 'bezier', points: Array.from({ length: 65 }, (_, index) => ({ heading: index / 20, elevation: 0 })) };
+  assert.equal((await f.app.inject({ method: 'PUT', url, payload: { guide: maximum, revision: 1 } })).statusCode, 200);
+});
+
 test('全景参考线拒绝非法形状和非有限坐标，失败不产生参考线版本', async (t) => {
   const f = await fixture(t);
   const task = await createAndWait(f);

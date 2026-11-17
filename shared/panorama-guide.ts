@@ -6,7 +6,9 @@ export interface PanoramaGuidePoint {
 
 export type PanoramaGuide =
   | { kind: 'line'; points: [PanoramaGuidePoint, PanoramaGuidePoint] }
-  | { kind: 'quadratic'; points: [PanoramaGuidePoint, PanoramaGuidePoint, PanoramaGuidePoint] };
+  | { kind: 'quadratic'; points: [PanoramaGuidePoint, PanoramaGuidePoint, PanoramaGuidePoint] }
+  // 分段二次贝塞尔按起点、控制点、连接节点、控制点、终点交替排列。
+  | { kind: 'bezier'; points: PanoramaGuidePoint[] };
 
 export interface PanoramaGuideState {
   guide: PanoramaGuide | null;

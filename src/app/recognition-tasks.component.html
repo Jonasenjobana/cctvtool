@@ -92,7 +92,10 @@
                         }
                       }
                       @if (showGuide()) {
-                        @if (panoramaGuide(); as reference) { <polyline class="guide-line" [attr.points]="reference.points" /> }
+                        @if (panoramaGuide(); as reference) {
+                          @if (!panoramaFocused() && !guideDrawing()) { <polyline class="guide-controls" [attr.points]="reference.controlPolygon" /> }
+                          <polyline class="guide-line" [attr.points]="reference.points" />
+                        }
                       }
                       @if (panoramaOutline(); as outline) { <polygon class="panorama-focus" [attr.points]="outline" /> }
                     </svg>
@@ -111,11 +114,11 @@
                     @if (showGuide() && !panoramaFocused() && !guideDrawing()) {
                       @if (panoramaGuide(); as reference) {
                         @for (point of reference.controls; track $index; let index = $index) {
-                          <button type="button" class="guide-handle" [class.curve-control]="guide()?.kind === 'quadratic' && index === 1"
-                            [attr.aria-label]="index === 0 ? '参考线起点' : guide()?.kind === 'quadratic' && index === 1 ? '参考线弯曲控制点' : '参考线终点'"
+                          <button type="button" class="guide-handle" [class.curve-control]="isGuideControl(index)"
+                            [class.active]="activeGuidePoint() === index" [attr.aria-label]="guidePointLabel(index)" [attr.title]="guidePointLabel(index)"
                             [style.left.%]="point.x / image.width * 100" [style.top.%]="point.y / image.height * 100"
                             [disabled]="!guideInitialized() || busy() || loading() || running() || generatingPanorama()"
-                            (pointerdown)="startGuidePointDrag($event, index)"></button>
+                            (focus)="activeGuidePoint.set(index)" (pointerdown)="startGuidePointDrag($event, index)"></button>
                         }
                       }
                     }
@@ -149,6 +152,8 @@
               <div class="actions">
                 <button type="button" [disabled]="!panorama()" [attr.aria-pressed]="guideDrawing() === 'line'" (click)="beginGuide('line')">{{ guide() ? '重画直线' : '画直线' }}</button>
                 <button type="button" [disabled]="!panorama()" [attr.aria-pressed]="guideDrawing() === 'quadratic'" (click)="beginGuide('quadratic')">{{ guide() ? '重画弧线' : '画弧线' }}</button>
+                <button type="button" [disabled]="!panorama() || guideDrawing() !== null || !canAddGuideNode()" (click)="addGuideNode()">添加节点</button>
+                <button type="button" [disabled]="!panorama() || guideDrawing() !== null || !canRemoveGuideNode()" (click)="removeGuideNode()">删除选中节点</button>
                 @if (guideDrawing()) { <button type="button" (click)="cancelGuideDrawing()">取消绘线</button> }
                 <button type="button" [disabled]="!guideDirty()" (click)="undoGuide()">撤销参考线</button>
                 <button type="button" class="primary" [disabled]="!guideDirty() || guideValidation() !== ''" (click)="saveGuide()">保存参考线</button>

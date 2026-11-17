@@ -125,11 +125,56 @@ export function panoramaGuideHeadingOffset(plan: PanoramaPlan, guide: PanoramaGu
   return (Math.round((planCenter - guideCenter) / (2 * Math.PI)) || 0) * 2 * Math.PI;
 }
 
-export function samplePanoramaGuide(guide: PanoramaGuide, segments = 128): PanoramaGuidePoint[] {
-  return Array.from({ length: segments + 1 }, (_, index) => guidePointAt(guide, index / segments));
+// 每段独立采样，最多 32 段，避免拖动时产生过多投影片段。
+export const panoramaGuidePointLimit = 65;
+type PanoramaGuideSegment = Exclude<PanoramaGuide, { kind: 'bezier' }>;
+
+export function addPanoramaGuideNode(guide: PanoramaGuide, segment: number): PanoramaGuide {
+  if (guide.kind === 'line') throw new Error('请先绘制弧线');
+  if (guide.points.length >= panoramaGuidePointLimit) throw new Error('弧线最多支持 32 段');
+  if (!Number.isInteger(segment) || segment < 0 || segment >= (guide.points.length - 1) / 2) throw new Error('请选择有效的弧线段');
+  const points = guide.points.map((point) => ({ ...point }));
+  const index = segment * 2, start = points[index], control = points[index + 1], end = points[index + 2];
+  const middle = (left: PanoramaGuidePoint, right: PanoramaGuidePoint) => ({
+    heading: (left.heading + right.heading) / 2, elevation: (left.elevation + right.elevation) / 2,
+  });
+  const left = middle(start, control), right = middle(control, end);
+  // de Casteljau 对半拆分保留原曲线，新增节点只增加局部编辑自由度。
+  points.splice(index, 3, start, left, middle(left, right), right, end);
+  return { kind: 'bezier', points };
 }
 
-function guidePointAt(guide: PanoramaGuide, t: number): PanoramaGuidePoint {
+export function removePanoramaGuideNode(guide: PanoramaGuide, index: number): PanoramaGuide {
+  if (guide.kind !== 'bezier' || !Number.isInteger(index) || index % 2 !== 0 || index <= 0 || index >= guide.points.length - 1) {
+    throw new Error('请选择弧线内部的连接节点');
+  }
+  const points = guide.points.map((point) => ({ ...point }));
+  const start = points[index - 2], left = points[index - 1], right = points[index + 1], end = points[index + 2];
+  const control = { heading: left.heading + right.heading - (start.heading + end.heading) / 2,
+    elevation: left.elevation + right.elevation - (start.elevation + end.elevation) / 2 };
+  points.splice(index - 1, 3, control);
+  const remaining = points.filter((_, position) => position !== index - 1).map((point) => point.heading);
+  const turn = 2 * Math.PI, margin = 4 * Number.EPSILON * Math.max(turn, ...remaining.map(Math.abs));
+  // 合并已调整的两段可能把控制点推到一周之外，只约束新增控制点，保留其余点位。
+  control.heading = Math.max(Math.max(...remaining) - turn + margin, Math.min(Math.min(...remaining) + turn - margin, control.heading));
+  return points.length === 3 ? { kind: 'quadratic', points: [points[0], points[1], points[2]] } : { kind: 'bezier', points };
+}
+
+function panoramaGuideSegments(guide: PanoramaGuide): PanoramaGuideSegment[] {
+  if (guide.kind !== 'bezier') return [guide];
+  const result: PanoramaGuideSegment[] = [];
+  for (let index = 0; index < guide.points.length - 2; index += 2) {
+    result.push({ kind: 'quadratic', points: [guide.points[index], guide.points[index + 1], guide.points[index + 2]] });
+  }
+  return result;
+}
+
+export function samplePanoramaGuide(guide: PanoramaGuide, segments = 128): PanoramaGuidePoint[] {
+  return panoramaGuideSegments(guide).flatMap((part, partIndex) =>
+    Array.from({ length: segments + 1 }, (_, index) => guidePointAt(part, index / segments)).slice(partIndex ? 1 : 0));
+}
+
+function guidePointAt(guide: PanoramaGuideSegment, t: number): PanoramaGuidePoint {
   const remaining = 1 - t;
   const start = guide.points[0], end = guide.points[guide.points.length - 1];
   if (guide.kind === 'line') return { heading: remaining * start.heading + t * end.heading,
@@ -140,6 +185,10 @@ function guidePointAt(guide: PanoramaGuide, t: number): PanoramaGuidePoint {
 }
 
 export function projectPanoramaGuide(frame: PanoramaFrame, guide: PanoramaGuide): HorizonPoint[][] {
+  return panoramaGuideSegments(guide).flatMap((part) => projectPanoramaGuideSegment(frame, part));
+}
+
+function projectPanoramaGuideSegment(frame: PanoramaFrame, guide: PanoramaGuideSegment): HorizonPoint[][] {
   const first = guide.points[0].heading, last = guide.points[guide.points.length - 1].heading;
   const control = guide.kind === 'quadratic' ? guide.points[1].heading : (first + last) / 2;
   const a = (last - control) - (control - first), b = 2 * (control - first);

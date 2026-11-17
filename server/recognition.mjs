@@ -211,9 +211,9 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   const bodyWithRevision = { type: 'object', additionalProperties: false, required: ['revision'], properties: { revision: revisionSchema } };
   const guidePoint = { type: 'object', additionalProperties: false, required: ['heading', 'elevation'],
     properties: { heading: { type: 'number' }, elevation: { type: 'number' } } };
-  const guideSchema = { anyOf: [{ type: 'null' }, ...[['line', 2], ['quadratic', 3]].map(([kind, count]) => ({
+  const guideSchema = { anyOf: [{ type: 'null' }, ...[['line', 2, 2], ['quadratic', 3, 3], ['bezier', 5, 65]].map(([kind, minimum, maximum]) => ({
     type: 'object', additionalProperties: false, required: ['kind', 'points'], properties: {
-      kind: { type: 'string', const: kind }, points: { type: 'array', minItems: count, maxItems: count, items: guidePoint },
+      kind: { type: 'string', const: kind }, points: { type: 'array', minItems: minimum, maxItems: maximum, items: guidePoint },
     },
   }))] };
   const paging = { type: 'object', additionalProperties: false, properties: {
@@ -238,6 +238,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     if (activeStatuses.includes(task.status)) throw httpError(409, '请等待识别结束或取消后再编辑');
     const { guide, revision } = request.body;
     if (guide) {
+      if (guide.kind === 'bezier' && guide.points.length % 2 !== 1) throw httpError(400, '分段贝塞尔需要交替排列控制点与连接节点');
       if (guide.points.some((point) => !Number.isFinite(point.heading) || !Number.isFinite(point.elevation))) {
         throw httpError(400, '全景参考线坐标必须为有限数值');
       }

@@ -5,9 +5,9 @@ import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
 import type { Camera, HorizonPoint, RecognitionItem, RecognitionTask, SnapshotGroup } from './models';
-import { createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
+import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
-  projectPanoramaGuide, projectPanoramaLine, samplePanoramaGuide } from './panorama-math';
+  panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
 import type { PanoramaFrame, PanoramaPlan } from './panorama-math';
 import { renderTaskPanorama, renderTaskPanoramaFrame } from './task-panorama';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
@@ -53,9 +53,21 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly guideDirty = signal(false);
   readonly guideInitialized = signal(false);
   readonly guideError = signal('');
+  readonly activeGuidePoint = signal(1);
+  readonly canAddGuideNode = computed(() => {
+    const guide = this.guide();
+    return !!guide && guide.kind !== 'line' && guide.points.length < panoramaGuidePointLimit;
+  });
+  readonly canRemoveGuideNode = computed(() => {
+    const guide = this.guide(), index = this.activeGuidePoint();
+    return guide?.kind === 'bezier' && index > 0 && index < guide.points.length - 1 && index % 2 === 0;
+  });
   readonly guideValidation = computed(() => {
     const guide = this.guide();
-    return guide && Math.abs(guide.points[0].heading - guide.points[guide.points.length - 1].heading) <= 1e-9
+    if (!guide) return '';
+    const headings = guide.points.map((point) => point.heading);
+    if (Math.max(...headings) - Math.min(...headings) > 2 * Math.PI) return '参考线的全部节点和控制点不能超过一周方位';
+    return Math.abs(guide.points[0].heading - guide.points[guide.points.length - 1].heading) <= 1e-9
       ? '参考线没有有效方位跨度，请调整起点或终点' : '';
   });
   readonly guideDrawing = signal<'line' | 'quadratic' | null>(null);
@@ -114,8 +126,9 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     const offset = this.guideHeadingOffset() ?? panoramaGuideHeadingOffset(image.plan, guide);
     const pixel = (point: PanoramaGuidePoint) => panoramaPointToPixel(image.plan, { ...point, heading: point.heading + offset });
     const points = samplePanoramaGuide(guide).map(pixel);
-    return { points: points.map((point) => `${point.x},${point.y}`).join(' '),
-      controls: guide.points.map(pixel) };
+    const controls = guide.points.map(pixel);
+    return { points: points.map((point) => `${point.x},${point.y}`).join(' '), controls,
+      controlPolygon: controls.map((point) => `${point.x},${point.y}`).join(' ') };
   });
   readonly activePanoramaEndpoint = signal(0);
   readonly panoramaLines = computed(() => {
@@ -159,7 +172,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   private focusedImageController?: AbortController;
   private readonly guideHeadingOffset = signal<number | null>(null);
   private guideDrag: { pointerId: number; stage: HTMLElement; index: number | null;
-    start: { x: number; y: number }; kind: 'line' | 'quadratic'; headingOffset: number } | null = null;
+    start: { x: number; y: number }; kind: PanoramaGuide['kind']; headingOffset: number } | null = null;
   private panoramaDrag: { pointerId: number; index: number; stage: HTMLElement; frame: PanoramaFrame;
     points: HorizonPoint[]; startY: number; lastY: number } | null = null;
 
@@ -412,7 +425,46 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   undoGuide() {
     this.cancelGuideDrawing();
     this.guide.set(structuredClone(this.savedGuide));
+    this.activeGuidePoint.set(1);
     this.guideDirty.set(false);
+  }
+
+  isGuideControl(index: number) { return this.guide()?.kind !== 'line' && index % 2 === 1; }
+
+  guidePointLabel(index: number) {
+    if (index === 0) return '参考线起点';
+    if (index === (this.guide()?.points.length ?? 0) - 1) return '参考线终点';
+    return this.isGuideControl(index) ? `弯曲控制点 ${(index + 1) / 2}` : `连接节点 ${index / 2}`;
+  }
+
+  addGuideNode() {
+    const guide = this.guide();
+    if (!guide || !this.canAddGuideNode() || !this.guideInitialized() || !this.panorama()
+      || this.busy() || this.loading() || this.running() || this.generatingPanorama() || this.guideDrawing()) return;
+    this.cancelGuideDrawing();
+    const segment = Math.min((guide.points.length - 3) / 2, Math.max(0, Math.floor((this.activeGuidePoint() - 1) / 2)));
+    this.setGuideDraft(addPanoramaGuideNode(guide, segment));
+    this.activeGuidePoint.set(segment * 2 + 2);
+    this.showGuide.set(true);
+    this.showOverview();
+  }
+
+  removeGuideNode() {
+    const guide = this.guide(), index = this.activeGuidePoint();
+    if (!guide || !this.canRemoveGuideNode() || !this.guideInitialized() || !this.panorama()
+      || this.busy() || this.loading() || this.running() || this.generatingPanorama() || this.guideDrawing()) return;
+    this.cancelGuideDrawing();
+    const reduced = removePanoramaGuideNode(guide, index), image = this.panorama()!;
+    const offset = panoramaGuideHeadingOffset(image.plan, reduced), control = reduced.points[index - 1];
+    const pixel = panoramaPointToPixel(image.plan, { ...control, heading: control.heading + offset });
+    // 合并后的控制点可能越出画布，把新控制点留在可拖动范围内。
+    const visible = panoramaPixelToPoint(image.plan, { x: Math.max(0, Math.min(image.width, pixel.x)),
+      y: Math.max(0, Math.min(image.height, pixel.y)) });
+    reduced.points[index - 1] = { ...visible, heading: visible.heading - offset };
+    this.setGuideDraft(reduced);
+    this.activeGuidePoint.set(index - 1);
+    this.showGuide.set(true);
+    this.showOverview();
   }
 
   deleteGuide() {
@@ -423,6 +475,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   private setGuideDraft(guide: PanoramaGuide | null) {
     this.guide.set(guide);
+    if (!guide || this.activeGuidePoint() >= guide.points.length) this.activeGuidePoint.set(1);
     this.guideDirty.set(JSON.stringify(guide) !== JSON.stringify(this.savedGuide));
     this.message.set('');
   }
@@ -458,6 +511,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (!start) return;
     event.preventDefault();
     event.stopPropagation();
+    this.activeGuidePoint.set(index);
     this.guideDrag = { pointerId: event.pointerId, stage, index, start, kind: guide.kind,
       headingOffset: panoramaGuideHeadingOffset(image.plan, guide) };
     this.guideHeadingOffset.set(this.guideDrag.headingOffset);

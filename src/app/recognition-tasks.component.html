@@ -1,6 +1,6 @@
 <header class="heading">
   <div class="page-title"><app-icon name="horizon" /><h1>海天线识别任务</h1></div>
-  <button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama()" (click)="refresh()"><app-icon name="refresh" />刷新</button>
+  <button type="button" [disabled]="busy() || loading() || hasDraft() || generatingPanorama()" (click)="refresh()"><app-icon name="refresh" />刷新</button>
 </header>
 @if (problem()) { <p class="error page-feedback" role="alert">{{ problem() }}</p> }
 @if (message()) { <p class="message page-feedback" role="status">{{ message() }}</p> }
@@ -50,6 +50,10 @@
               <figure class="panorama-preview">
                 <figcaption><span>{{ image.count }} 张 · {{ image.width }} × {{ image.height }}@if (image.missing) { · 已删除 {{ image.missing }} 张 }</span>
                   <div class="actions">
+                    <button type="button" [attr.aria-pressed]="!panoramaFocused()" (click)="showOverview()">全景总览</button>
+                    <button type="button" [attr.aria-pressed]="panoramaFocused()" [disabled]="!item() || item()?.missing || guideDrawing() !== null" (click)="showFocusedPanorama()">编辑当前图</button>
+                    <button type="button" [disabled]="busy() || loading() || guideDrawing() !== null || !navigation().previous" (click)="navigate('previous')">上一张</button>
+                    <button type="button" [disabled]="busy() || loading() || guideDrawing() !== null || !navigation().next" (click)="navigate('next')">下一张</button>
                     @if (dirty()) { <span class="panorama-unsaved">未保存</span> }
                     <button type="button" [disabled]="busy() || loading() || running() || !dirty()" (click)="undo()">撤销修改</button>
                     <button type="button" class="primary" [disabled]="busy() || loading() || running() || !dirty()" (click)="save()">保存标注</button>
@@ -59,58 +63,106 @@
                 <div #panoramaViewport class="panorama-viewport" tabindex="0" role="region" aria-label="全景图片，左右方向键选择端点，上下方向键微调"
                   aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown Control+s Meta+s"
                   (click)="focusPanorama()" (keydown)="panoramaKeydown($event)">
-                  <div class="panorama-stage" [style.width.px]="panoramaExpanded() ? image.width * (image.height > 360 ? 360 / image.height : 1) : null"
-                    (pointermove)="dragPanorama($event)" (pointerup)="endPanoramaDrag($event)" (pointercancel)="endPanoramaDrag($event)" (lostpointercapture)="endPanoramaDrag($event)">
+                  <div class="panorama-stage" [class.focused]="panoramaFocused()" [class.drawing]="guideDrawing() !== null"
+                    [style.width.px]="panoramaExpanded() ? image.width * (image.height > 360 ? 360 / image.height : 1) : null"
+                    (pointerdown)="startGuideDraw($event)" (pointermove)="dragPanorama($event); dragGuide($event)"
+                    (pointerup)="endPanoramaDrag($event); endGuideDrag($event)"
+                    (pointercancel)="endPanoramaDrag($event); endGuideDrag($event, false)"
+                    (lostpointercapture)="endPanoramaDrag($event); endGuideDrag($event, false)">
                     <img [src]="image.url" alt="识别任务全部现存截图拼接的全景图" (load)="focusPanorama()">
-                    @if (showPanoramaLines()) {
-                      <svg [attr.viewBox]="'0 0 ' + image.width + ' ' + image.height" aria-label="各图当前海天线，点击线段选择对应截图">
-                        @if (panoramaOutline(); as outline) {
-                          <defs><clipPath id="recognition-panorama-focus" clipPathUnits="userSpaceOnUse">
-                            <path [attr.d]="panoramaFocusClip()" clip-rule="evenodd" />
-                          </clipPath></defs>
-                          <polygon class="panorama-focus" [attr.points]="outline" />
-                        }
+                    @if (panoramaFocused()) {
+                      @if (focusedImage(); as currentImage) {
+                        @if (currentImage.snapshotId === selectedItemId()) { <img class="focused-snapshot" [src]="currentImage.url" alt="当前截图的不透明全景投影"> }
+                      }
+                    }
+                    <svg [attr.viewBox]="'0 0 ' + image.width + ' ' + image.height" aria-label="各图海天线与全景参考线">
+                      @if (showPanoramaLines()) {
                         @for (line of panoramaLines(); track line.snapshotId) {
-                          <g [class.ignored]="line.ignored" [class.current]="selectedItemId() === line.snapshotId" role="button" tabindex="0"
-                            [attr.clip-path]="line.snapshotId !== selectedItemId() && panoramaOutline() ? 'url(#recognition-panorama-focus)' : null"
-                            [attr.aria-label]="'复核 P ' + line.pan + '° 截图' + (line.ignored ? '，已忽略' : '')"
-                            (click)="openPanoramaItem(line.snapshotId)" (keydown.enter)="openPanoramaItem(line.snapshotId)"
-                            (keydown.space)="$event.preventDefault(); openPanoramaItem(line.snapshotId)">
-                            <title>P {{ line.pan | number:'1.1-2' }}° · {{ line.ignored ? '已忽略' : '参与计算' }}</title>
-                            <polyline class="panorama-hit" [attr.points]="line.points" />
-                            <polyline class="panorama-line" [attr.points]="line.points" />
-                          </g>
+                          @if (!panoramaFocused() || selectedItemId() === line.snapshotId) {
+                            <g [class.ignored]="line.ignored" [class.current]="selectedItemId() === line.snapshotId" role="button"
+                              [attr.tabindex]="guideDrawing() ? null : 0"
+                              [attr.aria-label]="'复核 P ' + line.pan + '° 截图' + (line.ignored ? '，已忽略' : '')"
+                              (click)="openPanoramaItem(line.snapshotId)" (keydown.enter)="openPanoramaItem(line.snapshotId)"
+                              (keydown.space)="$event.preventDefault(); openPanoramaItem(line.snapshotId)">
+                              <title>P {{ line.pan | number:'1.1-2' }}° · {{ line.ignored ? '已忽略' : '参与计算' }}</title>
+                              <polyline class="panorama-hit" [attr.points]="line.points" />
+                              <polyline class="panorama-line" [attr.points]="line.points" />
+                            </g>
+                          }
                         }
-                      </svg>
+                      }
+                      @if (showGuide()) {
+                        @if (panoramaGuide(); as reference) { <polyline class="guide-line" [attr.points]="reference.points" /> }
+                      }
+                      @if (panoramaOutline(); as outline) { <polygon class="panorama-focus" [attr.points]="outline" /> }
+                    </svg>
+                    @if (showPanoramaLines() && panoramaFocused()) {
                       @if (focusedPanoramaLine(); as line) {
                         @for (point of line.endpoints; track $index; let index = $index) {
                           <button type="button" class="panorama-handle" [class.active]="activePanoramaEndpoint() === index" [attr.data-panorama-endpoint]="index"
                             role="slider" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="1"
                             [attr.aria-label]="'P ' + line.pan + '° 截图' + (index === 0 ? '左端点' : '右端点')"
                             [attr.aria-valuenow]="line.sourcePoints[index].y" [style.left.%]="point.x / image.width * 100" [style.top.%]="point.y / image.height * 100"
-                            [disabled]="busy() || loading() || running() || generatingPanorama() || item()?.missing"
+                            [disabled]="busy() || loading() || running() || generatingPanorama() || item()?.missing || focusedImage()?.snapshotId !== selectedItemId()"
                             (focus)="activePanoramaEndpoint.set(index)" (pointerdown)="startPanoramaDrag($event, index)"></button>
+                        }
+                      }
+                    }
+                    @if (showGuide() && !panoramaFocused() && !guideDrawing()) {
+                      @if (panoramaGuide(); as reference) {
+                        @for (point of reference.controls; track $index; let index = $index) {
+                          <button type="button" class="guide-handle" [class.curve-control]="guide()?.kind === 'quadratic' && index === 1"
+                            [attr.aria-label]="index === 0 ? '参考线起点' : guide()?.kind === 'quadratic' && index === 1 ? '参考线弯曲控制点' : '参考线终点'"
+                            [style.left.%]="point.x / image.width * 100" [style.top.%]="point.y / image.height * 100"
+                            [disabled]="!guideInitialized() || busy() || loading() || running() || generatingPanorama()"
+                            (pointerdown)="startGuidePointDrag($event, index)"></button>
                         }
                       }
                     }
                   </div>
                 </div>
               </figure>
+              @if (loadingFocusedImage()) { <p class="panorama-loading" role="status">正在读取当前截图投影…</p> }
+              @if (focusedImageError()) {
+                <p class="error" role="alert">{{ focusedImageError() }} <button type="button" [disabled]="busy() || loading()" (click)="showFocusedPanorama()">重试当前图</button></p>
+              }
               <div class="legend panorama-legend"><label><input type="checkbox" [ngModel]="showPanoramaLines()" (ngModelChange)="endPanoramaDrag(); showPanoramaLines.set($event)">显示标注</label><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span><span><i class="ignored-swatch" aria-hidden="true"></i>已忽略</span>
-                @if (focusedPanoramaLine(); as line) {
-                  <span class="panorama-selection">聚焦 P {{ line.pan | number:'1.1-2' }}°</span>
+                @if (panoramaFocused() && item(); as entry) {
+                  <span class="panorama-selection">聚焦 P {{ entry.snapshot.ptz.raw.Pan | number:'1.1-2' }}°</span>
+                }
+                @if (panoramaFocused() && focusedPanoramaLine()) {
                   <div class="panorama-endpoints" role="group" aria-label="键盘微调端点">
                     <button type="button" [class.active]="activePanoramaEndpoint() === 0" [attr.aria-pressed]="activePanoramaEndpoint() === 0"
-                      [disabled]="busy() || loading() || running() || generatingPanorama() || !showPanoramaLines()" (click)="focusPanorama(0)">左端点</button>
+                      [disabled]="busy() || loading() || running() || generatingPanorama() || !showPanoramaLines() || focusedImage()?.snapshotId !== selectedItemId()" (click)="focusPanorama(0)">左端点</button>
                     <button type="button" [class.active]="activePanoramaEndpoint() === 1" [attr.aria-pressed]="activePanoramaEndpoint() === 1"
-                      [disabled]="busy() || loading() || running() || generatingPanorama() || !showPanoramaLines()" (click)="focusPanorama(1)">右端点</button>
+                      [disabled]="busy() || loading() || running() || generatingPanorama() || !showPanoramaLines() || focusedImage()?.snapshotId !== selectedItemId()" (click)="focusPanorama(1)">右端点</button>
                   </div>
                 }
               </div>
             }
+            <div class="guide-heading"><h4>全景参考线@if (guideDirty()) { <span class="panorama-unsaved"> · 未保存</span> }</h4>
+              <button type="button" [disabled]="busy() || loading() || guideDirty()" (click)="reloadGuide()">重新读取</button>
+            </div>
+            @if (guideError()) { <p class="error" role="alert">{{ guideError() }}</p> }
+            @if (guideValidation()) { <p class="error" role="alert">{{ guideValidation() }}</p> }
+            <fieldset class="guide-tools" [disabled]="!guideInitialized() || busy() || loading() || running() || generatingPanorama()">
+              <div class="actions">
+                <button type="button" [disabled]="!panorama()" [attr.aria-pressed]="guideDrawing() === 'line'" (click)="beginGuide('line')">{{ guide() ? '重画直线' : '画直线' }}</button>
+                <button type="button" [disabled]="!panorama()" [attr.aria-pressed]="guideDrawing() === 'quadratic'" (click)="beginGuide('quadratic')">{{ guide() ? '重画弧线' : '画弧线' }}</button>
+                @if (guideDrawing()) { <button type="button" (click)="cancelGuideDrawing()">取消绘线</button> }
+                <button type="button" [disabled]="!guideDirty()" (click)="undoGuide()">撤销参考线</button>
+                <button type="button" class="primary" [disabled]="!guideDirty() || guideValidation() !== ''" (click)="saveGuide()">保存参考线</button>
+                <button type="button" [disabled]="!guide()" (click)="deleteGuide()">删除参考线</button>
+                <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)">显示参考线</label>
+              </div>
+            </fieldset>
           </section>
           <section class="editor" aria-label="海天线编辑">
             <div class="section-heading"><h3>海天线复核</h3>
+              <div class="actions">
+                <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().previous" (click)="navigate('previous')">上一张</button>
+                <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().next" (click)="navigate('next')">下一张</button>
+              </div>
               @if (item(); as entry) { <span class="annotation-source" [class.unsaved]="dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ dirty() ? ' · 未保存' : '' }}</span> }
             </div>
             @if (item(); as entry) {
@@ -118,9 +170,28 @@
               @if (entry.missing) { <p class="error">原图已删除，重新生成数据时会排除此图。</p> }
               @else {
                 <div class="annotation" [style.aspect-ratio]="entry.snapshot.width + ' / ' + entry.snapshot.height">
-                  <img [src]="entry.snapshot.imageUrl" alt="拖动红色标注端点调整海天线">
+                  @for (source of [entry]; track source.snapshotId) {
+                    <img [src]="source.snapshot.imageUrl" [class.ready]="singleImageId() === source.snapshotId" alt="当前复核原图"
+                      (load)="imageLoaded(source.snapshotId)" (error)="imageFailed(source.snapshotId)">
+                  }
+                  @if (singleImageId() !== entry.snapshotId) {
+                    <div class="annotation-feedback" [class.error]="singleImageError()" [attr.role]="singleImageError() ? 'alert' : 'status'">{{ singleImageError() || '正在读取当前原图…' }}</div>
+                  }
                   <svg [attr.viewBox]="'0 0 ' + entry.snapshot.width + ' ' + entry.snapshot.height" role="img" aria-label="海天线标注层，也可在下方输入归一化坐标"
                     (pointerdown)="startDrag($event)" (pointermove)="drag($event)" (pointerup)="endDrag()" (pointercancel)="endDrag()" (lostpointercapture)="endDrag()">
+                    @if (showNeighbors()) {
+                      @for (reference of neighbors(); track reference.side) {
+                        <g class="neighbor-reference" [class.previous]="reference.side === 'previous'" [class.next]="reference.side === 'next'" [class.ignored]="reference.ignored" aria-hidden="true">
+                          @for (line of reference.lines; track $index) { <polyline [attr.points]="line" /> }
+                          @for (point of reference.endpoints; track $index) {
+                            <circle [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height" [attr.r]="entry.snapshot.width / 130" />
+                          }
+                        </g>
+                      }
+                    }
+                    @if (showGuide()) {
+                      @for (line of singleGuide().lines; track $index) { <polyline class="guide-line" [attr.points]="line" /> }
+                    }
                     @if (entry.detectedPoints.length === 2) {
                       <line class="model-line" [attr.x1]="entry.detectedPoints[0].x * entry.snapshot.width" [attr.y1]="entry.detectedPoints[0].y * entry.snapshot.height"
                         [attr.x2]="entry.detectedPoints[1].x * entry.snapshot.width" [attr.y2]="entry.detectedPoints[1].y * entry.snapshot.height" />
@@ -133,8 +204,15 @@
                   </svg>
                 </div>
               }
-              <div class="legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span><span>拖动两端调整海天线</span></div>
-              <fieldset [disabled]="busy() || loading() || running() || generatingPanorama() || entry.missing">
+              <div class="legend reference-legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span>
+                <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
+                <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
+                @for (reference of neighbors(); track reference.side) {
+                  <span [class.reference-ignored]="reference.ignored"><i [class.previous-swatch]="reference.side === 'previous'" [class.next-swatch]="reference.side === 'next'" aria-hidden="true"></i>{{ reference.label }}：{{ reference.state }}</span>
+                }
+              </div>
+              @if (showGuide() && singleGuide().error) { <p class="error" role="alert">全景参考线映射失败：{{ singleGuide().error }}</p> }
+              <fieldset [disabled]="busy() || loading() || running() || generatingPanorama() || guideDrawing() !== null || entry.missing || singleImageId() !== entry.snapshotId">
                 <div class="annotation-actions">
                   <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
                   <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
@@ -161,7 +239,7 @@
             <div class="images">
               @for (entry of items(); track entry.snapshotId) {
                 <button type="button" class="image-row" [class.current]="selectedItemId() === entry.snapshotId" [class.ignored]="entry.ignored || entry.missing" [class.missing]="entry.missing"
-                  [attr.aria-current]="selectedItemId() === entry.snapshotId ? 'true' : null" [disabled]="busy() || loading()" (click)="openItem(entry)">
+                  [attr.aria-current]="selectedItemId() === entry.snapshotId ? 'true' : null" [disabled]="busy() || loading() || guideDrawing() !== null" (click)="openItem(entry)">
                   <span class="thumbnail">
                     @if (!entry.missing) { <img [src]="entry.snapshot.imageUrl" loading="lazy" alt="待复核截图"> }
                     @else { <app-icon name="image" /> }

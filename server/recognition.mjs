@@ -209,6 +209,13 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
 
   const revisionSchema = { type: 'integer', minimum: 0 };
   const bodyWithRevision = { type: 'object', additionalProperties: false, required: ['revision'], properties: { revision: revisionSchema } };
+  const guidePoint = { type: 'object', additionalProperties: false, required: ['heading', 'elevation'],
+    properties: { heading: { type: 'number' }, elevation: { type: 'number' } } };
+  const guideSchema = { anyOf: [{ type: 'null' }, ...[['line', 2], ['quadratic', 3]].map(([kind, count]) => ({
+    type: 'object', additionalProperties: false, required: ['kind', 'points'], properties: {
+      kind: { type: 'string', const: kind }, points: { type: 'array', minItems: count, maxItems: count, items: guidePoint },
+    },
+  }))] };
   const paging = { type: 'object', additionalProperties: false, properties: {
     limit: { type: 'string', pattern: '^(?:[1-9]|[1-9][0-9]|100)$' }, offset: { type: 'string', pattern: '^(?:0|[1-9][0-9]{0,8})$' },
   } };
@@ -221,6 +228,26 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   });
   app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => store.listRecognitionTasks(pageOptions(request.query)));
   app.get('/api/recognition-tasks/:id', async (request) => store.getRecognitionTask(request.params.id));
+  app.get('/api/recognition-tasks/:id/panorama-guide', async (request) => store.getRecognitionPanoramaGuide(request.params.id));
+  app.put('/api/recognition-tasks/:id/panorama-guide', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'guide'], properties: {
+      revision: { ...revisionSchema, maximum: Number.MAX_SAFE_INTEGER - 1 }, guide: guideSchema,
+    },
+  } } }, async (request) => {
+    const task = store.getRecognitionTask(request.params.id);
+    if (activeStatuses.includes(task.status)) throw httpError(409, '请等待识别结束或取消后再编辑');
+    const { guide, revision } = request.body;
+    if (guide) {
+      if (guide.points.some((point) => !Number.isFinite(point.heading) || !Number.isFinite(point.elevation))) {
+        throw httpError(400, '全景参考线坐标必须为有限数值');
+      }
+      const headings = guide.points.map((point) => point.heading);
+      if (Math.abs(headings.at(-1) - headings[0]) <= 1e-9 || Math.max(...headings) - Math.min(...headings) > 2 * Math.PI) {
+        throw httpError(400, '全景参考线起终点需要有效方位跨度，全部点的方位范围不能超过一周');
+      }
+    }
+    return store.saveRecognitionPanoramaGuide(task.id, revision, guide);
+  });
   app.get('/api/recognition-tasks/:id/items', { schema: { querystring: paging } }, async (request) => {
     const task = store.getRecognitionTask(request.params.id);
     const options = pageOptions(request.query);

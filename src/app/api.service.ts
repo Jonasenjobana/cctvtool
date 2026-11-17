@@ -5,6 +5,7 @@ import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, P
 import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
+import type { PanoramaGuide, PanoramaGuideState } from '../../shared/panorama-guide';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
@@ -122,6 +123,12 @@ export class ApiService {
   }
   recognitionTask(id: string) {
     return firstValueFrom(this.http.get<RecognitionTask>(`/api/recognition-tasks/${id}`).pipe(timeout(10000)));
+  }
+  recognitionPanoramaGuide(id: string) {
+    return firstValueFrom(this.http.get<PanoramaGuideState>(`/api/recognition-tasks/${id}/panorama-guide`).pipe(timeout(10000)));
+  }
+  savePanoramaGuide(id: string, revision: number, guide: PanoramaGuide | null) {
+    return firstValueFrom(this.http.put<PanoramaGuideState>(`/api/recognition-tasks/${id}/panorama-guide`, { revision, guide }).pipe(timeout(10000)));
   }
   recognitionItems(id: string, offset = 0) {
     return firstValueFrom(this.http.get<RecognitionItemPage>(`/api/recognition-tasks/${id}/items`, { params: { offset, limit: 100 } }).pipe(timeout(10000)));

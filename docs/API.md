@@ -46,6 +46,8 @@
 | `GET /api/recognition-tasks/:id` | 任务状态、模型进度、标注版本和计算结果 |
 | `GET /api/recognition-tasks/:id/items` | 图片与标注分页，返回 `{ task, items, total, offset, nextOffset }` |
 | `PUT /api/recognition-tasks/:id/items/:snapshotId` | 保存 `{ revision, points?, ignored? }`，返回 `{ task, item }` |
+| `GET /api/recognition-tasks/:id/panorama-guide` | 获取全景参考线及独立版本 `{ guide, revision }` |
+| `PUT /api/recognition-tasks/:id/panorama-guide` | 保存或删除 `{ guide, revision }`，返回独立版本递增后的参考线状态 |
 | `POST /api/recognition-tasks/:id/cancel` | 取消排队或运行中的本地模型识别，保留已有结果 |
 | `POST /api/recognition-tasks/:id/generate` | `{ revision }` 联合生成四项安装修正，返回任务及结果，不写设备配置 |
 | `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId }` 应用服务端保存的最新合格结果，返回 `{ task, camera }` |
@@ -214,6 +216,10 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 任务中的 `revision` 从 0 开始，任何标注或忽略状态保存都会递增并清空旧 `result`。编辑、生成、应用均需提交客户端读取的版本，不匹配返回 409；识别运行或排队中不可编辑、生成或应用。列表与图片分页支持 `limit=1..100`、`offset>=0`，默认每页 30 条。
 
 每个识别条目包含 `snapshotId`、采样元数据副本 `snapshot`、模型原始 `detectedPoints`、当前 `points`、`source=model/manual`、`ignored/ignoreReason`、原图是否已删除 `missing` 及原始检测参数 `detection`。提交的点位固定为两个 `{x,y}`，均在 0～1 内；参与计算时横向跨度至少 10%，被忽略的图片可暂存尚未满足跨度的标注。只修改忽略状态时可省略 `points`，人工点位不会覆盖模型原始输出。源记录删除后 `missing=true`，重新生成会排除此图。
+
+全景参考线通过独立的 `panorama-guide` 接口保存，不进入单图 `points`、`detectedPoints`、忽略状态或安装拟合。无参考线的旧任务返回 `{ "guide": null, "revision": 0 }`。PUT 请求和响应均为 `{ guide, revision }`；请求的 `revision` 必须等于当前参考线版本，成功后加一，`guide:null` 表示删除并同样递增版本。版本冲突返回 409，未知任务返回 404，识别排队或运行中不可修改。
+
+`guide.kind` 为 `line` 或 `quadratic`，`guide.points` 分别为两个端点，或起点、弯曲控制点、终点。每点包含有限的 `heading`（展开方位，弧度）和 `elevation`（射线垂直分量与水平长度之比），独立于全景 PNG 尺寸；起终点方位差的绝对值须大于 `1e-9` 弧度，全部点的方位最大值与最小值之差不得超过 `2π`，保留展开值。参考线保存在独立的 `recognition_panorama_guides` 表，保存不会改变识别任务的 `revision`、`updatedAt`、计算结果编号或应用状态。该能力仅保存人工复核参照，不覆盖正式标注，不触发重识别或设备控制。
 
 模型无有效点位、采样姿态变化或同组局部倾角/归一化高度突变时默认忽略。邻域、MAD 和最小门槛见 README。突变过滤只比较同一 T/Z/FOV，多点路径的 T/Z 可能逐点变化，须逐图复核不同姿态的样本。自动忽略可手动恢复，恢复前必须有合法点位。过滤不保证边界一定是真正海天线。
 

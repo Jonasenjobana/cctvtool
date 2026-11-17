@@ -265,6 +265,14 @@ function solveLinear(matrix, vector) {
   return solution.every(Number.isFinite) ? solution : null;
 }
 
+function installationConditionNumber(matrix) {
+  const inverseColumns = [0, 1, 2, 3].map((index) => solveLinear(matrix, [0, 1, 2, 3].map((column) => Number(column === index))));
+  if (!inverseColumns.every(Boolean)) return null;
+  const norm = Math.max(...matrix.map((row) => row.reduce((sum, value) => sum + Math.abs(value), 0)));
+  const inverseNorm = Math.max(...[0, 1, 2, 3].map((row) => inverseColumns.reduce((sum, column) => sum + Math.abs(column[row]), 0)));
+  return Number.isFinite(norm * inverseNorm) ? norm * inverseNorm : null;
+}
+
 function linearizeInstallation(parameters, camera, geometry, samples) {
   const values = residuals(parameters, camera, geometry, samples);
   const derivatives = parameters.map((_, axis) => {
@@ -433,13 +441,7 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
   const solution = starts.map((initial) => optimizeInstallation(initial, camera, geometry, samples)).sort((a, b) => a.cost - b.cost)[0];
   const normal = linearizeInstallation(solution.parameters, camera, geometry, samples);
   // 用未加阻尼的矩阵检查可辨识性；阻尼本身不能证明样本提供了足够约束。
-  const inverseColumns = [0, 1, 2, 3].map((index) => solveLinear(normal.matrix, [0, 1, 2, 3].map((column) => Number(column === index))));
-  let conditionNumber = null;
-  if (inverseColumns.every(Boolean)) {
-    const norm = Math.max(...normal.matrix.map((row) => row.reduce((sum, value) => sum + Math.abs(value), 0)));
-    const inverseNorm = Math.max(...[0, 1, 2, 3].map((row) => inverseColumns.reduce((sum, column) => sum + Math.abs(column[row]), 0)));
-    if (Number.isFinite(norm * inverseNorm)) conditionNumber = norm * inverseNorm;
-  }
+  const conditionNumber = installationConditionNumber(normal.matrix);
   const perSnapshot = samples.map((sample) => {
     const values = normal.values.filter((value) => value.snapshotId === sample.snapshot.id);
     return { snapshotId: sample.snapshot.id, pan: sample.ptz.Pan, tilt: sample.ptz.Tilt, zoom: sample.ptz.Zoom,
@@ -514,13 +516,7 @@ export function refineInstallation(camera, snapshots, observations, requestedRan
   // 精修只从冻结的基础结果开始；当前相机的四项修正不参与初值选择。
   const solution = optimizeInstallation(initial, camera, geometry, samples);
   const normal = linearizeInstallation(solution.parameters, camera, geometry, samples);
-  const inverseColumns = [0, 1, 2, 3].map((index) => solveLinear(normal.matrix, [0, 1, 2, 3].map((column) => Number(column === index))));
-  let conditionNumber = null;
-  if (inverseColumns.every(Boolean)) {
-    const norm = Math.max(...normal.matrix.map((row) => row.reduce((sum, value) => sum + Math.abs(value), 0)));
-    const inverseNorm = Math.max(...[0, 1, 2, 3].map((row) => inverseColumns.reduce((sum, column) => sum + Math.abs(column[row]), 0)));
-    if (Number.isFinite(norm * inverseNorm)) conditionNumber = norm * inverseNorm;
-  }
+  const conditionNumber = installationConditionNumber(normal.matrix);
   const attempted = compare(solution.parameters);
   const withinRms = (comparison) => ['overall', 'base', 'high'].every((key) => Number.isFinite(comparison[key].rmsResidualPixels)
     && comparison[key].rmsResidualPixels <= maximumRmsPixels);

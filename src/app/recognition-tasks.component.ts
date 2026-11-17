@@ -33,6 +33,10 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly items = signal<RecognitionItem[]>([]);
   readonly selectedItemId = signal('');
   readonly item = computed(() => this.items().find((item) => item.snapshotId === this.selectedItemId()) || null);
+  // 外部参与图只用于当前候选的只读对照，不进入主任务的标注草稿和保存路径。
+  readonly sourceImage = signal<{ task: RecognitionTask; item: RecognitionItem } | null>(null);
+  readonly displayedItem = computed(() => this.sourceImage()?.item || this.item());
+  readonly displayedPoints = computed(() => this.sourceImage()?.item.points || this.points());
   readonly points = signal<HorizonPoint[]>([]);
   readonly ignored = signal(false);
   readonly dirty = signal(false);
@@ -85,9 +89,9 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       && (result.mode === 'before' || (!task.refinement?.stale && result.resultId === task.refinement?.resultId)) ? result : null;
   });
   readonly measurement = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
-    ?.perSnapshot.find((row) => row.snapshotId === this.selectedItemId()));
+    ?.perSnapshot.find((row) => row.snapshotId === this.displayedItem()?.snapshotId && !this.singleImageError()));
   readonly measurementExclusion = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
-    ?.excluded.find((row) => row.snapshotId === this.selectedItemId())?.reason);
+    ?.excluded.find((row) => row.snapshotId === this.displayedItem()?.snapshotId)?.reason);
   readonly theoreticalLabel = computed(() => this.comparisonMode() === 'validation'
     ? this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
     : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
@@ -263,6 +267,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.measuring.set(false);
     this.validationResult.set(null);
     this.refinementMeasurementResult.set(null);
+    this.closeSourceImage();
     this.clearPanorama();
     const revision = ++this.revision;
     this.loading.set(true);
@@ -332,6 +337,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.measuring.set(false);
       this.validationResult.set(null);
       this.refinementMeasurementResult.set(null);
+      this.closeSourceImage();
     }
     if (previous?.id !== task.id) {
       this.comparisonMode.set(task.refinementSelection?.base ? task.refinement && !task.refinement.stale ? 'after' : 'before' : 'validation');
@@ -357,6 +363,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   selectItem(item?: RecognitionItem) {
     this.endPanoramaDrag();
+    this.closeSourceImage();
     if (item?.snapshotId !== this.selectedItemId()) {
       this.activePanoramaEndpoint.set(0);
       this.clearFocusedImage();
@@ -382,7 +389,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   openPanoramaItem(snapshotId: string) {
     if (this.guideDrawing()) return;
-    if (snapshotId === this.selectedItemId()) { this.showFocusedPanorama(); this.focusPanorama(); return; }
+    if (snapshotId === this.selectedItemId() && !this.sourceImage()) { this.showFocusedPanorama(); this.focusPanorama(); return; }
     const entry = this.items().find((item) => item.snapshotId === snapshotId);
     if (entry) void this.openItem(entry);
   }
@@ -418,6 +425,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   showFocusedPanorama() {
     if (!this.panorama() || this.item()?.missing || !this.item()) return;
+    this.closeSourceImage();
     this.endGuideDrag(undefined, false);
     this.guideDrawing.set(null);
     this.panoramaFocused.set(true);
@@ -649,13 +657,13 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
 
   imageLoaded(snapshotId: string) {
-    if (snapshotId === this.selectedItemId()) { this.singleImageId.set(snapshotId); this.singleImageError.set(''); }
+    if (snapshotId === this.displayedItem()?.snapshotId) { this.singleImageId.set(snapshotId); this.singleImageError.set(''); }
   }
 
   imageFailed(snapshotId: string) {
-    if (snapshotId === this.selectedItemId()) {
+    if (snapshotId === this.displayedItem()?.snapshotId) {
       this.singleImageId.set('');
-      this.singleImageError.set('当前原图加载失败，请检查截图文件后重试');
+      this.singleImageError.set('当前原图读取失败，图片已删除或文件不可用，请刷新后重试');
     }
   }
 
@@ -837,7 +845,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.dirty.set(true);
   }
   startDrag(event: PointerEvent) {
-    if (this.running() || this.busy() || this.loading() || this.generatingPanorama() || this.panoramaDrag || this.guideDrawing()
+    if (this.sourceImage() || this.running() || this.busy() || this.loading() || this.generatingPanorama() || this.panoramaDrag || this.guideDrawing()
       || this.guideDrag || this.item()?.missing || this.singleImageId() !== this.selectedItemId() || this.points().length !== 2 || event.button !== 0) return;
     event.preventDefault();
     const svg = event.currentTarget as SVGSVGElement;
@@ -911,12 +919,14 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   async validate() {
     if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
+    this.closeSourceImage();
     this.comparisonMode.set('validation');
     this.problem.set('');
     await this.measure();
   }
   selectValidationSource(id: string) {
     this.problem.set('');
+    this.closeSourceImage();
     this.comparisonMode.set('validation');
     this.validationReferenceId.set(id);
     void this.measure();
@@ -959,7 +969,9 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
         && task.revision === this.selected()?.revision && selectionRevision === this.selected()?.refinementSelection?.revision
         && mode === this.comparisonMode()) this.refinementMeasurementResult.set(result);
-    } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
+    } catch (error) {
+      if (!this.destroyed && request === this.validationRequest) { this.closeSourceImage(); this.problem.set(errorMessage(error)); }
+    }
     finally { if (request === this.validationRequest) this.measuring.set(false); }
   }
   async selectRefinementBase(taskId: string) {
@@ -1017,6 +1029,61 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   async openValidationItem(snapshotId: string) {
     const item = this.items().find((entry) => entry.snapshotId === snapshotId);
     if (item) await this.openItem(item);
+  }
+  async openRefinementItem(snapshotId: string, taskId: string) {
+    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || this.guideDrawing() || this.dirty()) return;
+    const task = this.selected(), candidate = task?.refinement;
+    const source = candidate?.sources.find((entry) => entry.taskId === taskId && entry.sourceSnapshotIds.includes(snapshotId));
+    if (!task || !candidate || candidate.stale || !source) return;
+    const mode = this.comparisonMode() === 'before' ? 'before' : 'after';
+    if (taskId === task.id) {
+      this.comparisonMode.set(mode);
+      await this.openValidationItem(snapshotId);
+      return;
+    }
+    const revision = this.revision;
+    this.validationRequest++;
+    this.refinementMeasurementResult.set(null);
+    this.measuring.set(false);
+    this.loading.set(true);
+    this.problem.set('');
+    try {
+      let offset: number | null = 0;
+      while (offset !== null) {
+        const page = await this.api.recognitionItems(taskId, offset);
+        if (this.destroyed || revision !== this.revision || this.selected()?.refinement?.resultId !== candidate.resultId
+          || this.selected()?.refinementSelection?.revision !== candidate.selectionRevision) return;
+        if (page.task.revision !== source.revision || ['queued', 'running'].includes(page.task.status)
+          || (source.role === 'base' && page.task.resultId !== source.resultId)) {
+          throw new Error('精修参与图的来源版本已变化，请刷新并重新生成候选');
+        }
+        const item = page.items.find((entry) => entry.snapshotId === snapshotId);
+        if (item) {
+          if (item.missing) throw new Error('精修参与图的原图已删除，请刷新并重新生成候选');
+          this.showOverview();
+          this.endDrag();
+          this.singleImageId.set('');
+          this.singleImageError.set('');
+          this.sourceImage.set({ task: page.task, item });
+          this.comparisonMode.set(mode);
+          await this.measureRefinement();
+          return;
+        }
+        offset = page.nextOffset;
+      }
+      throw new Error('精修参与图已不存在，请刷新并重新生成候选');
+    } catch (error) {
+      if (!this.destroyed && revision === this.revision) {
+        this.closeSourceImage();
+        this.problem.set(error instanceof Error && error.name === 'Error' ? error.message : errorMessage(error));
+      }
+    } finally { if (revision === this.revision) this.loading.set(false); }
+  }
+  closeSourceImage() {
+    if (!this.sourceImage()) return;
+    this.sourceImage.set(null);
+    this.singleImageId.set('');
+    this.singleImageError.set('');
   }
   calibrationZoom(task: RecognitionTask) {
     const values = task.result?.diagnostics?.perSnapshot.flatMap((row) => row.zoom === undefined ? [] : [row.zoom]) || [];

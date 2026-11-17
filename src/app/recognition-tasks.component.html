@@ -165,12 +165,17 @@
           <section class="editor" aria-label="海天线编辑">
             <div class="section-heading"><h3>海天线复核</h3>
               <div class="actions">
-                <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().previous" (click)="navigate('previous')">上一张</button>
-                <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().next" (click)="navigate('next')">下一张</button>
+                @if (sourceImage()) {
+                  <button type="button" [disabled]="busy() || loading()" (click)="closeSourceImage()">返回主任务图片</button>
+                } @else {
+                  <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().previous" (click)="navigate('previous')">上一张</button>
+                  <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().next" (click)="navigate('next')">下一张</button>
+                }
               </div>
-              @if (item(); as entry) { <span class="annotation-source" [class.unsaved]="dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ dirty() ? ' · 未保存' : '' }}</span> }
+              @if (displayedItem(); as entry) { <span class="annotation-source" [class.unsaved]="!sourceImage() && dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ sourceImage() ? ' · 只读' : dirty() ? ' · 未保存' : '' }}</span> }
             </div>
-            @if (item(); as entry) {
+            @if (displayedItem(); as entry) {
+              @if (sourceImage(); as source) { <p class="image-info">参与图来源：{{ source.task.id === refinementBaseId() ? '基础' : '补充高倍' }}任务 · {{ source.task.createdAt | date:'MM-dd HH:mm:ss' }}</p> }
               <p class="image-info">{{ entry.snapshot.width }} × {{ entry.snapshot.height }}<span>P {{ entry.snapshot.ptz.raw.Pan | number:'1.2-2' }}°</span><span>T {{ entry.snapshot.ptz.raw.Tilt | number:'1.2-2' }}°</span><span>Z {{ entry.snapshot.ptz.raw.Zoom }}</span></p>
               @if (entry.missing) { <p class="error">原图已删除，重新生成数据时会排除此图。</p> }
               @else {
@@ -182,9 +187,9 @@
                   @if (singleImageId() !== entry.snapshotId) {
                     <div class="annotation-feedback" [class.error]="singleImageError()" [attr.role]="singleImageError() ? 'alert' : 'status'">{{ singleImageError() || '正在读取当前原图…' }}</div>
                   }
-                  <svg [attr.viewBox]="'0 0 ' + entry.snapshot.width + ' ' + entry.snapshot.height" role="img" aria-label="海天线标注层，也可在下方输入归一化坐标"
+                  <svg [attr.viewBox]="'0 0 ' + entry.snapshot.width + ' ' + entry.snapshot.height" role="img" aria-label="海天线标注与理论线"
                     (pointerdown)="startDrag($event)" (pointermove)="drag($event)" (pointerup)="endDrag()" (pointercancel)="endDrag()" (lostpointercapture)="endDrag()">
-                    @if (showNeighbors()) {
+                    @if (!sourceImage() && showNeighbors()) {
                       @for (reference of neighbors(); track reference.side) {
                         <g class="neighbor-reference" [class.previous]="reference.side === 'previous'" [class.next]="reference.side === 'next'" [class.ignored]="reference.ignored" aria-hidden="true">
                           @for (line of reference.lines; track $index) { <polyline [attr.points]="line" /> }
@@ -194,7 +199,7 @@
                         </g>
                       }
                     }
-                    @if (showGuide()) {
+                    @if (!sourceImage() && showGuide()) {
                       @for (line of singleGuide().lines; track $index) { <polyline class="guide-line" [attr.points]="line" /> }
                     }
                     @if (entry.detectedPoints.length === 2) {
@@ -215,23 +220,27 @@
                         }
                       </g>
                     }
-                    @if (points().length === 2) {
-                      <line class="edited-line" [attr.x1]="points()[0].x * entry.snapshot.width" [attr.y1]="points()[0].y * entry.snapshot.height"
-                        [attr.x2]="points()[1].x * entry.snapshot.width" [attr.y2]="points()[1].y * entry.snapshot.height" />
-                      @for (point of points(); track $index) { <circle [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height" [attr.r]="entry.snapshot.width / 100" /> }
+                    @if (displayedPoints().length === 2) {
+                      <line class="edited-line" [attr.x1]="displayedPoints()[0].x * entry.snapshot.width" [attr.y1]="displayedPoints()[0].y * entry.snapshot.height"
+                        [attr.x2]="displayedPoints()[1].x * entry.snapshot.width" [attr.y2]="displayedPoints()[1].y * entry.snapshot.height" />
+                      @if (!sourceImage()) {
+                        @for (point of displayedPoints(); track $index) { <circle [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height" [attr.r]="entry.snapshot.width / 100" /> }
+                      }
                     }
                   </svg>
                 </div>
               }
               <div class="legend reference-legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span>
                 @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>{{ theoreticalLabel() }}</span> }
-                <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
-                <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
-                @for (reference of neighbors(); track reference.side) {
-                  <span [class.reference-ignored]="reference.ignored"><i [class.previous-swatch]="reference.side === 'previous'" [class.next-swatch]="reference.side === 'next'" aria-hidden="true"></i>{{ reference.label }}：{{ reference.state }}</span>
+                @if (!sourceImage()) {
+                  <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
+                  <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
+                  @for (reference of neighbors(); track reference.side) {
+                    <span [class.reference-ignored]="reference.ignored"><i [class.previous-swatch]="reference.side === 'previous'" [class.next-swatch]="reference.side === 'next'" aria-hidden="true"></i>{{ reference.label }}：{{ reference.state }}</span>
+                  }
                 }
               </div>
-              @if (showGuide() && singleGuide().error) { <p class="error" role="alert">全景参考线映射失败：{{ singleGuide().error }}</p> }
+              @if (!sourceImage() && showGuide() && singleGuide().error) { <p class="error" role="alert">全景参考线映射失败：{{ singleGuide().error }}</p> }
               @if (measuring()) { <p class="image-info" role="status">正在计算{{ measurementLabel() }}…</p> }
               @if (measurement(); as row) {
                 <section class="measurement" aria-label="原图海天线测量">
@@ -255,21 +264,23 @@
                 </section>
               }
               @if (measurementExclusion(); as reason) { <p class="image-info" role="status">本图已排除：{{ reason }}</p> }
-              <fieldset [disabled]="busy() || loading() || running() || generatingPanorama() || guideDrawing() !== null || entry.missing || singleImageId() !== entry.snapshotId">
-                <div class="annotation-actions">
-                  <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
-                  <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
-                    <button type="button" class="primary" [disabled]="!dirty()" (click)="save()"><app-icon name="save" />保存标注</button></div>
-                </div>
-                <div class="coordinates">
-                  @for (point of points(); track $index; let i = $index) {
-                    <div class="coordinate-point"><span>端点 {{ i + 1 }}</span>
-                      <label>X<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'" [ngModel]="point.x" (ngModelChange)="editPoint(i, 'x', $event)"></label>
-                      <label>Y<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'" [ngModel]="point.y" (ngModelChange)="editPoint(i, 'y', $event)"></label>
-                    </div>
-                  }
-                </div>
-              </fieldset>
+              @if (!sourceImage()) {
+                <fieldset [disabled]="busy() || loading() || running() || generatingPanorama() || guideDrawing() !== null || entry.missing || singleImageId() !== entry.snapshotId">
+                  <div class="annotation-actions">
+                    <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
+                    <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
+                      <button type="button" class="primary" [disabled]="!dirty()" (click)="save()"><app-icon name="save" />保存标注</button></div>
+                  </div>
+                  <div class="coordinates">
+                    @for (point of points(); track $index; let i = $index) {
+                      <div class="coordinate-point"><span>端点 {{ i + 1 }}</span>
+                        <label>X<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'" [ngModel]="point.x" (ngModelChange)="editPoint(i, 'x', $event)"></label>
+                        <label>Y<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'" [ngModel]="point.y" (ngModelChange)="editPoint(i, 'y', $event)"></label>
+                      </div>
+                    }
+                  </div>
+                </fieldset>
+              }
               @if (entry.ignoreReason && !dirty()) { <p class="note">{{ entry.ignoreReason }}</p> }
               @if (entry.detection?.error; as detectionError) { <p class="error">{{ detectionError }}</p> }
               @for (warning of entry.detection?.warnings || []; track $index) { <p class="note">{{ warning }}</p> }
@@ -395,7 +406,7 @@
                     @for (row of candidate.after.perSnapshot; track row.snapshotId; let index = $index) {
                       @let before = candidate.before.perSnapshot[index];
                       <tr><th scope="row" [title]="row.taskId">{{ row.group === 'base' ? '基础' : '高倍' }}</th>
-                        <td><button type="button" [disabled]="busy() || loading() || generatingPanorama() || row.taskId !== task.id" (click)="openValidationItem(row.snapshotId)">
+                        <td><button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama() || guideDrawing() !== null || candidate.stale" (click)="openRefinementItem(row.snapshotId, row.taskId)">
                           {{ row.pan | number:'1.2-2' }}/{{ row.tilt | number:'1.2-2' }}/{{ row.zoom | number:'1.1-1' }}</button></td>
                         <td>{{ row.width }}×{{ row.height }}</td><td>{{ before.rmsResidualPixels | number:'1.2-2' }} → {{ row.rmsResidualPixels | number:'1.2-2' }}</td>
                         <td>{{ before.rmsAngularResidualDegrees | number:'1.4-4' }} → {{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td>

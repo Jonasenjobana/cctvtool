@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { httpError } from './errors.mjs';
 import { calibrationKeys, calibrationOf } from './store.mjs';
-import { estimateInstallation } from './tilt-calibration.mjs';
+import { estimateInstallation, evaluateInstallation } from './tilt-calibration.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
@@ -209,6 +209,13 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
 
   const revisionSchema = { type: 'integer', minimum: 0 };
   const bodyWithRevision = { type: 'object', additionalProperties: false, required: ['revision'], properties: { revision: revisionSchema } };
+  const guidePoint = { type: 'object', additionalProperties: false, required: ['heading', 'elevation'],
+    properties: { heading: { type: 'number' }, elevation: { type: 'number' } } };
+  const guideSchema = { anyOf: [{ type: 'null' }, ...[['line', 2], ['quadratic', 3]].map(([kind, count]) => ({
+    type: 'object', additionalProperties: false, required: ['kind', 'points'], properties: {
+      kind: { type: 'string', const: kind }, points: { type: 'array', minItems: count, maxItems: count, items: guidePoint },
+    },
+  }))] };
   const paging = { type: 'object', additionalProperties: false, properties: {
     limit: { type: 'string', pattern: '^(?:[1-9]|[1-9][0-9]|100)$' }, offset: { type: 'string', pattern: '^(?:0|[1-9][0-9]{0,8})$' },
   } };
@@ -221,6 +228,26 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   });
   app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => store.listRecognitionTasks(pageOptions(request.query)));
   app.get('/api/recognition-tasks/:id', async (request) => store.getRecognitionTask(request.params.id));
+  app.get('/api/recognition-tasks/:id/panorama-guide', async (request) => store.getRecognitionPanoramaGuide(request.params.id));
+  app.put('/api/recognition-tasks/:id/panorama-guide', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'guide'], properties: {
+      revision: { ...revisionSchema, maximum: Number.MAX_SAFE_INTEGER - 1 }, guide: guideSchema,
+    },
+  } } }, async (request) => {
+    const task = store.getRecognitionTask(request.params.id);
+    if (activeStatuses.includes(task.status)) throw httpError(409, '请等待识别结束或取消后再编辑');
+    const { guide, revision } = request.body;
+    if (guide) {
+      if (guide.points.some((point) => !Number.isFinite(point.heading) || !Number.isFinite(point.elevation))) {
+        throw httpError(400, '全景参考线坐标必须为有限数值');
+      }
+      const headings = guide.points.map((point) => point.heading);
+      if (Math.abs(headings.at(-1) - headings[0]) <= 1e-9 || Math.max(...headings) - Math.min(...headings) > 2 * Math.PI) {
+        throw httpError(400, '全景参考线起终点需要有效方位跨度，全部点的方位范围不能超过一周');
+      }
+    }
+    return store.saveRecognitionPanoramaGuide(task.id, revision, guide);
+  });
   app.get('/api/recognition-tasks/:id/items', { schema: { querystring: paging } }, async (request) => {
     const task = store.getRecognitionTask(request.params.id);
     const options = pageOptions(request.query);
@@ -258,6 +285,47 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
     return store.updateRecognitionTask(task.id, installationChanges(task));
+  });
+  app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {
+      ...bodyWithRevision.properties, referenceTaskId: { type: 'string', minLength: 1 }, referenceResultId: { type: 'string', minLength: 1 },
+    },
+  } } }, async (request) => {
+    const task = editable(request.params.id, request.body.revision);
+    const reference = store.getRecognitionTask(request.body.referenceTaskId);
+    if (reference.id === task.id || reference.cameraId !== task.cameraId) {
+      throw httpError(409, '请选择同一摄像头的另一识别任务作为标定来源');
+    }
+    if (activeStatuses.includes(reference.status) || reference.result?.status !== 'estimated'
+      || reference.result.model !== 'wgs84-horizon-installation-v1' || reference.resultRevision !== reference.revision
+      || reference.resultId !== request.body.referenceResultId) {
+      throw httpError(409, '标定来源没有合格的最新结果，或结果已变化，请刷新后重试');
+    }
+    if (store.getSnapshotGroup(reference.sourceTaskId).horizon?.phase === 'coarse') {
+      throw httpError(409, '历史预扫粗结果仅供查看，请选择正式标定结果');
+    }
+    const camera = store.getCamera(task.cameraId);
+    if (['longitude', 'latitude', 'height', 'panOffset', 'serial', 'code'].some((key) => camera[key] !== reference.fitCamera?.[key])) {
+      throw httpError(409, '安装位置、默认朝向或设备通道已变化，请重新生成标定来源结果');
+    }
+    const fittedIds = new Set(reference.result.sourceSnapshotIds);
+    if (store.recognitionItems(reference.id).some((item) => fittedIds.has(item.snapshotId) && item.missing)) {
+      throw httpError(409, '标定来源的参与截图已删除，请重新生成标定结果');
+    }
+    const items = store.recognitionItems(task.id);
+    const selected = items.filter((item) => !item.ignored && !item.missing && validPoints(item.points));
+    if (selected.some((item) => fittedIds.has(item.snapshotId))) {
+      throw httpError(409, '复核图片与拟合图片存在重叠，请使用未参与拟合的独立截图');
+    }
+    const dates = items.map((item) => +new Date(item.snapshot.createdAt));
+    const result = evaluateInstallation({ ...camera, ...reference.fitCamera, ...reference.result.installation },
+      selected.map((item) => item.snapshot), selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
+        startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
+      });
+    result.excluded.push(...items.filter((item) => item.ignored || item.missing).map((item) => ({ snapshotId: item.snapshotId,
+      reason: item.missing ? '源截图已删除' : item.ignoreReason })));
+    return { ...result, taskId: task.id, revision: task.revision, reference: { taskId: reference.id, resultId: reference.resultId,
+      revision: reference.revision, createdAt: reference.createdAt } };
   });
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },

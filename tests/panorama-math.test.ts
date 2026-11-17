@@ -1,9 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createLocalRigRotation } from '#camera-rotation';
-import { blendPanoramaFrame, createPanoramaPlan, extendHorizonLine, movePanoramaEndpoint, projectPanoramaLine } from '../src/app/panorama-math.ts';
+import { blendPanoramaFrame, createPanoramaFrame, createPanoramaPlan, extendHorizonLine, imagePointToPanoramaPoint,
+  movePanoramaEndpoint, panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel,
+  projectImageLine, projectPanoramaGuide, projectPanoramaLine,
+  samplePanoramaGuide } from '../src/app/panorama-math.ts';
 import type { PanoramaImage, PanoramaPlan } from '../src/app/panorama-math.ts';
 import type { Snapshot } from '../src/app/models.ts';
+import type { PanoramaGuide } from '../shared/panorama-guide.ts';
 
 function snapshot(index: number, pan: number): Snapshot {
   const now = '2026-11-09T08:00:00.000Z';
@@ -19,6 +23,178 @@ function snapshot(index: number, pan: number): Snapshot {
 
 const radians = (degrees: number) => degrees * Math.PI / 180;
 const colorField = (angle: number, slope: number) => [128 + 70 * Math.sin(angle * 2), 120 + slope * 200, 120 + 60 * Math.cos(angle)];
+
+test('单张截图无需全景即可按已知方位往返投影，跨正北保留展开方向', () => {
+  const shot = snapshot(0, 350);
+  shot.ptz.raw.HorizontalFieldAngle = 90;
+  shot.ptz.raw.VerticalFieldAngle = 90;
+  const frame = createPanoramaFrame(shot);
+  const known = [
+    { image: { x: 0.5, y: 0.5 }, panorama: { heading: radians(350), elevation: 0 } },
+    { image: { x: 1, y: 0.5 }, panorama: { heading: radians(395), elevation: 0 } },
+    { image: { x: 0.5, y: 0 }, panorama: { heading: radians(350), elevation: 1 } },
+  ];
+  for (const { image, panorama } of known) {
+    const projected = imagePointToPanoramaPoint(frame, image);
+    assert.ok(projected);
+    assert.ok(Math.abs(projected.heading - panorama.heading) < 1e-12);
+    assert.ok(Math.abs(projected.elevation - panorama.elevation) < 1e-12);
+    const restored = panoramaPointToImagePoint(frame, panorama);
+    assert.ok(restored);
+    assert.ok(Math.abs(restored.x - image.x) < 1e-12);
+    assert.ok(Math.abs(restored.y - image.y) < 1e-12);
+  }
+  assert.equal(panoramaPointToImagePoint(frame, { heading: radians(170), elevation: 0 }), null);
+  assert.equal(panoramaPointToImagePoint(frame, { heading: radians(410), elevation: 0 }), null);
+});
+
+test('持久参考点在跨正北全景改变分辨率后重建，恢复同一方向和相对位置', () => {
+  const shots = [snapshot(0, 350), snapshot(1, 10)];
+  const first = createPanoramaPlan(shots);
+  const persisted = { heading: radians(360), elevation: 0.1 };
+  const firstPixel = panoramaPointToPixel(first, persisted);
+  assert.ok(Math.abs(firstPixel.x - first.width / 2) < 1);
+  const stored = JSON.parse(JSON.stringify(panoramaPixelToPoint(first, firstPixel)));
+  shots.forEach((shot) => { shot.width *= 5; shot.height *= 5; });
+  const rebuilt = createPanoramaPlan(shots);
+  const rebuiltPixel = panoramaPointToPixel(rebuilt, stored);
+  assert.ok(Math.abs(rebuiltPixel.x - 5 * firstPixel.x) < 1e-10);
+  assert.ok(Math.abs(rebuiltPixel.y - 5 * firstPixel.y) < 1e-10);
+  assert.ok(Math.abs(stored.heading - persisted.heading) < 1e-12);
+  assert.ok(Math.abs(stored.elevation - persisted.elevation) < 1e-12);
+});
+
+test('整周全景从画布左边缘画到右边缘，持久参考点的方位跨度不超过一周', () => {
+  for (const startPan of [0, 90, 1.72 * 180 / Math.PI + 20, 350]) {
+    const shots = Array.from({ length: 12 }, (_, index) => {
+      const shot = snapshot(index, (startPan + index * 30) % 360);
+      shot.ptz.raw.HorizontalFieldAngle = 40;
+      return shot;
+    });
+    const plan = createPanoramaPlan(shots);
+    assert.ok(plan.width / plan.scale > 2 * Math.PI, '画布包含不足一个像素的取整余量');
+    const left = panoramaPixelToPoint(plan, { x: 0, y: plan.height / 2 });
+    const right = panoramaPixelToPoint(plan, { x: plan.width, y: plan.height / 2 });
+    const span = right.heading - left.heading;
+    assert.ok(span <= 2 * Math.PI, `${startPan}° 起始的参考线不能超出一周`);
+    assert.ok(Math.abs(span - 2 * Math.PI) < 1e-12, '左右边界仍对应同一实际方向');
+  }
+});
+
+test('跨零任务删除首张图后重建，整条参考线使用共同圈数偏移并保留持久坐标', () => {
+  const shots = [snapshot(0, 350), snapshot(1, 0), snapshot(2, 10)];
+  const guide: PanoramaGuide = { kind: 'quadratic', points: [
+    { heading: radians(350), elevation: 0 }, { heading: radians(360), elevation: 0.1 },
+    { heading: radians(375), elevation: 0 },
+  ] };
+  const before = JSON.stringify(guide);
+  assert.equal(panoramaGuideHeadingOffset(createPanoramaPlan(shots), guide), 0);
+  const rebuilt = createPanoramaPlan(shots.slice(1));
+  const offset = panoramaGuideHeadingOffset(rebuilt, guide);
+  assert.equal(offset, -2 * Math.PI);
+  for (const point of guide.points) {
+    const displayed = { ...point, heading: point.heading + offset };
+    const pixel = panoramaPointToPixel(rebuilt, displayed);
+    assert.ok(pixel.x >= 0 && pixel.x <= rebuilt.width);
+    const restored = panoramaPixelToPoint(rebuilt, pixel);
+    assert.ok(Math.abs(restored.heading - offset - point.heading) < 1e-12);
+    assert.ok(Math.abs(restored.elevation - point.elevation) < 1e-12);
+  }
+  assert.equal(JSON.stringify(guide), before);
+});
+
+test('直线与二次弧线按展开方位采样，控制点决定实际弯曲而不是折线', () => {
+  const start = { heading: radians(350), elevation: 0 };
+  const control = { heading: radians(360), elevation: 0.4 };
+  const end = { heading: radians(370), elevation: 0 };
+  const line = samplePanoramaGuide({ kind: 'line', points: [start, end] }, 2);
+  const curve = samplePanoramaGuide({ kind: 'quadratic', points: [start, control, end] }, 2);
+  assert.deepEqual(line, [start, { heading: radians(360), elevation: 0 }, end]);
+  assert.deepEqual(curve, [start, { heading: radians(360), elevation: 0.2 }, end]);
+});
+
+test('邻图参照按各自 T、FOV 和 Roll 映射，原始端点在画面外仍保留裁切参考线', () => {
+  const source = snapshot(0, 0), target = snapshot(1, 0);
+  source.ptz.raw.HorizontalFieldAngle = source.ptz.raw.VerticalFieldAngle = 90;
+  target.ptz.raw.Tilt = 30;
+  target.ptz.raw.HorizontalFieldAngle = 90;
+  target.ptz.raw.VerticalFieldAngle = 60;
+  target.calibration.imageRoll = 90;
+  const sourceFrame = createPanoramaFrame(source), targetFrame = createPanoramaFrame(target);
+  const points = [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }];
+  const before = JSON.stringify(points);
+  const segments = projectImageLine(sourceFrame, targetFrame, points);
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].length, 2);
+  for (const point of segments[0]) assert.ok(Math.abs(point.x - 0.21132486540518713) < 1e-12);
+  assert.ok(Math.abs(segments[0][0].y - 1) < 1e-12);
+  assert.ok(Math.abs(segments[0][1].y) < 1e-12);
+  for (const point of points) {
+    const direction = imagePointToPanoramaPoint(sourceFrame, point);
+    assert.ok(direction);
+    assert.equal(panoramaPointToImagePoint(targetFrame, direction), null);
+  }
+  target.ptz.raw.Pan = 180;
+  target.scanTarget!.pan = 180;
+  assert.deepEqual(projectImageLine(sourceFrame, createPanoramaFrame(target), points), []);
+  assert.equal(JSON.stringify(points), before);
+});
+
+test('跨正北的原图直线映射相邻截图，只保留两张截图的实际重叠方向', () => {
+  const source = snapshot(0, 350), target = snapshot(1, 10);
+  for (const shot of [source, target]) shot.ptz.raw.HorizontalFieldAngle = 90;
+  const fragments = projectImageLine(createPanoramaFrame(source), createPanoramaFrame(target),
+    [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }]);
+  assert.equal(fragments.length, 1);
+  assert.ok(Math.abs(fragments[0][0].x) < 1e-12);
+  assert.ok(Math.abs(fragments[0][1].x - 0.7331538290774993) < 1e-12);
+  for (const point of fragments[0]) assert.ok(Math.abs(point.y - 0.5) < 1e-12);
+});
+
+test('全景弧线保留可见曲率并分开背面缺口，禁止把两侧画面跨背面连接', () => {
+  const shot = snapshot(0, 0);
+  shot.ptz.raw.HorizontalFieldAngle = shot.ptz.raw.VerticalFieldAngle = 90;
+  const frame = createPanoramaFrame(shot);
+  const fragments = projectPanoramaGuide(frame, { kind: 'quadratic', points: [
+    { heading: 0, elevation: 0 }, { heading: Math.PI, elevation: 0.8 }, { heading: 2 * Math.PI, elevation: 0 },
+  ] });
+  assert.equal(fragments.length, 2);
+  assert.ok(fragments.every((fragment) => fragment.length > 3));
+  const first = fragments[0], last = fragments[1];
+  assert.ok(Math.abs(first[0].x - 0.5) < 1e-12 && Math.abs(first[0].y - 0.5) < 1e-12);
+  assert.ok(Math.abs(first[first.length - 1].x - 1) < 1e-12);
+  assert.ok(Math.abs(first[first.length - 1].y - 0.3762563132923542) < 1e-10);
+  assert.ok(Math.abs(last[0].x) < 1e-12);
+  assert.ok(Math.abs(last[last.length - 1].x - 0.5) < 1e-12);
+  for (const point of fragments.flat()) assert.ok(point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1);
+});
+
+test('整周弧线映射到未对准全局采样点的窄视场，局部仍保留足够曲线与左右边界', () => {
+  const shot = snapshot(0, 180.2);
+  shot.ptz.raw.Tilt = -5.710593137499643;
+  shot.ptz.raw.HorizontalFieldAngle = shot.ptz.raw.VerticalFieldAngle = 0.1;
+  const frame = createPanoramaFrame(shot);
+  const fragments = projectPanoramaGuide(frame, { kind: 'quadratic', points: [
+    { heading: 0, elevation: 0 }, { heading: Math.PI, elevation: 0.2 }, { heading: 2 * Math.PI, elevation: 0 },
+  ] });
+  assert.equal(fragments.length, 1);
+  const curve = fragments[0];
+  assert.ok(curve.length > 64);
+  assert.ok(Math.abs(curve[0].x) < 1e-8);
+  assert.ok(Math.abs(curve[curve.length - 1].x - 1) < 1e-8);
+  for (const point of curve) assert.ok(point.y > 0.499 && point.y < 0.501);
+});
+
+test('弧线控制点超出两端方位后折返，画面外的中间范围形成独立可见片段', () => {
+  const fragments = projectPanoramaGuide(createPanoramaFrame(snapshot(0, 0)), { kind: 'quadratic', points: [
+    { heading: radians(-30), elevation: 0 }, { heading: radians(150), elevation: 0.2 },
+    { heading: radians(-20), elevation: 0 },
+  ] });
+  assert.equal(fragments.length, 2);
+  const first = fragments[0], second = fragments[1];
+  assert.ok(Math.abs(first[0].x) < 1e-12 && Math.abs(first[first.length - 1].x - 1) < 1e-12);
+  assert.ok(Math.abs(second[0].x - 1) < 1e-12 && Math.abs(second[second.length - 1].x) < 1e-12);
+});
 
 function syntheticImage(shot: Snapshot, fixedColor?: number[]): PanoramaImage {
   const { width, height } = shot;
@@ -121,6 +297,20 @@ test('重叠区域按边缘权重融合，缺失视野保持透明，不拉伸�
   assert.equal(pixel(gap.plan, gap.data, 40).rgba[3], 0);
   assert.deepEqual(pixel(gap.plan, gap.data, 0).rgba, [255, 0, 0, 255]);
   assert.deepEqual(pixel(gap.plan, gap.data, 80).rgba, [0, 0, 255, 255]);
+});
+
+test('置顶当前帧使用原全景计划，重叠中心与边缘均保持当前图不透明颜色', () => {
+  const shots = [snapshot(0, 350), snapshot(1, 0), snapshot(2, 10)];
+  const overview = render(shots, [[255, 0, 0], [0, 255, 0], [0, 0, 255]]);
+  const frame = overview.plan.frames[1];
+  const output = new Uint8ClampedArray(overview.data.length);
+  blendPanoramaFrame(overview.plan, frame, syntheticImage(frame.snapshot, [0, 255, 0]), output,
+    new Float32Array(overview.plan.width * overview.plan.height));
+  for (const angle of [346, 350, 360, 370, 374]) {
+    assert.deepEqual(pixel(overview.plan, output, angle).rgba, [0, 255, 0, 255]);
+  }
+  assert.equal(pixel(overview.plan, output, 340).rgba[3], 0);
+  assert.deepEqual(pixel(overview.plan, overview.data, 340).rgba, [255, 0, 0, 255]);
 });
 
 test('高分辨率长任务的全景画布受尺寸与像素预算约束，原始记录不被改写', () => {

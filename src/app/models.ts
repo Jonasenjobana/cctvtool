@@ -156,16 +156,28 @@ export function emptyCamera(): CameraDraft {
 
 export interface HorizonPoint { x: number; y: number }
 export interface InstallationEstimate {
+  model?: string;
   status: 'estimated' | 'insufficient_data' | 'unreliable';
   installation: Pick<Calibration, 'pAxisPitch' | 'pAxisRoll' | 'tiltOffset' | 'imageRoll'> | null;
   sourceSnapshotIds: string[];
   excluded: { snapshotId: string; reason: string }[];
   panCoverageDegrees: number;
   diagnostics?: { rmsResidualPixels: number; rmsAngularResidualDegrees?: number; converged: boolean; conditionNumber: number | null;
-    perSnapshot: { snapshotId: string; rmsResidualPixels: number }[] };
+    perSnapshot: { snapshotId: string; rmsResidualPixels: number; zoom?: number }[] };
   message: string;
   warnings?: string[];
   applied: boolean;
+}
+export interface InstallationValidation {
+  taskId: string; revision: number; generatedAt: string;
+  reference: { taskId: string; resultId: string; revision: number; createdAt: string };
+  status: 'passed' | 'failed' | 'insufficient_data'; message: string;
+  installation: Pick<Calibration, 'pAxisPitch' | 'pAxisRoll' | 'tiltOffset' | 'imageRoll'>;
+  sourceSnapshotIds: string[]; excluded: { snapshotId: string; reason: string }[];
+  rmsResidualPixels: number | null; rmsAngularResidualDegrees: number | null; maximumResidualPixels: number | null;
+  maximumAcceptedRmsPixels: number; failedSnapshotIds: string[];
+  perSnapshot: { snapshotId: string; pan: number; tilt: number; zoom: number; width: number; height: number;
+    rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null }[];
 }
 export interface RecognitionTask {
   id: string; sourceTaskId: string; cameraId: string; cameraName: string;
@@ -173,6 +185,7 @@ export interface RecognitionTask {
   createdAt: string; updatedAt: string; sampleCount: number; completedCount: number; revision: number;
   result: InstallationEstimate | null; error: string | null; appliedAt: string | null; appliedRevision: number | null;
   resultId: string | null;
+  resultRevision?: number;
   fitCamera?: Calibration;
 }
 export interface RecognitionItem {

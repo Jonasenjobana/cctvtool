@@ -52,6 +52,233 @@ const post = async (f, id, action, revision) => {
     payload: { revision, ...(task ? { resultId: task.resultId || 'no-result' } : {}) } });
 };
 
+async function independentValidationFixture(t) {
+  const f = await fixture(t);
+  const source = await createAndWait(f);
+  const generated = await post(f, source.id, 'generate', 0);
+  assert.equal(generated.statusCode, 200, generated.body);
+  f.reference = generated.json();
+  await f.app.close();
+  const store = new CameraStore(f.dataDir);
+  try {
+    const task = { ...source, id: 'validation-task', sourceTaskId: 'validation-source', result: null, resultId: null };
+    store.addSnapshotGroup({ id: task.sourceTaskId, cameraId: f.camera.id, cameraName: f.camera.name,
+      kind: 'scan', status: 'completed', createdAt: source.createdAt, sampleCount: f.snapshots.length, completedCount: f.snapshots.length });
+    const items = f.snapshots.map((snapshot, index) => {
+      const copy = { ...snapshot, id: `validation-${index}`, groupId: task.sourceTaskId, fileName: `validation-${index}.jpg` };
+      store.addSnapshot(copy);
+      const points = f.observations[index].points.filter((_, column) => column !== 1);
+      return { snapshotId: copy.id, snapshot: copy, detectedPoints: points, points, ignored: false, source: 'manual', ignoreReason: '' };
+    });
+    store.addRecognitionTask(task, items);
+    f.validationTask = task;
+  } finally { store.close(); }
+  f.app = await createApp(f.options);
+  f.validate = (changes = {}) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.validationTask.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.reference.resultId, ...changes } });
+  return f;
+}
+
+test('独立复核使用另一任务的固定结果，不改变设备、标注、拟合或应用状态', async (t) => {
+  const f = await independentValidationFixture(t);
+  const camerasBefore = (await f.app.inject('/api/cameras')).json();
+  const itemsUrl = `/api/recognition-tasks/${f.validationTask.id}/items`;
+  const itemsBefore = (await f.app.inject(itemsUrl)).json();
+  const referenceBefore = (await f.app.inject(`/api/recognition-tasks/${f.reference.id}`)).json();
+  const response = await f.validate();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().status, 'passed');
+  assert.equal(response.json().reference.resultId, f.reference.resultId);
+  assert.deepEqual(response.json().installation, f.reference.result.installation);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), camerasBefore);
+  assert.deepEqual((await f.app.inject(itemsUrl)).json(), itemsBefore);
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${f.reference.id}`)).json(), referenceBefore);
+  const id = f.validationTask.id;
+  const edit = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${id}/items/validation-0`,
+    payload: { revision: 0, points: itemsBefore.items[0].points.map((point) => ({ ...point, y: point.y + 30 / itemsBefore.items[0].snapshot.height })) } });
+  assert.equal(edit.statusCode, 200, edit.body);
+  const failed = await f.validate({ revision: 1 });
+  assert.equal(failed.statusCode, 200, failed.body);
+  assert.equal(failed.json().status, 'failed');
+  assert.ok(failed.json().failedSnapshotIds.includes('validation-0'));
+  assert.deepEqual(failed.json().installation, f.reference.result.installation);
+});
+
+test('独立复核拒绝复用拟合图片、旧标注版本、旧结果编号与已变化的固定配置', async (t) => {
+  const f = await independentValidationFixture(t);
+  const overlap = await f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.reference.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.reference.resultId } });
+  assert.equal(overlap.statusCode, 409, overlap.body);
+  const duplicate = await createAndWait(f);
+  const duplicateCheck = await f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${duplicate.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.reference.resultId } });
+  assert.equal(duplicateCheck.statusCode, 409, duplicateCheck.body);
+  assert.equal((await f.validate({ revision: 1 })).statusCode, 409);
+  assert.equal((await f.validate({ referenceResultId: 'old-result' })).statusCode, 409);
+  assert.equal((await f.validate({ installation: f.reference.result.installation })).statusCode, 400);
+  await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: { ...f.input, height: f.input.height + 1 } });
+  assert.equal((await f.validate()).statusCode, 409);
+});
+
+test('全景参考线对已有识别任务缺省为空，未知任务返回 404', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const response = await f.app.inject(`/api/recognition-tasks/${task.id}/panorama-guide`);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), { guide: null, revision: 0 });
+  assert.equal((await f.app.inject('/api/recognition-tasks/unknown/panorama-guide')).statusCode, 404);
+});
+
+test('全景参考线独立保存并在重启后恢复，不改变正式标注、安装结果或应用状态', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const annotated = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${task.id}/items/${f.snapshots[0].id}`,
+    payload: { revision: 0, ignored: true, points: f.observations[0].points.filter((_, index) => index !== 1) } });
+  assert.equal(annotated.statusCode, 200, annotated.body);
+  const generated = await post(f, task.id, 'generate', 1);
+  assert.equal(generated.statusCode, 200, generated.body);
+  assert.equal(generated.json().result.status, 'estimated');
+  const pageBefore = (await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json();
+  const cameraBefore = (await f.app.inject('/api/cameras')).json();
+  const url = `/api/recognition-tasks/${task.id}/panorama-guide`;
+  const line = { kind: 'line', points: [{ heading: 6.1, elevation: -0.01 }, { heading: 6.4, elevation: 0.02 }] };
+  const saved = await f.app.inject({ method: 'PUT', url, payload: { guide: line, revision: 0 } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.deepEqual(saved.json(), { guide: line, revision: 1 });
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json(), pageBefore);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameraBefore);
+  const applied = await post(f, task.id, 'apply', 1);
+  assert.equal(applied.statusCode, 200, applied.body);
+  const appliedPage = (await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json();
+  const appliedCamera = (await f.app.inject('/api/cameras')).json();
+  const quadratic = { kind: 'quadratic', points: [
+    { heading: 6.1, elevation: -0.01 }, { heading: 6.3, elevation: 0.04 }, { heading: 6.4, elevation: 0.02 },
+  ] };
+  const curved = await f.app.inject({ method: 'PUT', url, payload: { guide: quadratic, revision: 1 } });
+  assert.equal(curved.statusCode, 200, curved.body);
+  assert.deepEqual(curved.json(), { guide: quadratic, revision: 2 });
+  await f.app.close();
+  f.app = await createApp(f.options);
+  assert.deepEqual((await f.app.inject(url)).json(), { guide: quadratic, revision: 2 });
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json(), appliedPage);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), appliedCamera);
+  const removed = await f.app.inject({ method: 'PUT', url, payload: { guide: null, revision: 2 } });
+  assert.equal(removed.statusCode, 200, removed.body);
+  assert.deepEqual(removed.json(), { guide: null, revision: 3 });
+  assert.deepEqual((await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json(), appliedPage);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), appliedCamera);
+});
+
+test('全景参考线拒绝非法形状和非有限坐标，失败不产生参考线版本', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const url = `/api/recognition-tasks/${task.id}/panorama-guide`;
+  for (const guide of [
+    { kind: 'line', points: [{ heading: 0, elevation: 0 }] },
+    { kind: 'line', points: [{ heading: 0, elevation: 0 }, { heading: 1, elevation: 0 }, { heading: 2, elevation: 0 }] },
+    { kind: 'quadratic', points: [{ heading: 0, elevation: 0 }, { heading: 1, elevation: 0 }] },
+    { kind: 'cubic', points: [{ heading: 0, elevation: 0 }, { heading: 1, elevation: 0 }] },
+    { kind: 'line', points: [null, { heading: 1, elevation: 0 }] },
+    { kind: 'line', points: [{ heading: 0 }, { heading: 1, elevation: 0 }] },
+    { kind: 'line', points: [{ heading: '0', elevation: 0 }, { heading: 1, elevation: 0 }] },
+    { kind: 'line', points: [{ heading: 0, elevation: null }, { heading: 1, elevation: 0 }] },
+    { kind: 'line', points: [{ heading: 0, elevation: 0, x: 0 }, { heading: 1, elevation: 0 }] },
+    { kind: 'line', points: [{ heading: 0, elevation: 0 }, { heading: 1, elevation: 0 }], extra: true },
+    {}, [], false,
+  ]) {
+    const response = await f.app.inject({ method: 'PUT', url, payload: { guide, revision: 0 } });
+    assert.equal(response.statusCode, 400, JSON.stringify({ guide, response: response.json() }));
+  }
+  for (const field of ['heading', 'elevation']) {
+    const point = field === 'heading' ? '{"heading":1e309,"elevation":0}' : '{"heading":1,"elevation":1e309}';
+    const response = await f.app.inject({ method: 'PUT', url, headers: { 'content-type': 'application/json' },
+      payload: `{"revision":0,"guide":{"kind":"line","points":[{"heading":0,"elevation":0},${point}]}}` });
+    assert.equal(response.statusCode, 400, response.body);
+  }
+  assert.deepEqual((await f.app.inject(url)).json(), { guide: null, revision: 0 });
+});
+
+test('全景参考线拒绝退化和超过一周的方位，保留展开方向与弧线控制点', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const url = `/api/recognition-tasks/${task.id}/panorama-guide`;
+  for (const guide of [
+    { kind: 'line', points: [{ heading: 1, elevation: 0 }, { heading: 1, elevation: 1 }] },
+    { kind: 'line', points: [{ heading: 0, elevation: 0 }, { heading: 1e-10, elevation: 1 }] },
+    { kind: 'line', points: [{ heading: 0, elevation: 0 }, { heading: 2 * Math.PI + 0.01, elevation: 0 }] },
+    { kind: 'quadratic', points: [{ heading: 0, elevation: 0 }, { heading: 1, elevation: 1 }, { heading: 0, elevation: 2 }] },
+    { kind: 'quadratic', points: [{ heading: 0, elevation: 0 }, { heading: 7, elevation: 1 }, { heading: 1, elevation: 0 }] },
+  ]) {
+    const response = await f.app.inject({ method: 'PUT', url, payload: { guide, revision: 0 } });
+    assert.equal(response.statusCode, 400, JSON.stringify({ guide, response: response.json() }));
+  }
+  assert.deepEqual((await f.app.inject(url)).json(), { guide: null, revision: 0 });
+  const quadratic = { kind: 'quadratic', points: [
+    { heading: 7, elevation: -4 }, { heading: 9, elevation: 12 }, { heading: 8, elevation: 3 },
+  ] };
+  const curve = await f.app.inject({ method: 'PUT', url, payload: { guide: quadratic, revision: 0 } });
+  assert.equal(curve.statusCode, 200, curve.body);
+  assert.deepEqual(curve.json(), { guide: quadratic, revision: 1 });
+  const fullCircle = { kind: 'line', points: [{ heading: 0, elevation: 0 }, { heading: -2 * Math.PI, elevation: 0 }] };
+  const full = await f.app.inject({ method: 'PUT', url, payload: { guide: fullCircle, revision: 1 } });
+  assert.equal(full.statusCode, 200, full.body);
+  assert.deepEqual(full.json(), { guide: fullCircle, revision: 2 });
+});
+
+test('全景参考线要求明确的形状和可安全递增的整数版本', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const url = `/api/recognition-tasks/${task.id}/panorama-guide`;
+  for (const payload of [
+    { guide: null, revision: Number.MAX_SAFE_INTEGER },
+    { guide: null, revision: 1e20 },
+    { guide: null, revision: -1 },
+    { guide: null, revision: 0.5 },
+    { guide: null, revision: '0' },
+    { guide: null }, { revision: 0 }, { guide: null, revision: 0, ignored: true },
+  ]) {
+    const response = await f.app.inject({ method: 'PUT', url, payload });
+    assert.equal(response.statusCode, 400, JSON.stringify({ payload, response: response.json() }));
+  }
+  assert.deepEqual((await f.app.inject(url)).json(), { guide: null, revision: 0 });
+});
+
+test('全景参考线按任务隔离，删除保留版本，并发旧版本保存返回 409', async (t) => {
+  const f = await fixture(t);
+  const first = await createAndWait(f);
+  const line = { kind: 'line', points: [{ heading: -1, elevation: 0.01 }, { heading: 1, elevation: 0.01 }] };
+  const firstUrl = `/api/recognition-tasks/${first.id}/panorama-guide`;
+  const saved = await f.app.inject({ method: 'PUT', url: firstUrl, payload: { guide: line, revision: 0 } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  const second = await createAndWait(f);
+  const secondUrl = `/api/recognition-tasks/${second.id}/panorama-guide`;
+  assert.deepEqual((await f.app.inject(secondUrl)).json(), { guide: null, revision: 0 });
+  const independent = await f.app.inject({ method: 'PUT', url: secondUrl, payload: { guide: line, revision: 0 } });
+  assert.equal(independent.statusCode, 200, independent.body);
+  const removed = await f.app.inject({ method: 'PUT', url: firstUrl, payload: { guide: null, revision: 1 } });
+  assert.equal(removed.statusCode, 200, removed.body);
+  assert.deepEqual(removed.json(), { guide: null, revision: 2 });
+  await f.app.close();
+  f.app = await createApp(f.options);
+  assert.deepEqual((await f.app.inject(firstUrl)).json(), { guide: null, revision: 2 });
+  assert.deepEqual((await f.app.inject(secondUrl)).json(), { guide: line, revision: 1 });
+  const stale = await f.app.inject({ method: 'PUT', url: firstUrl, payload: { guide: line, revision: 1 } });
+  assert.equal(stale.statusCode, 409, stale.body);
+  assert.deepEqual((await f.app.inject(firstUrl)).json(), { guide: null, revision: 2 });
+  const repeated = await f.app.inject({ method: 'PUT', url: firstUrl, payload: { guide: null, revision: 2 } });
+  assert.equal(repeated.statusCode, 200, repeated.body);
+  assert.deepEqual(repeated.json(), { guide: null, revision: 3 });
+  const attempts = await Promise.all([line, null].map((guide) => f.app.inject({ method: 'PUT', url: firstUrl,
+    payload: { guide, revision: 3 } })));
+  assert.deepEqual(attempts.map((response) => response.statusCode).sort(), [200, 409]);
+  const winner = attempts.find((response) => response.statusCode === 200).json();
+  assert.equal(winner.revision, 4);
+  assert.deepEqual((await f.app.inject(firstUrl)).json(), winner);
+  const missing = await f.app.inject({ method: 'PUT', url: '/api/recognition-tasks/unknown/panorama-guide',
+    payload: { guide: line, revision: 0 } });
+  assert.equal(missing.statusCode, 404, missing.body);
+});
+
 test('识别任务持久化、手动标注和忽略、重新计算、一键应用完整流程', async (t) => {
   const f = await fixture(t);
   let task = await createAndWait(f);
@@ -185,6 +412,15 @@ test('识别串行排队，取消排队和执行中的任务后队列可继续',
   await started;
   const second = (await create()).json();
   assert.equal((await f.app.inject(`/api/recognition-tasks/${second.id}`)).json().status, 'queued');
+  for (const task of [first, second]) {
+    const url = `/api/recognition-tasks/${task.id}/panorama-guide`;
+    assert.deepEqual((await f.app.inject(url)).json(), { guide: null, revision: 0 });
+    for (const guide of [null, { kind: 'line', points: [{ heading: 0, elevation: 0 }, { heading: 1, elevation: 0 }] }]) {
+      const blocked = await f.app.inject({ method: 'PUT', url, payload: { guide, revision: 0 } });
+      assert.equal(blocked.statusCode, 409, blocked.body);
+    }
+    assert.deepEqual((await f.app.inject(url)).json(), { guide: null, revision: 0 });
+  }
   const cancel = (id) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${id}/cancel`, payload: {} });
   assert.equal((await cancel(second.id)).json().status, 'cancelled');
   assert.equal((await cancel(first.id)).json().status, 'cancelled');

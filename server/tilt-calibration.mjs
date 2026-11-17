@@ -109,7 +109,7 @@ function residuals(parameters, camera, geometry, samples) {
       const dx = Cartesian3.dot(gradient, columns[0]) / sample.fx;
       const dy = -Cartesian3.dot(gradient, columns[2]) / sample.fy;
       const pixels = angle / Math.max(1e-12, Math.hypot(dx, dy));
-      result.push({ pixels, angle, snapshotId: sample.snapshot.id, weight: 1 / sample.points.length });
+      result.push({ pixels, angle, snapshotId: sample.snapshot.id, weight: (sample.weight ?? 1) / sample.points.length });
     }
   }
   return result;
@@ -465,5 +465,83 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
       '样本较少或采样方向集中时，结果对标注和固定参数误差更敏感'],
     message: accepted ? '已生成四项安装参数，请复核后点击应用'
       : [solution.converged ? '拟合已收敛' : '拟合未收敛', ...failures].join('；'),
+  };
+}
+
+export function refineInstallation(camera, snapshots, observations, requestedRange, baseSnapshotIds) {
+  const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
+  const geometry = cameraGeometry(camera);
+  const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
+  const baseIds = new Set(baseSnapshotIds);
+  const baseSamples = samples.filter((sample) => baseIds.has(sample.snapshot.id));
+  const highSamples = samples.filter((sample) => !baseIds.has(sample.snapshot.id));
+  const initial = [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
+  const installationOf = (parameters) => Object.fromEntries(['pAxisPitch', 'pAxisRoll', 'tiltOffset', 'imageRoll']
+    .map((key, index) => [key, parameters[index]]));
+  // 两组先按实际有效图片平均，任务拆分和图数不改变基础组与高倍组的总权重。
+  for (const sample of samples) sample.weight = 1 / (2 * (baseIds.has(sample.snapshot.id) ? baseSamples.length : highSamples.length));
+  const summarize = (rows) => ({ sampleCount: rows.length,
+    zoomRange: rows.length ? { min: Math.min(...rows.map((row) => row.zoom)), max: Math.max(...rows.map((row) => row.zoom)) } : null,
+    ...panCoverage(rows.map((row) => row.pan)),
+    rmsResidualPixels: rows.length ? Math.sqrt(rows.reduce((sum, row) => sum + row.rmsResidualPixels ** 2, 0) / rows.length) : null,
+    rmsAngularResidualDegrees: rows.length ? Math.sqrt(rows.reduce((sum, row) => sum + row.rmsAngularResidualDegrees ** 2, 0) / rows.length) : null,
+  });
+  const compare = (parameters) => {
+    const evaluated = evaluateInstallation({ ...camera, ...installationOf(parameters) }, samples.map((sample) => sample.snapshot),
+      samples.map((sample) => ({ snapshotId: sample.snapshot.id, points: sample.annotation })), range);
+    const perSnapshot = evaluated.perSnapshot.map((row) => ({ ...row, group: baseIds.has(row.snapshotId) ? 'base' : 'high' }));
+    const base = summarize(perSnapshot.filter((row) => row.group === 'base'));
+    const high = summarize(perSnapshot.filter((row) => row.group === 'high'));
+    const overall = summarize(perSnapshot);
+    if (base.sampleCount && high.sampleCount) {
+      for (const key of ['rmsResidualPixels', 'rmsAngularResidualDegrees']) overall[key] = Math.hypot(base[key], high[key]) / Math.sqrt(2);
+    }
+    return { installation: installationOf(parameters), overall, base, high, perSnapshot,
+      objective: loss(residuals(parameters, camera, geometry, samples)) };
+  };
+  const before = compare(initial);
+  const common = { model: 'wgs84-horizon-refinement-v1', generatedAt: new Date().toISOString(), ...range,
+    sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded, before,
+    maximumAcceptedRmsPixels: maximumRmsPixels, applied: false };
+  if (!baseSamples.length || !highSamples.length) return { ...common, status: 'insufficient_data', installation: null, after: before,
+    diagnostics: { converged: false, conditionNumber: null, failures: [!baseSamples.length ? '基础组没有有效观测' : '高倍组没有有效观测'] },
+    message: '基础组与高倍组都需要有效的停稳截图和正式标注' };
+  if (Math.max(...highSamples.map((sample) => sample.ptz.Zoom)) <= Math.max(...baseSamples.map((sample) => sample.ptz.Zoom))) {
+    return { ...common, status: 'insufficient_data', installation: null, after: before,
+      diagnostics: { converged: false, conditionNumber: null, failures: ['高倍组没有倍率高于基础组最大参与倍率的有效截图'] },
+      message: '高倍组至少需要一张有效截图的倍率高于基础组最大参与倍率' };
+  }
+  // 精修只从冻结的基础结果开始；当前相机的四项修正不参与初值选择。
+  const solution = optimizeInstallation(initial, camera, geometry, samples);
+  const normal = linearizeInstallation(solution.parameters, camera, geometry, samples);
+  const inverseColumns = [0, 1, 2, 3].map((index) => solveLinear(normal.matrix, [0, 1, 2, 3].map((column) => Number(column === index))));
+  let conditionNumber = null;
+  if (inverseColumns.every(Boolean)) {
+    const norm = Math.max(...normal.matrix.map((row) => row.reduce((sum, value) => sum + Math.abs(value), 0)));
+    const inverseNorm = Math.max(...[0, 1, 2, 3].map((row) => inverseColumns.reduce((sum, column) => sum + Math.abs(column[row]), 0)));
+    if (Number.isFinite(norm * inverseNorm)) conditionNumber = norm * inverseNorm;
+  }
+  const attempted = compare(solution.parameters);
+  const withinRms = (comparison) => ['overall', 'base', 'high'].every((key) => Number.isFinite(comparison[key].rmsResidualPixels)
+    && comparison[key].rmsResidualPixels <= maximumRmsPixels);
+  const improved = before.objective - attempted.objective > 1e-12 * (1 + before.objective)
+    && Math.hypot(...solution.parameters.map((value, index) => value - initial[index])) >= 1e-7;
+  const failures = [];
+  if (!solution.converged) failures.push('拟合未收敛');
+  if (conditionNumber === null || conditionNumber >= 1e8) failures.push('四参数不可可靠辨识');
+  for (const [key, label] of [['overall', '总体'], ['base', '基础组'], ['high', '高倍组']]) {
+    if (!Number.isFinite(attempted[key].rmsResidualPixels) || attempted[key].rmsResidualPixels > maximumRmsPixels) {
+      failures.push(`${label} RMS ${attempted[key].rmsResidualPixels?.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素门槛`);
+    }
+  }
+  const noChange = !improved && !failures.length && withinRms(before);
+  if (!improved && !noChange) failures.push('联合稳健目标在现有终止精度内没有改善');
+  const accepted = improved && !failures.length;
+  return { ...common, status: noChange ? 'no_change' : accepted ? 'estimated' : 'unreliable',
+    installation: noChange ? installationOf(initial) : accepted ? installationOf(solution.parameters) : null,
+    after: noChange ? before : attempted,
+    diagnostics: { converged: solution.converged, conditionNumber, failures },
+    message: noChange ? '基准已满足质量要求，无需修正' : accepted ? '已生成联合精修候选，请比较基准与候选误差'
+      : failures.join('；'),
   };
 }

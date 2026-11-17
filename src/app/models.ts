@@ -187,6 +187,38 @@ export interface HorizonMeasurement {
   directionDifferenceDegrees: number | null;
   rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null;
 }
+export interface RefinementSelection {
+  revision: number;
+  base: { taskId: string; revision: number; resultId: string } | null;
+  supplemental: { taskId: string; revision: number }[];
+}
+export interface RefinementSummary {
+  sampleCount: number; zoomRange: { min: number; max: number } | null;
+  distinctPanCount: number; panCoverageDegrees: number;
+  rmsResidualPixels: number | null; rmsAngularResidualDegrees: number | null;
+}
+export interface RefinementComparison {
+  installation: Pick<Calibration, 'pAxisPitch' | 'pAxisRoll' | 'tiltOffset' | 'imageRoll'>;
+  overall: RefinementSummary; base: RefinementSummary; high: RefinementSummary; objective: number;
+  perSnapshot: (HorizonMeasurement & { taskId: string; group: 'base' | 'high' })[];
+}
+export interface InstallationRefinement {
+  model: string; resultId: string; generatedAt: string; selectionRevision: number;
+  status: 'estimated' | 'no_change' | 'insufficient_data' | 'unreliable';
+  installation: RefinementComparison['installation'] | null;
+  before: RefinementComparison; after: RefinementComparison;
+  baseCamera: Calibration & Pick<Camera, 'serial' | 'code' | 'updatedAt'>; generatedCamera: Camera;
+  sources: { role: 'base' | 'high'; taskId: string; revision: number; resultId?: string;
+    inputSnapshotIds: string[]; sourceSnapshotIds: string[] }[];
+  sourceSnapshotIds: string[]; excluded: { taskId?: string; snapshotId: string; reason: string }[];
+  diagnostics: { converged: boolean; conditionNumber: number | null; failures: string[] };
+  maximumAcceptedRmsPixels: number; message: string; stale: boolean; staleReasons: string[];
+  applied: boolean; appliedAt: string | null;
+}
+export interface RefinementMeasurement {
+  taskId: string; revision: number; selectionRevision: number; mode: 'before' | 'after'; resultId: string | null;
+  perSnapshot: RefinementComparison['perSnapshot']; excluded: { snapshotId: string; reason: string }[];
+}
 export interface RecognitionTask {
   id: string; sourceTaskId: string; cameraId: string; cameraName: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
@@ -195,6 +227,8 @@ export interface RecognitionTask {
   resultId: string | null;
   resultRevision?: number;
   fitCamera?: Calibration;
+  refinementSelection?: RefinementSelection;
+  refinement?: InstallationRefinement;
 }
 export interface RecognitionItem {
   snapshotId: string; snapshot: Snapshot; points: HorizonPoint[]; detectedPoints: HorizonPoint[];

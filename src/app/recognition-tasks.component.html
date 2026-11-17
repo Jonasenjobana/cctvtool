@@ -224,7 +224,7 @@
                 </div>
               }
               <div class="legend reference-legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span>
-                @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>基准理论海天线</span> }
+                @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>{{ comparisonMode() === 'after' ? '候选' : '基准' }}理论海天线</span> }
                 <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
                 <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
                 @for (reference of neighbors(); track reference.side) {
@@ -232,10 +232,10 @@
                 }
               </div>
               @if (showGuide() && singleGuide().error) { <p class="error" role="alert">全景参考线映射失败：{{ singleGuide().error }}</p> }
-              @if (measuring()) { <p class="image-info" role="status">正在计算基准海天线对照…</p> }
+              @if (measuring()) { <p class="image-info" role="status">正在计算{{ measurementLabel() }}…</p> }
               @if (measurement(); as row) {
-                <section class="measurement" aria-label="原图基准海天线测量">
-                  <h4>基准海天线对照</h4>
+                <section class="measurement" aria-label="原图海天线测量">
+                  <h4>{{ measurementLabel() }}</h4>
                   <dl class="measurement-metrics">
                     @for (residual of row.verticalResiduals; track residual.position) {
                       <div><dt>{{ residualPositions[residual.position] }}垂直偏差</dt><dd>
@@ -327,6 +327,91 @@
           @if (coarse()) { <p class="note">历史预扫粗结果仅供查看，不应用到摄像头配置。</p> }
           @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，仍需逐图复核。</p> }
           <p class="note">修改标注后需重新生成安装参数；已选基准的独立复核自动更新。</p>
+          <section class="validation-section" aria-label="基础与高倍联合精修">
+            <div class="section-heading"><h2>联合精修</h2></div>
+            <label class="validation-source">基础标定结果
+              <select [ngModel]="refinementBaseId()" (ngModelChange)="selectRefinementBase($event)"
+                [disabled]="busy() || loading() || running() || generatingPanorama()">
+                <option value="">选择合格基础结果</option>
+                @for (reference of validationSources(); track reference.id) {
+                  <option [value]="reference.id">{{ reference.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference) }} · {{ reference.result?.sourceSnapshotIds?.length }} 张</option>
+                }
+              </select>
+            </label>
+            <details class="refinement-sources"><summary>补充高倍任务（已选 {{ refinementSupplementalIds().length }}）</summary>
+              @for (source of refinementSupplementalSources(); track source.id) {
+                <label><input type="checkbox" [ngModel]="refinementSupplementalIds().includes(source.id)"
+                  (ngModelChange)="selectRefinementSupplemental(source.id, $event)" [disabled]="busy() || loading() || running() || generatingPanorama()">
+                  {{ source.createdAt | date:'MM-dd HH:mm:ss' }} · {{ source.sampleCount }} 张</label>
+              }
+            </details>
+            @if (nextTaskOffset() !== null) {
+              <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多来源任务</button>
+            }
+            <p class="note">当前任务属于高倍组。基础组与高倍组各占一半权重；高倍任务无需单独拟合。来源选择立即保存。</p>
+            <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || !task.refinementSelection?.base"
+              (click)="refine()">生成联合精修候选</button>
+            @if (task.refinementSelection?.base) {
+              <div class="actions refinement-modes" aria-label="原图参数对照">
+                <button type="button" [attr.aria-pressed]="comparisonMode() === 'before'" (click)="selectComparisonMode('before')"
+                  [disabled]="busy() || loading() || running() || dirty() || generatingPanorama()">基准理论线</button>
+                <button type="button" [attr.aria-pressed]="comparisonMode() === 'after'" (click)="selectComparisonMode('after')"
+                  [disabled]="busy() || loading() || running() || dirty() || generatingPanorama() || !refinement() || refinement()?.stale">候选理论线</button>
+              </div>
+            }
+            @if (refinement(); as candidate) {
+              <p class="result-message" [class.error]="candidate.stale || candidate.status === 'unreliable' || candidate.status === 'insufficient_data'" role="status">
+                {{ candidate.stale ? '精修候选已过期' : candidate.message }}</p>
+              @if (candidate.stale) { <ul class="error">@for (reason of candidate.staleReasons; track $index) { <li>{{ reason }}</li> }</ul> }
+              <table><thead><tr><th scope="col">参数</th><th scope="col">基准值</th><th scope="col">{{ candidate.status === 'unreliable' ? '求解值' : '候选值' }}</th></tr></thead><tbody>
+                @for (field of fields; track field.key) {
+                  <tr><th scope="row">{{ field.label }}</th><td>{{ candidate.before.installation[field.key] | number:'1.4-4' }}°</td>
+                    <td>{{ candidate.after.installation[field.key] | number:'1.4-4' }}°</td></tr>
+                }
+              </tbody></table>
+              <div class="validation-table" tabindex="0" role="region" aria-label="联合精修分组前后误差">
+                <table><thead><tr><th scope="col">组</th><th scope="col">有效图</th><th scope="col">Z</th><th scope="col">P 覆盖</th>
+                  <th scope="col">RMS 前→后(px)</th><th scope="col">角度 RMS 前→后(°)</th></tr></thead><tbody>
+                  @for (group of refinementGroups; track group.key) {
+                    @let before = candidate.before[group.key]; @let after = candidate.after[group.key];
+                    <tr [class.validation-failed]="after.rmsResidualPixels !== null && after.rmsResidualPixels > candidate.maximumAcceptedRmsPixels">
+                      <th scope="row">{{ group.label }}</th><td>{{ after.sampleCount }}</td><td>{{ after.zoomRange?.min | number:'1.1-1' }}～{{ after.zoomRange?.max | number:'1.1-1' }}</td>
+                      <td>{{ after.panCoverageDegrees | number:'1.1-1' }}°</td>
+                      <td>{{ before.rmsResidualPixels | number:'1.2-2' }} → {{ after.rmsResidualPixels | number:'1.2-2' }}</td>
+                      <td>{{ before.rmsAngularResidualDegrees | number:'1.4-4' }} → {{ after.rmsAngularResidualDegrees | number:'1.4-4' }}</td>
+                    </tr>
+                  }
+                </tbody></table>
+              </div>
+              <p class="note">联合稳健目标：{{ candidate.before.objective | number:'1.6-6' }} → {{ candidate.after.objective | number:'1.6-6' }}；
+                收敛：{{ candidate.diagnostics.converged ? '是' : '否' }}；条件数：{{ candidate.diagnostics.conditionNumber | number:'1.2-2' }}。</p>
+              <details><summary>逐图前后误差（{{ candidate.sourceSnapshotIds.length }} 张）</summary>
+                <div class="validation-table" tabindex="0" role="region" aria-label="联合精修逐图前后误差">
+                  <table><thead><tr><th scope="col">组</th><th scope="col">P/T/Z</th><th scope="col">尺寸</th><th scope="col">RMS 前→后(px)</th>
+                    <th scope="col">角度 RMS 前→后(°)</th><th scope="col">左/中/右偏差 前→后(px)</th><th scope="col">方向差 前→后(°)</th></tr></thead><tbody>
+                    @for (row of candidate.after.perSnapshot; track row.snapshotId; let index = $index) {
+                      @let before = candidate.before.perSnapshot[index];
+                      <tr><th scope="row" [title]="row.taskId">{{ row.group === 'base' ? '基础' : '高倍' }}</th>
+                        <td><button type="button" [disabled]="busy() || loading() || generatingPanorama() || row.taskId !== task.id" (click)="openValidationItem(row.snapshotId)">
+                          {{ row.pan | number:'1.2-2' }}/{{ row.tilt | number:'1.2-2' }}/{{ row.zoom | number:'1.1-1' }}</button></td>
+                        <td>{{ row.width }}×{{ row.height }}</td><td>{{ before.rmsResidualPixels | number:'1.2-2' }} → {{ row.rmsResidualPixels | number:'1.2-2' }}</td>
+                        <td>{{ before.rmsAngularResidualDegrees | number:'1.4-4' }} → {{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td>
+                        <td>@for (residual of row.verticalResiduals; track residual.position; let pointIndex = $index) {
+                          {{ $first ? '' : ' / ' }}{{ signedResidual(before.verticalResiduals[pointIndex].offsetPixels) }} → {{ signedResidual(residual.offsetPixels) }}
+                        }</td><td>{{ signedResidual(before.directionDifferenceDegrees) }} → {{ signedResidual(row.directionDifferenceDegrees) }}</td>
+                      </tr>
+                    }
+                  </tbody></table>
+                </div>
+              </details>
+              @if (candidate.excluded.length) {
+                <details><summary>排除 {{ candidate.excluded.length }} 张截图</summary><ul>
+                  @for (excluded of candidate.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }
+                </ul></details>
+              }
+              <p class="note">{{ candidate.model }} · {{ candidate.generatedAt | date:'MM-dd HH:mm:ss' }}。参与图对照用于比较精修前后，不属于独立复核。画面与姿态严格同步尚未验证。</p>
+            }
+          </section>
           <section class="validation-section" aria-label="独立复核安装参数">
             <div class="section-heading"><h2>独立复核</h2></div>
             <label class="validation-source">基准标定来源

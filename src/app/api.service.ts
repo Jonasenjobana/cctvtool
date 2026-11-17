@@ -2,7 +2,8 @@ import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
-import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage, InstallationValidation } from './models';
+import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage, InstallationValidation,
+  RefinementSelection, RefinementMeasurement } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
 import type { PanoramaGuide, PanoramaGuideState } from '../../shared/panorama-guide';
@@ -139,6 +140,17 @@ export class ApiService {
   }
   generateInstallation(id: string, revision: number) {
     return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/generate`, { revision }).pipe(timeout(95000)));
+  }
+  saveRefinementSources(id: string, revision: number, selection: RefinementSelection) {
+    return firstValueFrom(this.http.put<RecognitionTask>(`/api/recognition-tasks/${id}/refinement-sources`,
+      { revision, selectionRevision: selection.revision, base: selection.base, supplemental: selection.supplemental }).pipe(timeout(10000)));
+  }
+  refineInstallation(id: string, revision: number, selectionRevision: number) {
+    return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/refine`, { revision, selectionRevision }).pipe(timeout(95000)));
+  }
+  measureRefinement(id: string, revision: number, selectionRevision: number, mode: 'before' | 'after', resultId?: string) {
+    return firstValueFrom(this.http.post<RefinementMeasurement>(`/api/recognition-tasks/${id}/refinement-measure`,
+      { revision, selectionRevision, mode, ...(resultId ? { resultId } : {}) }).pipe(timeout(95000)));
   }
   validateInstallation(id: string, revision: number, referenceTaskId: string, referenceResultId: string) {
     return firstValueFrom(this.http.post<InstallationValidation>(`/api/recognition-tasks/${id}/validate`,

@@ -6,7 +6,8 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { httpError } from './errors.mjs';
 import { calibrationKeys, calibrationOf } from './store.mjs';
-import { estimateInstallation, evaluateInstallation } from './tilt-calibration.mjs';
+import { estimateInstallation, evaluateInstallation, refineInstallation } from './tilt-calibration.mjs';
+import { refinementInputs, refinementStaleReasons, withRefinementState } from './installation-refinement.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
@@ -226,8 +227,11 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   } } }, async (request, reply) => {
     return reply.code(202).send(createTask(request.body.sourceTaskId));
   });
-  app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => store.listRecognitionTasks(pageOptions(request.query)));
-  app.get('/api/recognition-tasks/:id', async (request) => store.getRecognitionTask(request.params.id));
+  app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => {
+    const page = store.listRecognitionTasks(pageOptions(request.query));
+    return { ...page, tasks: page.tasks.map((task) => withRefinementState(store, task)) };
+  });
+  app.get('/api/recognition-tasks/:id', async (request) => withRefinementState(store, store.getRecognitionTask(request.params.id)));
   app.get('/api/recognition-tasks/:id/panorama-guide', async (request) => store.getRecognitionPanoramaGuide(request.params.id));
   app.put('/api/recognition-tasks/:id/panorama-guide', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'guide'], properties: {
@@ -253,7 +257,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const task = store.getRecognitionTask(request.params.id);
     const options = pageOptions(request.query);
     const items = store.recognitionItems(task.id, options);
-    return { task, items, total: task.sampleCount, offset: options.offset,
+    return { task: withRefinementState(store, task), items, total: task.sampleCount, offset: options.offset,
       nextOffset: options.offset + items.length < task.sampleCount ? options.offset + items.length : null };
   });
   app.post('/api/recognition-tasks/:id/cancel', async (request) => {
@@ -280,12 +284,86 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       const item = store.updateRecognitionItem(task.id, previous.snapshotId, { points, ignored,
         ...(request.body.points ? { source: 'manual' } : {}), ignoreReason: ignored ? '已人工忽略' : '' });
       const updated = store.updateRecognitionTask(task.id, { revision: task.revision + 1, result: null, resultId: null });
-      return { task: updated, item };
+      return { task: withRefinementState(store, updated), item };
     });
   });
   app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
-    return store.updateRecognitionTask(task.id, installationChanges(task));
+    return withRefinementState(store, store.updateRecognitionTask(task.id, installationChanges(task)));
+  });
+  const sourceVersion = { type: 'object', additionalProperties: false, required: ['taskId', 'revision'], properties: {
+    taskId: { type: 'string', minLength: 1 }, revision: revisionSchema,
+  } };
+  app.put('/api/recognition-tasks/:id/refinement-sources', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'selectionRevision', 'base', 'supplemental'], properties: {
+      ...bodyWithRevision.properties, selectionRevision: { ...revisionSchema, maximum: Number.MAX_SAFE_INTEGER - 1 },
+      base: { anyOf: [{ type: 'null' }, { ...sourceVersion, required: ['taskId', 'revision', 'resultId'],
+        properties: { ...sourceVersion.properties, resultId: { type: 'string', minLength: 1 } } }] },
+      supplemental: { type: 'array', items: sourceVersion },
+    },
+  } } }, async (request) => store.transaction(() => {
+    const task = editable(request.params.id, request.body.revision);
+    if ((task.refinementSelection?.revision || 0) !== request.body.selectionRevision) {
+      throw httpError(409, '精修来源选择已变化，请刷新后重试');
+    }
+    const { base, supplemental, selectionRevision } = request.body;
+    if (base) refinementInputs(store, task, { base, supplemental });
+    return withRefinementState(store, store.updateRecognitionTask(task.id, { refinementSelection: { revision: selectionRevision + 1, base, supplemental } }));
+  }));
+  app.post('/api/recognition-tasks/:id/refine', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'selectionRevision'], properties: {
+      ...bodyWithRevision.properties, selectionRevision: revisionSchema,
+    },
+  } } }, async (request) => {
+    const task = editable(request.params.id, request.body.revision);
+    if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
+    const input = refinementInputs(store, task, task.refinementSelection);
+    const result = refineInstallation({ ...input.camera, ...input.baseCamera }, input.selected.map((item) => item.snapshot),
+      input.selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), input.range, input.baseSnapshotIds);
+    const taskBySnapshot = new Map(input.selected.map((item) => [item.snapshotId, item.taskId]));
+    for (const comparison of [result.before, result.after]) {
+      comparison.perSnapshot = comparison.perSnapshot.map((row) => ({ ...row, taskId: taskBySnapshot.get(row.snapshotId) }));
+    }
+    result.excluded.push(...input.excluded);
+    const refinement = { ...result, resultId: randomUUID(), selectionRevision: task.refinementSelection.revision,
+      baseCamera: input.baseCamera, generatedCamera: input.camera,
+      sources: input.sources.map((source) => ({ ...source, sourceSnapshotIds: result.sourceSnapshotIds.filter((id) => source.inputSnapshotIds.includes(id)) })),
+      stale: false, staleReasons: [], appliedAt: null };
+    return store.transaction(() => {
+      const currentTask = editable(task.id, task.revision);
+      if (currentTask.refinementSelection?.revision !== refinement.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
+      const latest = refinementInputs(store, currentTask, currentTask.refinementSelection);
+      if (Object.keys(input.camera).some((key) => input.camera[key] !== latest.camera[key])) {
+        throw httpError(409, '计算期间摄像头配置已变化，请重新生成精修候选');
+      }
+      const changed = refinementStaleReasons(store, { ...currentTask, refinement });
+      if (changed.length) throw httpError(409, changed.join('；'));
+      return store.updateRecognitionTask(task.id, { refinement });
+    });
+  });
+  app.post('/api/recognition-tasks/:id/refinement-measure', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'selectionRevision', 'mode'], properties: {
+      ...bodyWithRevision.properties, selectionRevision: revisionSchema,
+      mode: { type: 'string', enum: ['before', 'after'] }, resultId: { type: 'string', minLength: 1 },
+    },
+  } } }, async (request) => {
+    const task = editable(request.params.id, request.body.revision);
+    if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
+    const input = refinementInputs(store, task, task.refinementSelection);
+    const after = request.body.mode === 'after';
+    if (after && (!task.refinement || task.refinement.resultId !== request.body.resultId)) throw httpError(409, '精修候选编号已变化，请刷新后重试');
+    if (after) {
+      const changed = refinementStaleReasons(store, task);
+      if (changed.length) throw httpError(409, changed.join('；'));
+    }
+    const result = evaluateInstallation({ ...input.camera, ...input.baseCamera, ...(after ? task.refinement.after.installation : {}) },
+      input.selected.map((item) => item.snapshot), input.selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), input.range);
+    const taskBySnapshot = new Map(input.selected.map((item) => [item.snapshotId, item.taskId]));
+    result.perSnapshot = result.perSnapshot.map((row) => ({ ...row, taskId: taskBySnapshot.get(row.snapshotId),
+      group: input.baseSnapshotIds.includes(row.snapshotId) ? 'base' : 'high' }));
+    result.excluded.push(...input.excluded);
+    return { ...result, taskId: task.id, revision: task.revision, selectionRevision: task.refinementSelection.revision,
+      mode: request.body.mode, resultId: after ? task.refinement.resultId : null };
   });
   app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {

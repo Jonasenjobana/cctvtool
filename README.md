@@ -89,12 +89,12 @@ npm run db:init
 | [路径规划](shared/snapshot-path.ts)、[自动截图](server/snapshot-scan.mjs)、[扫描回归](tests/snapshot-scan.test.mjs) | 多点插值、精确定位、稳定回读、分组、暂停／继续及删除一致性 | 修改自动采样时 |
 | [海天线控制](server/horizon-control.mjs)、[几何回归](tests/horizon-control.test.mjs)、[历史兼容回归](tests/horizon-scan.test.mjs) | 椭球切线几何、旧海天线任务余量与冻结恢复、新任务手动识别 | 修改海天线几何或历史任务兼容后 |
 | [MCP HTTP 入口](server/mcp-http.mjs)、[HTTP 服务](server/mcp-http-app.mjs)、[工具定义](server/calibration-mcp.mjs) | 局域网 Streamable HTTP、访问认证及四个只读标定工具 | 接入或修改 MCP 时 |
-| [倾斜拟合与独立复核](server/tilt-calibration.mjs) | 海天线与 PTZ 的数值拟合、固定参数复核、质量门槛及结果 | 修改标定计算或复核时 |
+| [倾斜拟合与独立复核](server/tilt-calibration.mjs)、[精修来源](server/installation-refinement.mjs) | 海天线数值拟合、基础与高倍等权精修、固定参数测量、来源版本与质量门槛 | 修改标定计算、精修或复核时 |
 | [MCP 使用说明](docs/MCP使用说明.md)、[配置示例](mcp.config.example.json) | 局域网启动、客户端连接、AI 调用流程与排错 | 连接具备视觉能力的 AI 客户端时 |
 | [ESSLD 离线评测](scripts/essld-evaluate.py)、[Python 依赖](scripts/essld-requirements.txt) | 只读本地截图，生成海天线候选、分割掩膜与原图对照；操作见 [MCP 使用说明](docs/MCP使用说明.md#essld-独立离线试跑) | 评测专用模型时，不接入网页或 MCP |
 | [识别任务页面](src/app/recognition-tasks.component.ts)、[页面模板](src/app/recognition-tasks.component.html)、[页面样式](src/app/recognition-tasks.component.css) | 任务进度、海天线逐图与全景编辑、忽略截图、重算和应用四项安装参数 | 修改本地模型标定交互或布局时 |
 | [识别后端](server/recognition.mjs)、[模型进程](scripts/essld-recognize.py)、[共用推理](scripts/essld_model.py) | 本地模型队列、突变排除、版本校验和配置应用；SQLite 保存任务与标注 | 修改识别任务、模型执行或应用规则时 |
-| [四参数回归](tests/installation-calibration.test.mjs)、[独立复核回归](tests/installation-validation.test.mjs)、[识别任务回归](tests/recognition.test.mjs) | 四参数恢复、固定参数复核、突变过滤、持久化、编辑失效、旧结果拒绝和应用边界 | 修改本地识别、标定或复核后 |
+| [四参数回归](tests/installation-calibration.test.mjs)、[独立复核回归](tests/installation-validation.test.mjs)、[识别任务回归](tests/recognition.test.mjs)、[联合精修回归](tests/recognition-refinement.test.mjs) | 四参数恢复、固定参数复核、基础与高倍精修、突变过滤、持久化、版本失效和应用边界 | 修改本地识别、标定、精修或复核后 |
 | [接口回归](tests/api.test.mjs)、[几何回归](tests/camera-math.test.ts) | token、持久化、截图一致性和空间计算验证 | 修改上述行为后 |
 | [船体取景回归](tests/point-framing.test.ts) | 长宽高及朝向投影、50% 占比、倍率上下限和失败边界 | 修改临时点尺寸或自动倍率估算后 |
 | [参考算法回归](tests/reference-camera-math.test.ts)、[参考数值夹具](tests/fixtures/reference-camera-poses.json) | 相同安装参数与 PTZ 下的世界姿态、海天线、视频截面和最佳观察对照 | 修改安装朝向、旋转顺序或投影后 |
@@ -385,6 +385,14 @@ MCP 与网页应用共用 `.env` 中 `DATA_DIR` 指向的数据目录，先通�
 7. 截图任务的识别结果复核后，返回标定来源任务点击“应用到摄像头”，仅保存四项安装修正，立即同步当前设备表单及三维投影；不发送 PTZ 控制、不修改原始读数或历史截图。历史预扫粗结果在页面仅供查看。标注变化会清除旧结果；配置变化、参与样本被删除、旧版本或重复应用均返回冲突，需按提示重新生成。
 
 本地联合拟合模型为 `wgs84-horizon-installation-v1`；MCP 保持只估计两个 P 轴倾角的 `wgs84-horizon-p-axis-v3`。任务、模型原始标注、人工标注、忽略状态及计算结果均保存到 SQLite，重启后可继续复核。源截图被删除时识别任务保留标注记录，并在重新生成时排除该图。
+
+在高倍主任务的“联合精修”中，可选择同摄像头的合格基础标定结果（包括已应用结果），并勾选零个或多个补充高倍任务；当前任务自动属于高倍组。高倍任务不要求先完成单任务拟合，识别结束并保存正式标注即可。来源选择立即保存，刷新和服务重启可恢复；来源版本变化后先刷新，再生成候选以确认采用当前来源版本。高倍组至少有一张有效图片的 Z 严格高于基础实际参与图的最大 Z，允许其他图片混合倍率、非等间隔和随机顺序 P、不同 T、视场角及分辨率，无固定张数或完整转圈要求。
+
+精修模型 `wgs84-horizon-refinement-v1` 从选定基础四参数开始，将基础原拟合实际参与图的正式标注与全部高倍有效图联合求解。图内按点数平均，基础组和高倍组各按有效图数平均后等权合并稳健目标；高倍图如何拆分为任务不改变权重。固定位置、高度、默认朝向和光学假设，仅求解既有四项修正。当前设备的四项修正不同不会替换基础初值；每张截图自己的历史安装配置继续作为采样副本保留，不混入本次计算。
+
+候选与普通单任务结果独立保存，页面显示四项参数及总体、基础、高倍、逐图的精修前后误差，并可在现有原图中切换基准与候选理论线。总体 RMS 采用两组等权口径；有效图数、Z 范围、P 覆盖和排除原因同时保留。候选须收敛、四参数可辨识、总体和两组 RMS 各不超过 5 原图像素，且联合稳健目标在现有终止精度外改善；部分图片或某组的误差可能上升，按实值显示。基准已满足质量要求且没有实际改善时显示“无需修正”；无有效组、未收敛、不可辨识和超差保留明确原因与前后测量，不增加倍率补偿参数。
+
+参与图原图对照通过只读几何测量取得，选择参数或保存正式标注后重算，不属于独立复核。任一来源正式标注或忽略状态、基础结果编号、参与图存在性、当前固定安装条件或来源选择变化后，旧候选标为过期，仍可查看诊断。候选记录完整来源清单、输入版本和生成时设备配置；计算与预览不写设备配置、不调用 PTZ，不改变原图或历史副本。本阶段提供候选生成与对照，精修候选的独立复核和配置应用由后续任务实现；原单任务应用与独立复核继续使用原契约。合成测试和数值门槛不代表现场根因或精度已经验收。
 
 独立复核固定来源结果的四项参数及安装位置、默认朝向，按每张验证图自己的实际 P/T/FOV 计算误差，不要求等间隔或画面重叠，也不重新拟合。高倍采样应覆盖实际使用的多个 P/T；P/T 与倍率分别做配对对照，反向回位的重复性另行检查。拟合与验证的图片有重叠、来源结果过期、固定配置改变或来源参与截图被删除时拒绝复核。
 

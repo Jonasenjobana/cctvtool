@@ -4,7 +4,7 @@ import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
-import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, SnapshotGroup } from './models';
+import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement, SnapshotGroup } from './models';
 import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
   panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
@@ -40,6 +40,15 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly validationReferenceId = signal('');
   readonly measuring = signal(false);
   private readonly validationResult = signal<InstallationValidation | null>(null);
+  readonly comparisonMode = signal<'validation' | 'before' | 'after'>('validation');
+  private readonly refinementMeasurementResult = signal<RefinementMeasurement | null>(null);
+  readonly refinement = computed(() => this.selected()?.refinement);
+  readonly refinementBaseId = signal('');
+  readonly refinementSupplementalIds = signal<string[]>([]);
+  readonly refinementSupplementalSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
+    && task.id !== this.selected()?.refinementSelection?.base?.taskId && task.cameraId === this.selected()?.cameraId
+    && !['queued', 'running'].includes(task.status)));
+  readonly refinementGroups = [{ key: 'overall', label: '总体（两组等权）' }, { key: 'base', label: '基础组' }, { key: 'high', label: '高倍组' }] as const;
   readonly validationSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
     && task.cameraId === this.selected()?.cameraId && task.result?.status === 'estimated'
     && task.result.model === 'wgs84-horizon-installation-v1' && task.resultRevision === task.revision
@@ -51,8 +60,17 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     return result && task && reference && !this.dirty() && result.taskId === task.id && result.revision === task.revision
       && result.reference.taskId === reference.id && result.reference.resultId === reference.resultId ? result : null;
   });
-  readonly measurement = computed(() => this.validation()?.perSnapshot.find((row) => row.snapshotId === this.selectedItemId()));
-  readonly measurementExclusion = computed(() => this.validation()?.excluded.find((row) => row.snapshotId === this.selectedItemId())?.reason);
+  readonly refinementMeasurement = computed(() => {
+    const result = this.refinementMeasurementResult(), task = this.selected();
+    return result && task && !this.dirty() && result.taskId === task.id && result.revision === task.revision
+      && result.selectionRevision === task.refinementSelection?.revision && result.mode === this.comparisonMode()
+      && (result.mode === 'before' || (!task.refinement?.stale && result.resultId === task.refinement?.resultId)) ? result : null;
+  });
+  readonly measurement = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
+    ?.perSnapshot.find((row) => row.snapshotId === this.selectedItemId()));
+  readonly measurementExclusion = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
+    ?.excluded.find((row) => row.snapshotId === this.selectedItemId())?.reason);
+  readonly measurementLabel = computed(() => this.comparisonMode() === 'after' ? '候选海天线对照' : '基准海天线对照');
   readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
   readonly generatingPanorama = signal(false);
@@ -221,6 +239,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.validationRequest++;
     this.measuring.set(false);
     this.validationResult.set(null);
+    this.refinementMeasurementResult.set(null);
     this.clearPanorama();
     const revision = ++this.revision;
     this.loading.set(true);
@@ -247,6 +266,13 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       }
       if (this.destroyed || revision !== this.revision || this.hasDraft()) return;
       this.setTask(page.task);
+      const sourceIds = [page.task.refinementSelection?.base?.taskId, ...page.task.refinementSelection?.supplemental.map((source) => source.taskId) || []]
+        .filter((source): source is string => !!source);
+      const sourceResults = await Promise.allSettled(sourceIds.map((source) => this.api.recognitionTask(source)));
+      if (this.destroyed || revision !== this.revision) return;
+      const sources = sourceResults.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      for (const result of sourceResults) if (result.status === 'rejected') this.problem.set(`精修来源读取失败：${errorMessage(result.reason)}`);
+      this.tasks.update((tasks) => [...tasks.filter((task) => !sourceIds.includes(task.id)), ...sources]);
       this.items.set(entries);
       this.nextItemOffset.set(offset);
       this.selectItem(entries.find((item) => item.snapshotId === this.selectedItemId()) || entries[0]);
@@ -275,12 +301,15 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   private setTask(task: RecognitionTask) {
     const previous = this.selected();
-    if (previous?.id !== task.id || previous.revision !== task.revision) {
+    if (previous?.id !== task.id || previous.revision !== task.revision || previous.refinement?.resultId !== task.refinement?.resultId
+      || previous.refinementSelection?.revision !== task.refinementSelection?.revision || task.refinement?.stale) {
       this.validationRequest++;
       this.measuring.set(false);
       this.validationResult.set(null);
+      this.refinementMeasurementResult.set(null);
     }
     if (previous?.id !== task.id) {
+      this.comparisonMode.set(task.refinementSelection?.base ? task.refinement && !task.refinement.stale ? 'after' : 'before' : 'validation');
       this.validationReferenceId.set('');
       this.clearPanorama();
       this.guide.set(null);
@@ -291,7 +320,12 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.guideError.set('');
     }
     if (previous?.sourceTaskId !== task.sourceTaskId) this.sourceGroup.set(null);
+    if (this.comparisonMode() === 'after' && (!task.refinement || task.refinement.stale)) {
+      this.comparisonMode.set(task.refinementSelection?.base ? 'before' : 'validation');
+    }
     this.selected.set(task);
+    this.refinementBaseId.set(task.refinementSelection?.base?.taskId || '');
+    this.refinementSupplementalIds.set(task.refinementSelection?.supplemental.map((source) => source.taskId) || []);
     this.tasks.update((tasks) => tasks.some((item) => item.id === task.id)
       ? tasks.map((item) => item.id === task.id ? task : item) : [task, ...tasks]);
   }
@@ -852,13 +886,16 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   async validate() {
     if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
+    this.comparisonMode.set('validation');
     await this.measure();
   }
   selectValidationSource(id: string) {
+    this.comparisonMode.set('validation');
     this.validationReferenceId.set(id);
     void this.measure();
   }
   private async measure() {
+    if (this.comparisonMode() !== 'validation') return this.measureRefinement();
     if (this.destroyed) return;
     const request = ++this.validationRequest;
     this.validationResult.set(null);
@@ -874,6 +911,80 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         && reference.resultId === this.validationSource()?.resultId) this.validationResult.set(result);
     } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
     finally { if (request === this.validationRequest) this.measuring.set(false); }
+  }
+  selectComparisonMode(mode: 'before' | 'after') {
+    this.comparisonMode.set(mode);
+    void this.measure();
+  }
+  private async measureRefinement() {
+    if (this.destroyed) return;
+    const request = ++this.validationRequest, task = this.selected(), mode = this.comparisonMode();
+    this.refinementMeasurementResult.set(null);
+    this.validationResult.set(null);
+    this.measuring.set(false);
+    if (!task?.refinementSelection?.base || this.dirty() || this.running() || mode === 'validation'
+      || (mode === 'after' && (!task.refinement || task.refinement.stale))) return;
+    const revision = this.revision, selectionRevision = task.refinementSelection.revision;
+    this.measuring.set(true); this.problem.set('');
+    try {
+      const result = await this.api.measureRefinement(task.id, task.revision, selectionRevision, mode, task.refinement?.resultId);
+      if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
+        && task.revision === this.selected()?.revision && selectionRevision === this.selected()?.refinementSelection?.revision
+        && mode === this.comparisonMode()) this.refinementMeasurementResult.set(result);
+    } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
+    finally { if (request === this.validationRequest) this.measuring.set(false); }
+  }
+  async selectRefinementBase(taskId: string) {
+    await this.saveRefinementSources(taskId, this.refinementSupplementalIds().filter((id) => id !== taskId));
+  }
+  async selectRefinementSupplemental(taskId: string, checked: boolean) {
+    const ids = this.refinementSupplementalIds().filter((id) => id !== taskId);
+    if (checked) ids.push(taskId);
+    await this.saveRefinementSources(this.selected()?.refinementSelection?.base?.taskId || '', ids);
+  }
+  private async saveRefinementSources(baseId: string, supplementalIds: string[], measure = true): Promise<boolean> {
+    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return false;
+    const task = this.selected(), base = this.tasks().find((source) => source.id === baseId);
+    if (!task || (baseId && !base?.resultId)) return false;
+    this.refinementBaseId.set(baseId);
+    this.refinementSupplementalIds.set(supplementalIds);
+    this.busy.set(true); this.problem.set(''); this.message.set('');
+    let saved = false;
+    try {
+      const result = await this.api.saveRefinementSources(task.id, task.revision, { revision: task.refinementSelection?.revision || 0,
+        base: base?.resultId ? { taskId: base.id, revision: base.revision, resultId: base.resultId } : null,
+        supplemental: supplementalIds.map((id) => ({ taskId: id, revision: this.tasks().find((source) => source.id === id)!.revision })) });
+      if (this.destroyed) return false;
+      this.setTask(result);
+      this.comparisonMode.set(baseId ? 'before' : 'validation');
+      this.message.set('精修来源已保存');
+      saved = true;
+    } catch (error) { this.problem.set(errorMessage(error)); }
+    finally {
+      this.busy.set(false);
+      this.refinementBaseId.set(this.selected()?.refinementSelection?.base?.taskId || '');
+      this.refinementSupplementalIds.set(this.selected()?.refinementSelection?.supplemental.map((source) => source.taskId) || []);
+    }
+    if (saved && measure) void this.measure();
+    return saved;
+  }
+  async refine() {
+    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
+    const selected = this.selected();
+    if (!selected?.refinementSelection?.base || !await this.saveRefinementSources(selected.refinementSelection.base.taskId,
+      selected.refinementSelection.supplemental.map((source) => source.taskId), false)) return;
+    const task = this.selected()!;
+    this.busy.set(true); this.problem.set(''); this.message.set('');
+    let generated = false;
+    try {
+      const result = await this.api.refineInstallation(task.id, task.revision, task.refinementSelection!.revision);
+      if (this.destroyed) return;
+      this.setTask(result);
+      this.comparisonMode.set('after');
+      generated = true;
+    } catch (error) { this.problem.set(errorMessage(error)); }
+    finally { this.busy.set(false); }
+    if (generated) void this.measure();
   }
   async openValidationItem(snapshotId: string) {
     const item = this.items().find((entry) => entry.snapshotId === snapshotId);

@@ -1,6 +1,5 @@
-import { Cartesian3, Cartographic, Ellipsoid, EllipsoidalOccluder, HeadingPitchRoll, Math as CesiumMath, Matrix4, Transforms } from 'cesium';
+import { Cartesian3, Cartographic, HeadingPitchRoll, Math as CesiumMath, Matrix4, Transforms } from 'cesium';
 import type { VesselBodyDimensions, VesselGeometryOptions, VesselTarget } from './ais.models';
-import type { CameraPose } from './camera-math';
 
 export function vesselBodyDimensions(target: VesselTarget, options: VesselGeometryOptions, override?: VesselBodyDimensions): VesselBodyDimensions | null {
   let body = override;
@@ -18,8 +17,11 @@ export function vesselBodyDimensions(target: VesselTarget, options: VesselGeomet
 }
 
 export function vesselGeometry(target: VesselTarget, options: VesselGeometryOptions, override?: VesselBodyDimensions) {
-  const body = vesselBodyDimensions(target, options, override), { heading } = target;
-  if (!body || heading === null || !Number.isFinite(heading) || heading < 0 || heading >= 360) return null;
+  const body = vesselBodyDimensions(target, options, override);
+  // COG 仅用于缺少船艏时的船体建模，不改写报告的 heading。
+  const heading = [target.heading, target.cog].find((value): value is number =>
+    value !== null && Number.isFinite(value) && value >= 0 && value < 360);
+  if (!body || heading === undefined) return null;
   const { a, b, c, d, height } = body, length = a + b, width = c + d;
   const forward = (a - b) / 2, right = (d - c) / 2;
   const angle = CesiumMath.toRadians(heading);
@@ -33,17 +35,4 @@ export function vesselGeometry(target: VesselTarget, options: VesselGeometryOpti
   return { point, position, abcd: { a, b, c, d }, dimensions: new Cartesian3(width, length, height),
     orientation: Transforms.headingPitchRollQuaternion(position, new HeadingPitchRoll(angle, 0, 0)),
     vessel: { length, width, heading, height } };
-}
-
-export function isInCameraView(pose: CameraPose, position: Cartesian3, radius = 0): boolean {
-  const ray = Cartesian3.subtract(position, pose.position, new Cartesian3());
-  const depth = Cartesian3.dot(ray, pose.direction);
-  if (depth + radius <= 0) return false;
-  const tanH = Math.tan(CesiumMath.toRadians(pose.horizontalFov / 2));
-  const tanV = Math.tan(CesiumMath.toRadians(pose.verticalFov / 2));
-  if (Math.abs(Cartesian3.dot(ray, pose.right)) > depth * tanH + radius * Math.hypot(1, tanH)
-    || Math.abs(Cartesian3.dot(ray, pose.up)) > depth * tanV + radius * Math.hypot(1, tanV)) return false;
-  const top = Cartesian3.add(position, Cartesian3.multiplyByScalar(
-    Ellipsoid.WGS84.geodeticSurfaceNormal(position, new Cartesian3()), radius, new Cartesian3()), new Cartesian3());
-  return new EllipsoidalOccluder(Ellipsoid.WGS84, pose.position).isPointVisible(top);
 }

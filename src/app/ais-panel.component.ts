@@ -19,14 +19,21 @@ export class AisPanelComponent {
   readonly ais = inject(AisState);
   @Input() canTrack = false;
   @Input() busy = false;
+  @Input() currentZoom: number | null = null;
+  @Input() maxZoom = 73;
   @Input() operationError = '';
   @Input() operationMessage = '';
   @Output() readonly tracked = new EventEmitter<string>();
+  @Output() readonly predicted = new EventEmitter<{ mmsi: string; seconds: number | null }>();
   @Output() readonly closed = new EventEmitter<void>();
   readonly search = signal('');
   readonly lookupError = signal('');
   readonly bodyDraft = signal<BodyDraft | null>(null);
   readonly bodyError = signal('');
+  readonly zoomDraft = signal<number | null | undefined>(undefined);
+  readonly zoomError = signal('');
+  readonly predictionSeconds = signal<number | null>(this.ais.predictionSeconds() ?? 3);
+  readonly predictionError = signal('');
   readonly bodyFields = [
     { key: 'a', label: 'A 至船艏（m）' }, { key: 'b', label: 'B 至船艉（m）' },
     { key: 'c', label: 'C 至左舷（m）' }, { key: 'd', label: 'D 至右舷（m）' },
@@ -35,7 +42,7 @@ export class AisPanelComponent {
   readonly statusText = computed(() => ({ idle: '未订阅', connecting: '正在连接', connected: '已连接', reconnecting: '正在重连', error: '连接失败' })[this.ais.status()]);
   readonly geometry = computed(() => {
     const target = this.ais.selectedTarget(), source = this.ais.selectedSource();
-    return target && source ? vesselGeometry(target, source.geometry, this.ais.selectedBodyOverride() ?? undefined) : null;
+    return this.ais.useBodyGeometry() && target && source ? vesselGeometry(target, source.geometry, this.ais.selectedBodyOverride() ?? undefined) : null;
   });
   readonly bodyValues = computed<BodyDraft>(() => {
     if (this.bodyDraft()) return this.bodyDraft()!;
@@ -56,6 +63,29 @@ export class AisPanelComponent {
   editBody(field: keyof VesselBodyDimensions, value: number | null) {
     this.bodyDraft.set({ ...this.bodyValues(), [field]: value });
     this.bodyError.set('');
+  }
+
+  zoomValue() {
+    const draft = this.zoomDraft();
+    return draft === undefined ? this.ais.trackingZoom() ?? this.currentZoom : draft;
+  }
+
+  applyZoom() {
+    try {
+      this.ais.setTrackingZoom(this.zoomValue(), this.maxZoom);
+      this.zoomDraft.set(undefined);
+      this.zoomError.set('');
+    } catch (error) { this.zoomError.set(error instanceof Error ? error.message : '跟踪倍率应用失败'); }
+  }
+
+  predict() {
+    const seconds = this.predictionSeconds();
+    if (seconds === null || !Number.isFinite(seconds) || seconds < 0) {
+      this.predictionError.set('预判秒数须为大于或等于 0 的数字');
+      return;
+    }
+    this.predictionError.set('');
+    this.predicted.emit({ mmsi: this.ais.selectedMmsi(), seconds });
   }
 
   applyBody() {

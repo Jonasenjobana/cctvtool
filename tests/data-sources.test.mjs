@@ -109,19 +109,19 @@ test('AIS 定时追踪仅在位置或船艏变化后通过 HTTP 再次定位，0
   await settleTracking();
   assert.equal(f.commands.length, 1);
   await f.update({ speed: 5, date: '2026-11-13 15:59:59' });
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.equal(f.commands.length, 1);
   await f.update({ lng: 117.001 });
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.equal(f.commands.length, 2);
   await f.update({ heading: 120 });
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.equal(f.commands.length, 3);
   await f.update({ heading: 0 });
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.equal(f.commands.length, 3);
   stop();
@@ -129,6 +129,40 @@ test('AIS 定时追踪仅在位置或船艏变化后通过 HTTP 再次定位，0
   t.mock.timers.tick(5000);
   await settleTracking();
   assert.equal(f.commands.length, 3);
+});
+
+test('AIS 定时追踪在船艏缺失时响应 COG 变化，有船艏时忽略 COG 单独变化', async (t) => {
+  const f = await trackingFixture(t);
+  const { startAisTracking } = await import('../src/app/ais-tracking.ts');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const stop = startAisTracking(f.options);
+  t.after(stop);
+  await settleTracking();
+  assert.equal(f.commands.length, 1);
+  await f.update({ heading: 0, cog: 180 });
+  t.mock.timers.tick(2000);
+  await settleTracking();
+  assert.equal(f.commands.length, 1);
+  await f.update({ heading: 511 });
+  t.mock.timers.tick(2000);
+  await settleTracking();
+  assert.equal(f.commands.length, 2);
+  await f.update({ cog: 270 });
+  t.mock.timers.tick(2000);
+  await settleTracking();
+  assert.equal(f.commands.length, 3);
+  await f.update({ cog: 360 });
+  t.mock.timers.tick(2000);
+  await settleTracking();
+  assert.equal(f.commands.length, 4);
+  await f.update({ heading: 45, cog: 90 });
+  t.mock.timers.tick(2000);
+  await settleTracking();
+  assert.equal(f.commands.length, 5);
+  await f.update({ cog: 120 });
+  t.mock.timers.tick(2000);
+  await settleTracking();
+  assert.equal(f.commands.length, 5);
 });
 
 test('AIS 定时追踪在定位未回包时不重叠或排队，随后只定位最新状态', async (t) => {
@@ -150,7 +184,7 @@ test('AIS 定时追踪在定位未回包时不重叠或排队，随后只定位�
     assert.equal(f.commands.length, 1);
     release();
     await settleTracking();
-    t.mock.timers.tick(1000);
+    t.mock.timers.tick(2000);
     await settleTracking();
     assert.deepEqual(f.commands.map(command => command.pan), [90, 150]);
     t.mock.timers.tick(5000);
@@ -198,19 +232,48 @@ test('AIS 定时追踪等待控制空闲，来源失效后终止后续定位', a
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const stop = startAisTracking(f.options);
   t.after(stop);
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.equal(f.commands.length, 0);
   ready = true;
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.equal(f.commands.length, 1);
   f.sockets[0].close();
   await f.update({ heading: 150 });
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await settleTracking();
   assert.deepEqual(f.stops, [null]);
   assert.equal(f.commands.length, 1);
+});
+
+test('预判跟踪在 AIS 未更新时仍周期调用，慢请求串行且停止后不继续定位', async (t) => {
+  const f = await trackingFixture(t);
+  const { startAisTracking } = await import('../src/app/ais-tracking.ts');
+  f.options.continuous = true;
+  let release;
+  f.control.commandWait = new Promise(accept => { release = accept; });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const stop = startAisTracking(f.options);
+  try {
+    await settleTracking();
+    assert.equal(f.commands.length, 1);
+    t.mock.timers.tick(5000);
+    await settleTracking();
+    assert.equal(f.commands.length, 1);
+    release();
+    await settleTracking();
+    t.mock.timers.tick(1999);
+    await settleTracking();
+    assert.equal(f.commands.length, 1);
+    t.mock.timers.tick(1);
+    await settleTracking();
+    assert.equal(f.commands.length, 2);
+    stop();
+    t.mock.timers.tick(5000);
+    await settleTracking();
+    assert.equal(f.commands.length, 2);
+  } finally { release(); stop(); }
 });
 
 test('数据源目录给出固定项目与展示参数，不向前端暴露上游地址或供应商适配配置', async (t) => {
@@ -231,7 +294,7 @@ test('来源通过统一快照提供精简字段，AIS 分批合并且其他消�
   f.sockets[0].open();
   f.sockets[0].message({ api: 1, datas: [row] });
   assert.deepEqual((await f.snapshot()).targets, [{ mmsi: row.mmsi, time: '2026-11-13T07:59:50.000Z',
-    longitude: 117, latitude: 39, heading: null, length: 100, width: 20, speed: 0 }]);
+    longitude: 117, latitude: 39, heading: null, cog: 90, length: 100, width: 20, speed: 0 }]);
   f.sockets[0].message({ api: 1, datas: [{ ...row, mmsi: '987654321', heading: 90 }] });
   f.sockets[0].message({ api: 0, datas: [{ ...row, mmsi: '111222333' }] });
   f.sockets[0].message({ api: 2, datas: [{ voltage: 24 }] });
@@ -253,11 +316,29 @@ test('同船乱序更新不覆盖较新位置，未知方向和尺寸保持缺�
     heading: 511, shipLength: 0, shipWidth: 0, speed: 102.3 }, { ...row, mmsi: 'bad' }] });
   const snapshot = await f.snapshot();
   assert.deepEqual(snapshot.targets[0], { mmsi: row.mmsi, time: '2026-11-13T07:59:59.000Z',
-    longitude: 117, latitude: 39, heading: null, length: null, width: null, speed: null });
+    longitude: 117, latitude: 39, heading: null, cog: 90, length: null, width: null, speed: null });
   assert.match(snapshot.error, /1 条无效/);
   f.sockets[0].message('{bad');
   assert.ok((await f.snapshot()).error);
   assert.equal((await f.snapshot()).targets.length, 1);
+});
+
+test('COG 独立保留度数和北向零值，无效或缺失值归一为 null 而不改写船艏', async (t) => {
+  const f = await fixture(t);
+  await f.snapshot();
+  f.sockets[0].open();
+  for (const cog of [0, 90.25, 359.9]) {
+    f.sockets[0].message({ api: 1, datas: [{ ...row, heading: 511, cog }] });
+    const target = (await f.snapshot()).targets[0];
+    assert.equal(target.cog, cog);
+    assert.equal(target.heading, null);
+  }
+  for (const cog of [undefined, null, -1, 360, 3600, NaN, Infinity, '90']) {
+    f.sockets[0].message({ api: 1, datas: [{ ...row, heading: 135, cog }] });
+    const target = (await f.snapshot()).targets[0];
+    assert.equal(target.cog, null);
+    assert.equal(target.heading, 135);
+  }
 });
 
 test('船艏为 0 的更新保留同船旧船艏，其他字段照常更新且后续有效船艏仍可替换', async (t) => {
@@ -267,7 +348,7 @@ test('船艏为 0 的更新保留同船旧船艏，其他字段照常更新且�
   f.sockets[0].message({ api: 1, datas: [{ ...row, heading: 135, speed: 5 }] });
   f.sockets[0].message({ api: 1, datas: [{ ...row, date: '2026-11-13 15:59:59', lng: 118, heading: 0 }] });
   assert.deepEqual((await f.snapshot()).targets[0], { mmsi: row.mmsi, time: '2026-11-13T07:59:59.000Z',
-    longitude: 118, latitude: 39, heading: 135, length: 100, width: 20, speed: 0 });
+    longitude: 118, latitude: 39, heading: 135, cog: 90, length: 100, width: 20, speed: 0 });
   f.sockets[0].message({ api: 1, datas: [{ ...row, heading: 45 }] });
   assert.equal((await f.snapshot()).targets[0].heading, 135);
   f.sockets[0].message({ api: 1, datas: [{ ...row, date: '2026-11-13 15:59:59', heading: 200 }] });

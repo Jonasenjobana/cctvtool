@@ -68,7 +68,9 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @Input() vessels: readonly VesselTarget[] = [];
   @Input() vesselSource: VesselSourceInfo | null = null;
   @Input() vesselBodies: ReadonlyMap<string, VesselBodyDimensions> = new Map();
+  @Input() useVesselBodyGeometry = false;
   @Input() trackedMmsi = '';
+  @Input() predictedMmsi = '';
   @Output() readonly vesselSelected = new EventEmitter<string>();
   @Output() readonly plotLayerError = new EventEmitter<PlotLayerError>();
   @Output() readonly plotFocusResult = new EventEmitter<PlotLayerFocusResult>();
@@ -139,7 +141,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         this.plotScene.sync(this.plotLayers);
         this.plotScene.focus(this.plotFocus);
         this.aisScene = new AisScene(this.viewer, mmsi => this.zone.run(() => this.vesselSelected.emit(mmsi)));
-        this.aisScene.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi, this.vesselBodies);
+        this.aisScene.sync(this.vessels, this.vesselSource, this.trackedMmsi, this.vesselBodies, this.useVesselBodyGeometry, this.predictedMmsi);
       } catch (error) {
         this.sceneFailed = true;
         this.problem.set('三维场景初始化失败，请检查显卡与 WebGL 支持');
@@ -155,7 +157,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       this.releaseVideo();
     }
     this.update();
-    this.aisScene?.sync(this.vessels, this.vesselSource, this.pose, this.trackedMmsi, this.vesselBodies);
+    this.aisScene?.sync(this.vessels, this.vesselSource, this.trackedMmsi, this.vesselBodies, this.useVesselBodyGeometry, this.predictedMmsi);
     if (changes['temporaryPoints']) this.syncTemporaryPoints();
     if (changes['plotLayers']) this.plotScene?.sync(this.plotLayers);
     if (changes['plotFocus']) {

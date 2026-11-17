@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Cartesian3, Cartographic, Matrix3, Matrix4, Transforms } from 'cesium';
-import { isInCameraView, vesselBodyDimensions, vesselGeometry } from '../src/app/ais-math.ts';
+import { vesselBodyDimensions, vesselGeometry } from '../src/app/ais-math.ts';
 import { createCameraPose, pointTargetPtz } from '../src/app/camera-math.ts';
 import type { VesselTarget } from '../src/app/ais.models.ts';
 
 const vessel: VesselTarget = { mmsi: '123456789', time: '2026-11-13T08:00:00Z', longitude: 0, latitude: 0,
-  heading: 0, length: 100, width: 20, speed: 0 };
+  heading: 0, cog: null, length: 100, width: 20, speed: 0 };
 const options = { antennaFromSternRatio: 0.1, antennaFromPortRatio: 0.5, heightMeters: 10 };
 const near = (actual: number, expected: number, tolerance = 0.001) => assert.ok(Math.abs(actual - expected) < tolerance, `${actual} / ${expected}`);
 
@@ -41,6 +41,33 @@ test('手动 ABCD 和船高共同决定船体大小与偏移，保留原始 AIS 
   assert.deepEqual(vessel, original);
 });
 
+test('ABCD 方向优先船艏，无有效船艏时按 COG 计算中心与朝向且保留原始字段', () => {
+  const inverse = Matrix4.inverseTransformation(Transforms.eastNorthUpToFixedFrame(Cartesian3.fromDegrees(0, 0)), new Matrix4());
+  const preferred = vesselGeometry({ ...vessel, heading: 45, cog: 90 }, options)!;
+  assert.equal(preferred.vessel.heading, 45);
+  for (const heading of [null, -1, 360, 511, NaN]) {
+    const target = { ...vessel, heading, cog: 90 }, original = { ...target };
+    const geometry = vesselGeometry(target, options)!;
+    assert.ok(geometry);
+    const local = Matrix4.multiplyByPoint(inverse, geometry.position, new Cartesian3());
+    near(local.x, 40); near(local.y, 0); near(local.z, 5);
+    assert.equal(geometry.vessel.heading, 90);
+    assert.deepEqual(target, original);
+  }
+  const manual = vesselGeometry({ ...vessel, heading: null, cog: 90 }, options,
+    { a: 30, b: 90, c: 5, d: 25, height: 20 })!;
+  const local = Matrix4.multiplyByPoint(inverse, manual.position, new Cartesian3());
+  near(local.x, -30); near(local.y, -10); near(local.z, 10);
+});
+
+test('COG 0 度可作为北向，两种方向均不可用或尺寸缺失时保持报告点降级', () => {
+  assert.equal(vesselGeometry({ ...vessel, heading: null, cog: 0 }, options)!.vessel.heading, 0);
+  for (const cog of [null, -1, 360, 3600, NaN, Infinity]) {
+    assert.equal(vesselGeometry({ ...vessel, heading: null, cog }, options), null);
+  }
+  assert.equal(vesselGeometry({ ...vessel, heading: null, cog: 90, length: null }, options), null);
+});
+
 test('手动尺寸可补足缺失的 AIS 长宽，允许零边距并拒绝退化或无效船体', () => {
   const body = { a: 0, b: 100, c: 0, d: 20, height: 12 };
   const missing = { ...vessel, length: null, width: null };
@@ -52,25 +79,6 @@ test('手动尺寸可补足缺失的 AIS 长宽，允许零边距并拒绝退化
     { ...body, height: NaN }, { ...body, c: Infinity }]) {
     assert.equal(vesselGeometry(vessel, options, invalid), null);
   }
-});
-
-test('显示按摄像头实际 FOV 筛选并保留 2 公里外目标，追踪船体部分进入视场时仍保留', () => {
-  const camera = { name: '', serial: '', code: '', longitude: 0, latitude: 0, height: 100,
-    pAxisPitch: 0, pAxisRoll: 0, panOffset: 0, tiltOffset: 0, imageRoll: 0 };
-  const pose = createCameraPose(camera, { Pan: 0, Tilt: 5.2, Zoom: 4, HorizontalFieldAngle: 20, VerticalFieldAngle: 10 });
-  const inside = Cartesian3.fromDegrees(0, 0.01);
-  assert.equal(isInCameraView(pose, inside), true);
-  for (const latitude of [0.03, 0.1]) {
-    const far = Cartesian3.fromDegrees(0, latitude);
-    assert.ok(Cartesian3.distance(pose.position, far) > 2000);
-    assert.equal(isInCameraView(pose, far), true);
-  }
-  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0.01, 0.01)), false);
-  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0, -0.01)), false);
-  assert.equal(isInCameraView(pose, Cartesian3.fromDegrees(0, 1)), false);
-  const edge = Cartesian3.fromDegrees(0.0022, 0.01, 5);
-  assert.equal(isInCameraView(pose, edge), false);
-  assert.equal(isInCameraView(pose, edge, 80), true);
 });
 
 test('追踪可瞄准估算长方体的空间中心，普通海面点仍保持零高程', () => {

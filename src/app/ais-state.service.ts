@@ -2,7 +2,7 @@ import { Injectable, computed, inject, signal } from '@angular/core';
 import type { OnDestroy } from '@angular/core';
 import { ApiService, errorMessage } from './api.service';
 import { vesselBodyDimensions } from './ais-math';
-import type { VesselBodyDimensions, VesselSnapshot, VesselSourceCatalog, VesselTarget } from './ais.models';
+import type { VesselBodyDimensions, VesselPrediction, VesselSnapshot, VesselSourceCatalog, VesselTarget } from './ais.models';
 
 @Injectable({ providedIn: 'root' })
 export class AisState implements OnDestroy {
@@ -14,12 +14,24 @@ export class AisState implements OnDestroy {
   readonly trackedMmsi = signal('');
   readonly selectionRevision = signal(0);
   readonly bodyRevision = signal(0);
+  readonly useBodyGeometry = signal(false);
+  readonly trackingZoom = signal<number | null>(null);
+  readonly predictionSeconds = signal<number | null>(null);
+  readonly predictionTarget = signal<VesselTarget | null>(null);
+  readonly predictedPosition = signal<VesselPrediction | null>(null);
   readonly status = signal<VesselSnapshot['status'] | 'error'>('idle');
   readonly problem = signal('');
   readonly preferenceError = signal('');
   readonly loading = signal(false);
   readonly selectedSource = computed(() => this.catalog()?.sources.find(source => source.id === this.selectedId()) ?? null);
-  readonly selectedTarget = computed(() => this.targets().find(target => target.mmsi === this.selectedMmsi()) ?? null);
+  readonly selectedTarget = computed(() => {
+    const predicted = this.predictionTarget();
+    return predicted?.mmsi === this.selectedMmsi() ? predicted : this.targets().find(target => target.mmsi === this.selectedMmsi()) ?? null;
+  });
+  readonly predictedTarget = computed(() => {
+    const target = this.predictionTarget(), position = this.predictedPosition();
+    return target && position ? { ...target, longitude: position.longitude, latitude: position.latitude } : null;
+  });
   private readonly bodySettings = signal<ReadonlyMap<string, ReadonlyMap<string, VesselBodyDimensions>>>(new Map());
   readonly bodyOverrides = computed(() => this.bodySettings().get(this.selectedId()) ?? new Map<string, VesselBodyDimensions>());
   readonly selectedBodyOverride = computed(() => this.bodyOverrides().get(this.selectedMmsi()) ?? null);
@@ -79,13 +91,16 @@ export class AisState implements OnDestroy {
           this.status.set(snapshot.status);
           this.problem.set(snapshot.error ?? '');
           this.targets.set(snapshot.status === 'connected' ? snapshot.targets : []);
-          if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectTarget('');
-          if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.clearTracking();
+          const previous = this.predictionTarget(), latest = this.targets().find(target => target.mmsi === previous?.mmsi);
+          if (latest && previous && Date.parse(latest.time) >= Date.parse(previous.time)) this.predictionTarget.set({ ...latest });
+          if (!this.hasPrediction()) {
+            if (!this.targets().some(target => target.mmsi === this.selectedMmsi())) this.selectTarget('');
+            if (!this.targets().some(target => target.mmsi === this.trackedMmsi())) this.clearTracking();
+          }
         } catch (error) {
           this.status.set('reconnecting');
           this.targets.set([]);
-          this.selectTarget('');
-          this.clearTracking();
+          if (!this.hasPrediction()) { this.selectTarget(''); this.clearTracking(); }
           this.problem.set(errorMessage(error));
         }
       });
@@ -93,8 +108,7 @@ export class AisState implements OnDestroy {
         if (this.stream !== stream) return;
         this.status.set('reconnecting');
         this.targets.set([]);
-        this.selectTarget('');
-        this.clearTracking();
+        if (!this.hasPrediction()) { this.selectTarget(''); this.clearTracking(); }
         this.problem.set('AIS 页面连接已断开，正在重连');
       });
     } catch (error) {
@@ -114,10 +128,42 @@ export class AisState implements OnDestroy {
   clearTracking() {
     if (this.trackedMmsi()) this.selectionRevision.update(revision => revision + 1);
     this.trackedMmsi.set('');
+    this.predictionSeconds.set(null);
+    this.predictionTarget.set(null);
+    this.predictedPosition.set(null);
+  }
+
+  private hasPrediction() {
+    return this.predictionSeconds() !== null && this.predictionTarget()?.mmsi === this.trackedMmsi();
+  }
+
+  startPrediction(seconds: number | null) {
+    if (seconds === null || !Number.isFinite(seconds) || seconds < 0) throw new Error('预判秒数须为大于或等于 0 的数字');
+    const target = this.selectedTarget();
+    if (!target || !this.selectedSource()) throw new Error('该 AIS 目标已失效或未选择数据源');
+    this.clearTracking();
+    this.predictionTarget.set({ ...target });
+    this.predictionSeconds.set(seconds);
+    this.trackedMmsi.set(target.mmsi);
+  }
+
+  setUseBodyGeometry(enabled: boolean) {
+    if (enabled === this.useBodyGeometry()) return;
+    this.useBodyGeometry.set(enabled);
+    this.bodyRevision.update(revision => revision + 1);
+  }
+
+  setTrackingZoom(zoom: number | null, maxZoom: number) {
+    if (!Number.isFinite(maxZoom) || maxZoom < 1) throw new Error('摄像头最大倍率必须大于或等于 1');
+    if (zoom === null || !Number.isFinite(zoom) || zoom < 1 || zoom > maxZoom) throw new Error(`跟踪倍率须位于 1～${maxZoom}`);
+    if (zoom === this.trackingZoom()) return;
+    this.trackingZoom.set(zoom);
+    this.bodyRevision.update(revision => revision + 1);
   }
 
   setBodyDimensions(mmsi: string, dimensions: VesselBodyDimensions) {
-    const ship = this.targets().find(target => target.mmsi === mmsi), source = this.selectedSource();
+    const cached = this.predictionTarget();
+    const ship = this.targets().find(target => target.mmsi === mmsi) ?? (cached?.mmsi === mmsi ? cached : null), source = this.selectedSource();
     if (!ship || !source) throw new Error('该 AIS 目标已失效或未选择数据源');
     if (!vesselBodyDimensions(ship, source.geometry, dimensions)) {
       throw new Error('ABCD 须为非负数，A+B、C+D 和船高须大于 0');

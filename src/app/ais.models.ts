@@ -4,6 +4,7 @@ export interface VesselTarget {
   longitude: number;
   latitude: number;
   heading: number | null;
+  cog: number | null;
   length: number | null;
   width: number | null;
   speed: number | null;
@@ -13,6 +14,14 @@ export interface VesselGeometryOptions {
   antennaFromSternRatio: number;
   antennaFromPortRatio: number;
   heightMeters: number;
+}
+
+export interface VesselPrediction {
+  longitude: number;
+  latitude: number;
+  predictedAt: string;
+  elapsedSeconds: number;
+  distanceMeters: number;
 }
 
 export interface VesselBodyDimensions {

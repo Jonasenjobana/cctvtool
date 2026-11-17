@@ -21,6 +21,7 @@ import { AisState } from './ais-state.service';
 import { AisPanelComponent } from './ais-panel.component';
 import { vesselGeometry } from './ais-math';
 import { startAisTracking } from './ais-tracking';
+import { predictVesselPosition } from './ais-prediction';
 import type { VesselTarget } from './ais.models';
 import { HoldPtzControl } from './hold-ptz-control';
 import { createPtzPath } from '../../shared/snapshot-path';
@@ -48,7 +49,11 @@ export class AppComponent implements OnDestroy {
   readonly plots = inject(PlotLayerState);
   readonly ais = inject(AisState);
   readonly showAisPanel = signal(false);
-  readonly aisTargets = computed(() => this.page() === 'scene' && !this.selectedSnapshot() ? this.ais.targets() : []);
+  readonly aisTargets = computed(() => {
+    if (this.page() !== 'scene' || this.selectedSnapshot()) return [];
+    const targets = this.ais.targets(), predicted = this.ais.predictedTarget();
+    return predicted ? [...targets.filter(target => target.mmsi !== predicted.mmsi), predicted] : targets;
+  });
   readonly cameras = signal<Camera[]>([]);
   readonly selectedId = signal('');
   readonly draft = signal<CameraDraft>(emptyCamera());
@@ -231,9 +236,10 @@ export class AppComponent implements OnDestroy {
       const mmsi = this.ais.trackedMmsi(), id = this.selectedId(), sourceId = this.ais.selectedId();
       const selection = this.ais.selectionRevision(), page = this.page(), history = this.selectedSnapshot();
       const bodyRevision = this.ais.bodyRevision();
-      const status = this.ais.status(), selected = this.ais.selectedMmsi();
+      const predictionSeconds = this.ais.predictionSeconds(), selected = this.ais.selectedMmsi();
+      const status = predictionSeconds === null ? this.ais.status() : null;
       if (!mmsi) return;
-      if (!id || page !== 'scene' || history || status !== 'connected' || selected !== mmsi) {
+      if (!id || page !== 'scene' || history || (predictionSeconds === null && status !== 'connected') || selected !== mmsi) {
         untracked(() => this.ais.clearTracking());
         return;
       }
@@ -241,11 +247,12 @@ export class AppComponent implements OnDestroy {
       const stop = untracked(() => startAisTracking({
         target: () => sourceId === this.ais.selectedId() && selection === this.ais.selectionRevision()
           && id === this.selectedId() && mmsi === this.ais.trackedMmsi() && mmsi === this.ais.selectedMmsi()
-          && this.ais.status() === 'connected' && this.page() === 'scene' && !this.selectedSnapshot()
+          && (predictionSeconds !== null || this.ais.status() === 'connected') && this.page() === 'scene' && !this.selectedSnapshot()
           && navigation === this.plotNavigationRevision && bodyRevision === this.ais.bodyRevision()
-          ? this.ais.targets().find(ship => ship.mmsi === mmsi) ?? null : null,
+          ? predictionSeconds !== null ? this.ais.predictionTarget() : this.ais.targets().find(ship => ship.mmsi === mmsi) ?? null : null,
         ready: () => this.canTrackPoint(),
-        track: (current, changed) => this.locateAis(mmsi, id, sourceId, current, changed),
+        continuous: predictionSeconds !== null,
+        track: (current, changed) => this.locateAis(mmsi, id, sourceId, current, changed, predictionSeconds),
         stopped: error => {
           if (selection !== this.ais.selectionRevision() || bodyRevision !== this.ais.bodyRevision()) return;
           if (error) this.operationError.set(error instanceof Error ? error.message : errorMessage(error));
@@ -710,40 +717,77 @@ export class AppComponent implements OnDestroy {
       && this.temporaryPoints().some(item => item === point)));
   }
 
-  selectAisTarget(mmsi: string) {
+  async selectAisTarget(mmsi: string) {
     this.ais.selectTarget(mmsi);
     this.showPlotPanel.set(false);
     this.showTemporaryPoints.set(false);
     this.showAisPanel.set(true);
+    if (this.following()) return;
+    this.ais.clearTracking();
+    if (!this.canTrackPoint() || this.ais.status() !== 'connected' || !this.ais.selectedTarget()) return;
+    const id = this.selectedId(), sourceId = this.ais.selectedId(), selection = this.ais.selectionRevision();
+    const navigation = this.plotNavigationRevision, bodyRevision = this.ais.bodyRevision();
+    await this.locateAis(mmsi, id, sourceId, () => !this.following() && this.page() === 'scene' && !this.selectedSnapshot()
+      && id === this.selectedId() && sourceId === this.ais.selectedId() && selection === this.ais.selectionRevision()
+      && mmsi === this.ais.selectedMmsi() && this.ais.status() === 'connected'
+      && navigation === this.plotNavigationRevision && bodyRevision === this.ais.bodyRevision());
   }
 
   trackAis(mmsi: string) {
     if (!this.canTrackPoint() || this.ais.status() !== 'connected') return;
     if (mmsi !== this.ais.selectedMmsi()) return;
+    if (!this.ais.targets().some(ship => ship.mmsi === mmsi)) {
+      this.operationError.set('该 AIS 目标已失效，不能开始实时追踪');
+      return;
+    }
     this.ais.clearTracking();
     this.ais.trackedMmsi.set(mmsi);
   }
 
+  predictAis(request: { mmsi: string; seconds: number | null }) {
+    if (!this.canTrackPoint() || request.mmsi !== this.ais.selectedMmsi()) return;
+    try {
+      const ship = this.ais.selectedTarget();
+      if (!ship) throw new Error('该 AIS 目标已失效');
+      if (request.seconds === null) throw new Error('请填写预判秒数');
+      predictVesselPosition(ship, request.seconds);
+      this.ais.startPrediction(request.seconds);
+    } catch (error) { this.operationError.set(errorMessage(error)); }
+  }
+
   private async locateAis(mmsi: string, id: string, sourceId: string, valid: () => boolean,
-    changed: (ship: VesselTarget) => boolean): Promise<VesselTarget | null> {
+    changed: (ship: VesselTarget) => boolean = () => true, predictionSeconds: number | null = null): Promise<VesselTarget | null> {
     let located: VesselTarget | null = null;
     await this.executePrecise(async current => {
       const reading = await firstValueFrom(this.api.ptz(id));
       if (!current()) return null;
-      // PTZ 回读可能较慢，完成后再取 AIS，避免瞄准回读前的旧位置。
-      const snapshot = await this.api.dataSourceSnapshot(sourceId);
-      if (!current()) return null;
-      const ship = snapshot.targets.find(target => target.mmsi === mmsi), source = this.ais.selectedSource();
-      if (!ship || !source || snapshot.status !== 'connected' || this.ais.status() !== 'connected') throw new Error('该 AIS 目标已失效或来源已断开');
+      let ship: VesselTarget | undefined;
+      if (predictionSeconds === null) {
+        // PTZ 回读可能较慢，完成后再取 AIS，避免瞄准回读前的旧位置。
+        const snapshot = await this.api.dataSourceSnapshot(sourceId);
+        if (!current()) return null;
+        if (snapshot.status !== 'connected' || this.ais.status() !== 'connected') throw new Error('AIS 来源已断开');
+        ship = snapshot.targets.find(target => target.mmsi === mmsi);
+      } else {
+        // 预判只读取缓存的报告；SSE 校正起点，连续定位不等待 AIS 或快照接口更新。
+        ship = this.ais.predictionTarget() ?? undefined;
+      }
+      const source = this.ais.selectedSource();
+      if (!ship || !source) throw new Error('该 AIS 目标已失效或未选择数据源');
       // 定时检查与回读之间可能收到新快照，以实际用于定位的数据去重。
       if (!changed(ship)) { located = ship; return null; }
       const camera = this.acceptPreciseReading(reading);
-      const geometry = vesselGeometry(ship, source.geometry, this.ais.bodyOverrides().get(mmsi));
-      const point = geometry ? { ...geometry.point, height: geometry.vessel.height / 2 } : ship;
-      const aim = pointTargetPtz(camera, reading.raw, point);
-      const framing = geometry ? estimateVesselZoom(camera, reading.raw, geometry.point, geometry.vessel, aim, this.pointZoomMax()) : null;
-      const target = framing ? { ...aim, zoom: framing.zoom } : aim;
-      return { target, message: `AIS ${mmsi} 追踪指令已发送，位置以回读为准`, sent: () => { located = ship; } };
+      const prediction = predictionSeconds === null ? null : predictVesselPosition(ship, predictionSeconds);
+      const subject = prediction ? { ...ship, longitude: prediction.longitude, latitude: prediction.latitude } : ship;
+      const geometry = this.ais.useBodyGeometry() ? vesselGeometry(subject, source.geometry, this.ais.bodyOverrides().get(mmsi)) : null;
+      const point = geometry ? { ...geometry.point, height: geometry.vessel.height / 2 } : subject;
+      const zoom = this.ais.trackingZoom() ?? reading.raw.Zoom;
+      if (!this.inRange(zoom, 1, this.pointZoomMax())) throw new Error(`跟踪倍率须位于 1～${this.pointZoomMax()}`);
+      const target = { ...pointTargetPtz(camera, reading.raw, point), zoom };
+      return { target, message: `AIS ${mmsi} ${prediction ? '预判' : '定位'}指令已发送，位置以回读为准`, sent: () => {
+        located = ship!;
+        if (prediction) this.ais.predictedPosition.set(prediction);
+      } };
     }, valid);
     return located;
   }

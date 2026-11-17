@@ -25,6 +25,7 @@ export function decodeSeaoilAis(packet, config) {
     }
     targets.push({ mmsi, time, longitude: row.lng, latitude: row.lat,
       heading: Number.isFinite(row.heading) && row.heading >= 0 && row.heading < 360 ? row.heading : null,
+      cog: Number.isFinite(row.cog) && row.cog >= 0 && row.cog < 360 ? row.cog : null,
       length: positive(row.shipLength), width: positive(row.shipWidth),
       speed: Number.isFinite(row.speed) && row.speed >= 0 && row.speed < 102.3 ? row.speed : null });
   }

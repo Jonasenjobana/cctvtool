@@ -219,7 +219,7 @@ test('连续方向和变倍直接转发 ptz，无须回读，速度默认 129，
 test('精确定位仅由独立请求提交完整 P/T/Z，安装修正不进入目标值', async (t) => {
   const f = await fixture(t);
   const url = `/api/cameras/${f.camera.id}/precise`;
-  const target = { pan: 233.25, tilt: 3.75, zoom: 37 };
+  const target = { pan: 233.25, tilt: 3.75, zoom: 12.75 };
   const response = await f.app.inject({ method: 'POST', url, payload: target });
   assert.equal(response.statusCode, 200, response.body);
   assert.deepEqual(f.state.controls, [target]);

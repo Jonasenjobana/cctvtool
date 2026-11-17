@@ -3,6 +3,7 @@ import type { VesselTarget } from './ais.models';
 interface AisTrackingOptions {
   target: () => VesselTarget | null;
   ready: () => boolean;
+  continuous?: boolean;
   track: (current: () => boolean, changed: (ship: VesselTarget) => boolean) => Promise<VesselTarget | null>;
   stopped: (error?: unknown) => void;
 }
@@ -12,8 +13,9 @@ export function startAisTracking(options: AisTrackingOptions): () => void {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let last: VesselTarget | null = null;
   const current = () => active && options.target() !== null;
-  const changed = (ship: VesselTarget) => !last || ship.mmsi !== last.mmsi
-    || ship.longitude !== last.longitude || ship.latitude !== last.latitude || ship.heading !== last.heading;
+  const changed = (ship: VesselTarget) => options.continuous === true || !last || ship.mmsi !== last.mmsi
+    || ship.longitude !== last.longitude || ship.latitude !== last.latitude || ship.heading !== last.heading
+    || (ship.heading === null && ship.cog !== last.cog);
   const stop = () => { active = false; clearTimeout(timeout); };
   const finish = (error?: unknown) => { stop(); options.stopped(error); };
 
@@ -30,7 +32,7 @@ export function startAisTracking(options: AisTrackingOptions): () => void {
       }
     } catch (error) { if (active) finish(error); return; }
     // 完成后再计时，只处理最新目标，不累积在途期间的中间位置。
-    if (active) timeout = setTimeout(() => { void tick(); }, 1000);
+    if (active) timeout = setTimeout(() => { void tick(); }, 2000);
   };
   void tick();
   return stop;

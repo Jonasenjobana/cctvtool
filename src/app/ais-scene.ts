@@ -1,13 +1,12 @@
 import {
   BoxGeometry, BoxOutlineGeometry, Cartesian2, Cartesian3, Color, ColorGeometryInstanceAttribute,
-  Ellipsoid, EllipsoidalOccluder, Entity, GeometryInstance, LabelStyle, Matrix4,
+  Entity, GeometryInstance, LabelStyle, Matrix4,
   PerInstanceColorAppearance, Primitive, PrimitiveCollection, ScreenSpaceEventHandler, ScreenSpaceEventType,
 } from 'cesium';
 import * as Cesium from 'cesium';
 import type { Viewer } from 'cesium';
-import type { CameraPose } from './camera-math';
 import type { VesselBodyDimensions, VesselSourceInfo, VesselTarget } from './ais.models';
-import { isInCameraView, vesselGeometry } from './ais-math';
+import { vesselGeometry } from './ais-math';
 
 // Cesium 的类型声明省略渲染队列；仅将本模块的盒命令放在视频合成之后。
 const renderPass = (Cesium as unknown as { Pass: { OVERLAY: number; TRANSLUCENT: number } }).Pass;
@@ -39,14 +38,12 @@ class AisOverlayPrimitive extends Primitive {
   }
 }
 
-interface VesselSceneEntry { entity: Entity; key: string; occlusionPoint: Cartesian3; box?: PrimitiveCollection }
+interface VesselSceneEntry { entity: Entity; key: string; box?: PrimitiveCollection }
 
 /** 仅拥有 AIS 场景资源；数据源选择、缓存和设备控制由页面负责。 */
 export class AisScene {
   private readonly entities = new Map<string, VesselSceneEntry>();
   private readonly handler: ScreenSpaceEventHandler;
-  private readonly stopVisibility: () => void;
-  private readonly occluder = new EllipsoidalOccluder(Ellipsoid.WGS84);
   private sourceId = '';
 
   constructor(private readonly viewer: Viewer, selected: (mmsi: string) => void) {
@@ -58,29 +55,19 @@ export class AisScene {
         if (entry.entity === picked.id) { selected(mmsi); break; }
       }
     }, ScreenSpaceEventType.LEFT_CLICK);
-    this.stopVisibility = viewer.scene.preRender.addEventListener(() => {
-      this.occluder.cameraPosition = viewer.camera.positionWC;
-      for (const entry of this.entities.values()) {
-        const visible = this.occluder.isPointVisible(entry.occlusionPoint);
-        entry.entity.show = visible;
-        if (entry.box) entry.box.show = visible;
-      }
-    });
   }
 
-  sync(targets: readonly VesselTarget[], source: VesselSourceInfo | null, pose: CameraPose | undefined, trackedMmsi: string,
-    bodies: ReadonlyMap<string, VesselBodyDimensions>) {
+  sync(targets: readonly VesselTarget[], source: VesselSourceInfo | null, trackedMmsi: string,
+    bodies: ReadonlyMap<string, VesselBodyDimensions>, useBodyGeometry = false, predictedMmsi = '') {
     if (this.sourceId !== (source?.id ?? '')) { this.clear(); this.sourceId = source?.id ?? ''; }
     const visible = new Set<string>();
-    if (source && pose) {
+    if (source) {
       for (const target of targets) {
-        const tracked = target.mmsi === trackedMmsi;
-        const geometry = tracked ? vesselGeometry(target, source.geometry, bodies.get(target.mmsi)) : null;
+        const tracked = target.mmsi === trackedMmsi, predicted = target.mmsi === predictedMmsi;
+        const geometry = tracked && useBodyGeometry ? vesselGeometry(target, source.geometry, bodies.get(target.mmsi)) : null;
         const position = geometry?.position ?? Cartesian3.fromDegrees(target.longitude, target.latitude);
-        const radius = geometry ? Cartesian3.magnitude(geometry.dimensions) / 2 : 0;
-        if (!isInCameraView(pose, position, radius)) continue;
         visible.add(target.mmsi);
-        const key = JSON.stringify([target.longitude, target.latitude, geometry?.position, geometry?.dimensions, geometry?.orientation, tracked]);
+        const key = JSON.stringify([target.longitude, target.latitude, geometry?.position, geometry?.dimensions, geometry?.orientation, tracked, predicted]);
         const previous = this.entities.get(target.mmsi);
         if (previous?.key === key) continue;
         if (previous) this.remove(previous);
@@ -89,14 +76,12 @@ export class AisScene {
           orientation: geometry?.orientation,
           point: geometry ? undefined : { pixelSize: tracked ? 10 : 7, color: tracked ? Color.ORANGE : Color.CYAN,
             outlineColor: Color.BLACK, outlineWidth: 1, disableDepthTestDistance: Infinity },
-          label: tracked ? { text: target.mmsi, font: '12px sans-serif', fillColor: Color.WHITE,
+          label: tracked ? { text: predicted ? `${target.mmsi} 预判` : target.mmsi, font: '12px sans-serif', fillColor: Color.WHITE,
             outlineColor: Color.BLACK, outlineWidth: 2, style: LabelStyle.FILL_AND_OUTLINE,
             pixelOffset: new Cartesian2(0, -20), disableDepthTestDistance: Infinity } : undefined,
         });
         const box = geometry ? this.addBox(entity, geometry) : undefined;
-        const occlusionPoint = Cartesian3.add(position, Cartesian3.multiplyByScalar(
-          Ellipsoid.WGS84.geodeticSurfaceNormal(position, new Cartesian3()), radius, new Cartesian3()), new Cartesian3());
-        this.entities.set(target.mmsi, { entity, key, occlusionPoint, box });
+        this.entities.set(target.mmsi, { entity, key, box });
       }
     }
     for (const [mmsi, entry] of this.entities) {
@@ -136,7 +121,6 @@ export class AisScene {
 
   destroy() {
     this.handler.destroy();
-    this.stopVisibility();
     this.clear();
   }
 }

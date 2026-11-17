@@ -50,7 +50,7 @@
 | `PUT /api/recognition-tasks/:id/panorama-guide` | 保存或删除 `{ guide, revision }`，返回独立版本递增后的参考线状态 |
 | `POST /api/recognition-tasks/:id/cancel` | 取消排队或运行中的本地模型识别，保留已有结果 |
 | `POST /api/recognition-tasks/:id/generate` | `{ revision }` 联合生成四项安装修正，返回任务及结果，不写设备配置 |
-| `POST /api/recognition-tasks/:id/validate` | `{ revision, referenceTaskId, referenceResultId }` 使用另一任务的固定参数独立复核本任务截图，不写入配置、任务或标注 |
+| `POST /api/recognition-tasks/:id/validate` | `{ revision, referenceTaskId, referenceResultId }` 固定另一任务的合格参数，返回原图理论线、偏差和独立复核误差；不写入配置、任务或标注 |
 | `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId }` 应用服务端保存的最新合格结果，返回 `{ task, camera }` |
 
 设备创建与保存的请求体为：
@@ -253,7 +253,22 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 
 `validate` 固定另一任务已生成的合格 `wgs84-horizon-installation-v1` 结果，按本任务全部有效标注计算残差，不调用优化器。请求的 `revision` 对应验证任务；来源必须是同一摄像头的另一任务，`referenceResultId` 与来源当前结果编号一致，来源 `resultRevision` 等于其标注版本且不在识别中。历史预扫粗结果不能作为来源。当前经纬度、高度、默认朝向和设备通道必须与来源 `fitCamera` 一致，来源参与截图仍须存在；验证图与来源实际参与拟合的截图有重叠时返回 409。只使用未忽略、源记录存在且点位有效的验证图，其余排除原因列在 `excluded`。
 
-复核响应包含 `taskId/revision/generatedAt`、`reference:{ taskId, resultId, revision, createdAt }`、本次固定的 `installation`、实际使用的 `sourceSnapshotIds`、`perSnapshot`、`failedSnapshotIds`、总体 `rmsResidualPixels/rmsAngularResidualDegrees`、最大逐图 RMS `maximumResidualPixels` 及门槛 `maximumAcceptedRmsPixels=5`。逐图返回实际 `pan/tilt/zoom/width/height`、像素与角度 RMS、`verticalOffsetPixels`；垂直偏差在标注中点的同一横坐标与理论海天线比较，向下为正，理论海天线未穿过该图像竖线时为 `null`。像素按每张原图尺寸计算，跨倍率或分辨率对照可同时参考角度残差。全部有效图的逐图 RMS 均不超过 5 像素时 `status=passed`，有超差图时为 `failed`；无有效图为 `insufficient_data`，总体误差为 `null`。验证任务可以只有单张图，响应只评价实际参与的这些样本，不将其视为全姿态或现场精度验收。结果仅返回客户端，不持久化，不清除本任务拟合结果、不应用参数，也不调用 LiveGBS；客户端在标注或来源变化后重新执行复核。
+复核响应包含 `taskId/revision/generatedAt`、`reference:{ taskId, resultId, revision, createdAt }`、本次固定的 `installation`、实际使用的 `sourceSnapshotIds`、`perSnapshot`、`failedSnapshotIds`、总体 `rmsResidualPixels/rmsAngularResidualDegrees`、最大逐图 RMS `maximumResidualPixels` 及门槛 `maximumAcceptedRmsPixels=5`。逐图测量字段如下：
+
+| 字段 | 口径 |
+| --- | --- |
+| `pan/tilt/zoom/width/height` | 该张截图实际保存的 P/T/Z 与原图尺寸 |
+| `horizontalFieldAngle/verticalFieldAngle` | 该图保存的 HFOV/VFOV，单位度；不按倍率比例推算 |
+| `timeAlignment` | 保存的画面与姿态同步状态；缺省 `unverified`，读数稳定不等于严格同步 |
+| `theoreticalHorizon` | 原图中可见的理论海天线片段数组，每段为归一化 `{x,y}` 点数组，无可见片段时为 `[]`。使用来源 `fitCamera` 的固定安装条件、来源结果四参数与本图实际 P/T/FOV，沿用共享旋转链和 WGS84 海平面几何；不混入该图历史安装参数 |
+| `verticalResiduals` | 按 `left/center/right` 排列的三项 `{position,x,observedY,theoreticalY,offsetPixels,unavailableReason}`。`x` 为正式标注横向范围左端、中点、右端；`observedY` 按正式标注插值，坐标均归一化。`offsetPixels=(observedY-theoreticalY)×height`，原图向下为正，不向标注范围外推算测量 |
+| `verticalOffsetPixels` | 兼容字段，等于 `verticalResiduals` 中点的 `offsetPixels` |
+| `directionDifferenceDegrees` | 实拍标注与理论线在标注两端连线的方向角之差，单位度，图像向右为参考、顺时针为正。理论线未经过两端对应竖线时为 `null` |
+| `rmsResidualPixels/rmsAngularResidualDegrees` | 原有几何像素 RMS 与射线角度 RMS；它们与有符号垂直偏差、海天线方向差分别命名，不互相替代 |
+
+理论海天线未经过某个对应图像竖线时，该处 `theoreticalY/offsetPixels` 为 `null`，`unavailableReason` 为“理论海天线未经过该图像竖线”；可比较处原因为 `null`。不可比较位置不填零，其余几何 RMS 保留。像素使用每张原图尺寸，跨倍率或分辨率对照可同时参考角度残差；前端缩放只改变绘制。
+
+全部有效图的逐图 RMS 均不超过 5 像素时 `status=passed`，有超差图时为 `failed`；无有效图（含无截图条目的历史任务）为 `insufficient_data`，总体误差为 `null`。忽略、缺图和无效正式标注，以及几何有效性检查排除的姿态、通道、尺寸等原因列在 `excluded`。验证任务可以只有单张图，响应只评价实际参与的这些样本，不将其视为全姿态或现场精度验收。结果仅返回客户端，不持久化，不生成精修候选，不清除本任务拟合结果、不应用参数，也不调用 LiveGBS；客户端切换来源或图片、保存正式标注后重新请求，草稿未保存时隐藏旧测量。旧版本、过期来源或固定条件冲突不能继续作为有效对照，历史原图、PTZ 和拍摄时参数副本保持原值。
 
 `apply` 必须同时提交读取的 `revision` 与 `resultId`，只读取服务端保存的合格结果，不接收前端角度值；校验标注版本、结果编号、计算参考的当前设备配置、设备通道、源记录仍存在以及设备未被控制/截图占用。在同一事务中更新四项修正与应用状态，其他设备字段保持原值；不调用 LiveGBS 控制、修改原始 PTZ 或回写历史截图。成功后记录 `appliedAt/appliedRevision`；无合格结果、配置改变、源图删除、过期版本或重复应用返回 409。此写入能力仅属于本地网页流程，MCP 工具继续只读且只估计两个 P 轴倾角。
 

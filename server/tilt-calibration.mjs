@@ -76,7 +76,7 @@ function prepareSamples(camera, snapshots, observations, range) {
     const tanH = Math.tan(ptz.HorizontalFieldAngle * rad / 2);
     const tanV = Math.tan(ptz.VerticalFieldAngle * rad / 2);
     samples.push({
-      snapshot, ptz,
+      snapshot, ptz, annotation: points,
       fx: snapshot.width / (2 * tanH), fy: snapshot.height / (2 * tanV),
       points: points.map((point) => ({ nx: (2 * point.x - 1) * tanH, nz: (1 - 2 * point.y) * tanV })),
     });
@@ -315,24 +315,58 @@ function optimizeInstallation(initial, camera, geometry, samples) {
   return { parameters, cost, converged, iterations: iterations + 1 };
 }
 
-function horizonVerticalOffset(parameters, camera, geometry, sample) {
-  const nx = sample.points.reduce((sum, point) => sum + point.nx, 0) / sample.points.length;
-  const nz = sample.points.reduce((sum, point) => sum + point.nz, 0) / sample.points.length;
-  const tanV = sample.snapshot.height / (2 * sample.fy);
-  const observedY = (1 - nz / tanV) / 2;
-  const angleAt = (y) => residuals(parameters, camera, geometry,
-    [{ ...sample, points: [{ nx, nz: (1 - 2 * y) * tanV }] }])[0].angle;
-  let top = 0, bottom = 1, topAngle = angleAt(top);
-  const bottomAngle = angleAt(bottom);
-  if (topAngle * bottomAngle > 0) return null;
-  if (topAngle === 0) return observedY * sample.snapshot.height;
-  if (bottomAngle === 0) return (observedY - 1) * sample.snapshot.height;
-  for (let iteration = 0; iteration < 32; iteration++) {
-    const middle = (top + bottom) / 2, angle = angleAt(middle);
-    if (angle * topAngle > 0) { top = middle; topAngle = angle; } else bottom = middle;
+function horizonMeasurements(parameters, camera, geometry, sample) {
+  const { width, height } = sample.snapshot;
+  const tanH = width / (2 * sample.fx), tanV = height / (2 * sample.fy);
+  const rig = createLocalRigRotation({ pAxisPitch: parameters[0], pAxisRoll: parameters[1],
+    panOffset: camera.panOffset, tiltOffset: parameters[2], imageRoll: parameters[3] }, sample.ptz);
+  const world = Matrix3.multiply(geometry.enu, rig.camera, new Matrix3());
+  const columns = [0, 1, 2].map((index) => Cartesian3.multiplyComponents(
+    Matrix3.getColumn(world, index, new Cartesian3()), geometry.inverseRadii, new Cartesian3(),
+  ));
+  const theoreticalY = (x) => {
+    const horizontal = Cartesian3.add(columns[1], Cartesian3.multiplyByScalar(columns[0], (2 * x - 1) * tanH, new Cartesian3()), new Cartesian3());
+    const angleAt = (y) => {
+      const ray = Cartesian3.add(horizontal, Cartesian3.multiplyByScalar(columns[2], (1 - 2 * y) * tanV, new Cartesian3()), new Cartesian3());
+      return Math.asin(Math.max(-1, Math.min(1, Cartesian3.dot(geometry.normal, Cartesian3.normalize(ray, ray))))) + geometry.dip;
+    };
+    let top = 0, bottom = 1, topAngle = angleAt(top);
+    const bottomAngle = angleAt(bottom);
+    if (topAngle * bottomAngle > 0) return null;
+    if (topAngle === 0) return 0;
+    if (bottomAngle === 0) return 1;
+    for (let iteration = 0; iteration < 40; iteration++) {
+      const middle = (top + bottom) / 2, angle = angleAt(middle);
+      if (angle * topAngle > 0) { top = middle; topAngle = angle; } else bottom = middle;
+    }
+    return (top + bottom) / 2;
+  };
+  const points = [...sample.annotation].sort((a, b) => a.x - b.x);
+  const left = points[0], right = points.at(-1);
+  const verticalResiduals = ['left', 'center', 'right'].map((position, index) => {
+    const x = index === 0 ? left.x : index === 2 ? right.x : (left.x + right.x) / 2;
+    const end = points.findIndex((point) => point.x >= x);
+    const a = points[Math.max(0, end - 1)], b = points[end];
+    const observedY = a.x === b.x ? b.y : a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x);
+    const y = theoreticalY(x);
+    return { position, x, observedY, theoreticalY: y, offsetPixels: y === null ? null : (observedY - y) * height,
+      unavailableReason: y === null ? '理论海天线未经过该图像竖线' : null };
+  });
+  const theoreticalHorizon = [];
+  let segment = [];
+  for (let column = 0; column <= 128; column++) {
+    const x = column / 128, y = theoreticalY(x);
+    if (y !== null) segment.push({ x, y });
+    else if (segment.length) { theoreticalHorizon.push(segment); segment = []; }
   }
-  // 在标注中点的同一横坐标比较高度；正值表示标注在理论海天线下方。
-  return (observedY - (top + bottom) / 2) * sample.snapshot.height;
+  if (segment.length) theoreticalHorizon.push(segment);
+  const [start, , end] = verticalResiduals;
+  const directionDifferenceDegrees = start.theoreticalY === null || end.theoreticalY === null ? null
+    : Math.atan2((right.y - left.y) * height, (right.x - left.x) * width) / rad
+      - Math.atan2((end.theoreticalY - start.theoreticalY) * height, (right.x - left.x) * width) / rad;
+  // 偏差只比较正式标注范围内相同横坐标，原图向下为正；不把不可见位置补成零。
+  return { theoreticalHorizon, verticalResiduals, directionDifferenceDegrees,
+    verticalOffsetPixels: verticalResiduals[1].offsetPixels };
 }
 
 export function evaluateInstallation(camera, snapshots, observations, requestedRange) {
@@ -361,9 +395,11 @@ export function evaluateInstallation(camera, snapshots, observations, requestedR
     const values = byId.get(sample.snapshot.id);
     return { snapshotId: sample.snapshot.id, pan: sample.ptz.Pan, tilt: sample.ptz.Tilt, zoom: sample.ptz.Zoom,
       width: sample.snapshot.width, height: sample.snapshot.height,
+      horizontalFieldAngle: sample.ptz.HorizontalFieldAngle, verticalFieldAngle: sample.ptz.VerticalFieldAngle,
+      timeAlignment: sample.snapshot.timeAlignment || 'unverified',
       rmsResidualPixels: Math.sqrt(values.reduce((sum, value) => sum + value.pixels ** 2, 0) / values.length),
       rmsAngularResidualDegrees: Math.sqrt(values.reduce((sum, value) => sum + value.angle ** 2, 0) / values.length) / rad,
-      verticalOffsetPixels: horizonVerticalOffset(parameters, camera, geometry, sample) };
+      ...horizonMeasurements(parameters, camera, geometry, sample) };
   });
   const rms = (key) => Math.sqrt(perSnapshot.reduce((sum, item) => sum + item[key] ** 2, 0) / perSnapshot.length);
   const failedSnapshotIds = perSnapshot.filter((item) => !Number.isFinite(item.rmsResidualPixels)

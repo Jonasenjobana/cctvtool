@@ -176,8 +176,16 @@ export interface InstallationValidation {
   sourceSnapshotIds: string[]; excluded: { snapshotId: string; reason: string }[];
   rmsResidualPixels: number | null; rmsAngularResidualDegrees: number | null; maximumResidualPixels: number | null;
   maximumAcceptedRmsPixels: number; failedSnapshotIds: string[];
-  perSnapshot: { snapshotId: string; pan: number; tilt: number; zoom: number; width: number; height: number;
-    rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null }[];
+  perSnapshot: HorizonMeasurement[];
+}
+export interface HorizonMeasurement {
+  snapshotId: string; pan: number; tilt: number; zoom: number; width: number; height: number;
+  horizontalFieldAngle: number; verticalFieldAngle: number; timeAlignment: string;
+  theoreticalHorizon: HorizonPoint[][];
+  verticalResiduals: { position: 'left' | 'center' | 'right'; x: number; observedY: number;
+    theoreticalY: number | null; offsetPixels: number | null; unavailableReason: string | null }[];
+  directionDifferenceDegrees: number | null;
+  rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null;
 }
 export interface RecognitionTask {
   id: string; sourceTaskId: string; cameraId: string; cameraName: string;

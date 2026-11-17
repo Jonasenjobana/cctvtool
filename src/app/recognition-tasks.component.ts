@@ -38,6 +38,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly nextTaskOffset = signal<number | null>(null);
   readonly nextItemOffset = signal<number | null>(null);
   readonly validationReferenceId = signal('');
+  readonly measuring = signal(false);
   private readonly validationResult = signal<InstallationValidation | null>(null);
   readonly validationSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
     && task.cameraId === this.selected()?.cameraId && task.result?.status === 'estimated'
@@ -50,6 +51,9 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     return result && task && reference && !this.dirty() && result.taskId === task.id && result.revision === task.revision
       && result.reference.taskId === reference.id && result.reference.resultId === reference.resultId ? result : null;
   });
+  readonly measurement = computed(() => this.validation()?.perSnapshot.find((row) => row.snapshotId === this.selectedItemId()));
+  readonly measurementExclusion = computed(() => this.validation()?.excluded.find((row) => row.snapshotId === this.selectedItemId())?.reason);
+  readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
   readonly generatingPanorama = signal(false);
   readonly panoramaProgress = signal('');
@@ -178,6 +182,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private destroyed = false;
   private revision = 0;
+  private validationRequest = 0;
   private guideRevision = 0;
   private savedGuide: PanoramaGuide | null = null;
   private dragIndex: number | null = null;
@@ -213,6 +218,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   async loadTask(id: string, save = true) {
     if (this.busy() || (save && !await this.save())) return;
+    this.validationRequest++;
+    this.measuring.set(false);
     this.validationResult.set(null);
     this.clearPanorama();
     const revision = ++this.revision;
@@ -220,6 +227,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.problem.set('');
     this.guideInitialized.set(false);
     this.guideError.set('');
+    let loaded = false;
     try {
       const [itemsResult, guideResult] = await Promise.allSettled([
         this.api.recognitionItems(id), this.api.recognitionPanoramaGuide(id),
@@ -253,16 +261,25 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         this.guideError.set(`全景参考线读取失败：${errorMessage(guideResult.reason)}`);
       }
       const sourceGroup = await this.api.snapshotGroup(page.task.sourceTaskId);
-      if (!this.destroyed && revision === this.revision) this.sourceGroup.set(sourceGroup);
+      if (!this.destroyed && revision === this.revision) { this.sourceGroup.set(sourceGroup); loaded = true; }
     } catch (error) {
       if (!this.destroyed && revision === this.revision) this.problem.set(error instanceof Error && error.name === 'Error' ? error.message : errorMessage(error));
     }
-    finally { if (revision === this.revision) this.loading.set(false); }
+    finally {
+      if (revision === this.revision) {
+        this.loading.set(false);
+        if (loaded) void this.measure();
+      }
+    }
   }
 
   private setTask(task: RecognitionTask) {
     const previous = this.selected();
-    if (previous?.id !== task.id || previous.revision !== task.revision) this.validationResult.set(null);
+    if (previous?.id !== task.id || previous.revision !== task.revision) {
+      this.validationRequest++;
+      this.measuring.set(false);
+      this.validationResult.set(null);
+    }
     if (previous?.id !== task.id) {
       this.validationReferenceId.set('');
       this.clearPanorama();
@@ -297,11 +314,12 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   async openItem(item: RecognitionItem) {
     if (!this.busy() && !this.loading() && !this.guideDrawing() && await this.save()) {
       this.selectItem(this.items().find((entry) => entry.snapshotId === item.snapshotId) || item);
+      void this.measure();
       if (this.panorama()) this.showFocusedPanorama();
       this.focusPanorama();
     }
   }
-  undo() { const item = this.item(); if (item) this.selectItem(item); }
+  undo() { const item = this.item(); if (item) { this.selectItem(item); void this.measure(); } }
 
   openPanoramaItem(snapshotId: string) {
     if (this.guideDrawing()) return;
@@ -402,7 +420,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     });
   }
 
-  private imageLinePoints(points: HorizonPoint[], item: RecognitionItem) {
+  imageLinePoints(points: HorizonPoint[], item: RecognitionItem) {
     return points.map((point) => `${point.x * item.snapshot.width},${point.y * item.snapshot.height}`).join(' ');
   }
 
@@ -789,6 +807,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (!task || (saveAnnotation && !item) || (saveGuide && !this.guideInitialized()) || this.busy()) return false;
     this.busy.set(true);
     this.problem.set('');
+    let saved = false;
     try {
       if (saveAnnotation && item) {
         const points = this.points();
@@ -808,10 +827,14 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         this.guideRevision = result.revision;
         this.guideDirty.set(false);
       }
-      this.message.set(saveAnnotation ? `${saveGuide ? '标注和全景参考线' : '标注'}已保存，请重新计算或独立复核` : '全景参考线已保存');
+      this.message.set(saveAnnotation ? `${saveGuide ? '标注和全景参考线' : '标注'}已保存` : '全景参考线已保存');
+      saved = true;
       return true;
     } catch (error) { this.problem.set(errorMessage(error)); return false; }
-    finally { this.busy.set(false); }
+    finally {
+      this.busy.set(false);
+      if (saved && saveAnnotation) void this.measure();
+    }
   }
 
   saveGuide() { return this.save(false); }
@@ -829,15 +852,28 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   async validate() {
     if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
+    await this.measure();
+  }
+  selectValidationSource(id: string) {
+    this.validationReferenceId.set(id);
+    void this.measure();
+  }
+  private async measure() {
+    if (this.destroyed) return;
+    const request = ++this.validationRequest;
+    this.validationResult.set(null);
+    this.measuring.set(false);
     const task = this.selected(), reference = this.validationSource();
-    if (!task || !reference?.resultId) return;
+    if (!task || !reference?.resultId || this.dirty() || this.running()) return;
     const revision = this.revision;
-    this.busy.set(true); this.problem.set(''); this.message.set(''); this.validationResult.set(null);
+    this.measuring.set(true); this.problem.set('');
     try {
       const result = await this.api.validateInstallation(task.id, task.revision, reference.id, reference.resultId);
-      if (!this.destroyed && revision === this.revision) this.validationResult.set(result);
-    } catch (error) { if (!this.destroyed) this.problem.set(errorMessage(error)); }
-    finally { this.busy.set(false); }
+      if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
+        && task.revision === this.selected()?.revision && reference.id === this.validationSource()?.id
+        && reference.resultId === this.validationSource()?.resultId) this.validationResult.set(result);
+    } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
+    finally { if (request === this.validationRequest) this.measuring.set(false); }
   }
   async openValidationItem(snapshotId: string) {
     const item = this.items().find((entry) => entry.snapshotId === snapshotId);
@@ -849,6 +885,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     const min = Math.min(...values), max = Math.max(...values);
     return min === max ? min.toFixed(1) : `${min.toFixed(1)}～${max.toFixed(1)}`;
   }
+  signedResidual(value: number | null) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(2)}`; }
   async apply() {
     const task = this.selected();
     if (!task || !task.resultId || this.busy() || this.loading() || this.dirty() || this.running() || this.generatingPanorama()

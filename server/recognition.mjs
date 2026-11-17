@@ -318,13 +318,13 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     if (selected.some((item) => fittedIds.has(item.snapshotId))) {
       throw httpError(409, '复核图片与拟合图片存在重叠，请使用未参与拟合的独立截图');
     }
-    const dates = items.map((item) => +new Date(item.snapshot.createdAt));
+    const dates = items.length ? items.map((item) => +new Date(item.snapshot.createdAt)) : [+new Date(task.createdAt)];
     const result = evaluateInstallation({ ...camera, ...reference.fitCamera, ...reference.result.installation },
       selected.map((item) => item.snapshot), selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
         startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
       });
-    result.excluded.push(...items.filter((item) => item.ignored || item.missing).map((item) => ({ snapshotId: item.snapshotId,
-      reason: item.missing ? '源截图已删除' : item.ignoreReason })));
+    result.excluded.push(...items.filter((item) => item.ignored || item.missing || !validPoints(item.points)).map((item) => ({ snapshotId: item.snapshotId,
+      reason: item.missing ? '源截图已删除' : item.ignored ? item.ignoreReason : '海天线正式标注无效或横向跨度不足图片宽度的 10%' })));
     return { ...result, taskId: task.id, revision: task.revision, reference: { taskId: reference.id, resultId: reference.resultId,
       revision: reference.revision, createdAt: reference.createdAt } };
   });

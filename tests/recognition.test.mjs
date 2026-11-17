@@ -52,7 +52,8 @@ const post = async (f, id, action, revision) => {
     payload: { revision, ...(task ? { resultId: task.resultId || 'no-result' } : {}) } });
 };
 
-async function independentValidationFixture(t) {
+async function independentValidationFixture(t, { transformSnapshot = (snapshot) => snapshot,
+  transformItem = (item) => item, empty = false, referencePhase } = {}) {
   const f = await fixture(t);
   const source = await createAndWait(f);
   const generated = await post(f, source.id, 'generate', 0);
@@ -61,16 +62,17 @@ async function independentValidationFixture(t) {
   await f.app.close();
   const store = new CameraStore(f.dataDir);
   try {
+    if (referencePhase) store.updateSnapshotGroup(source.sourceTaskId, { horizon: { phase: referencePhase } });
     const task = { ...source, id: 'validation-task', sourceTaskId: 'validation-source', result: null, resultId: null };
     store.addSnapshotGroup({ id: task.sourceTaskId, cameraId: f.camera.id, cameraName: f.camera.name,
       kind: 'scan', status: 'completed', createdAt: source.createdAt, sampleCount: f.snapshots.length, completedCount: f.snapshots.length });
     const items = f.snapshots.map((snapshot, index) => {
-      const copy = { ...snapshot, id: `validation-${index}`, groupId: task.sourceTaskId, fileName: `validation-${index}.jpg` };
+      const copy = transformSnapshot({ ...snapshot, id: `validation-${index}`, groupId: task.sourceTaskId, fileName: `validation-${index}.jpg` }, index);
       store.addSnapshot(copy);
       const points = f.observations[index].points.filter((_, column) => column !== 1);
-      return { snapshotId: copy.id, snapshot: copy, detectedPoints: points, points, ignored: false, source: 'manual', ignoreReason: '' };
+      return transformItem({ snapshotId: copy.id, snapshot: copy, detectedPoints: points, points, ignored: false, source: 'manual', ignoreReason: '' }, index);
     });
-    store.addRecognitionTask(task, items);
+    store.addRecognitionTask({ ...task, sampleCount: empty ? 0 : items.length }, empty ? [] : items);
     f.validationTask = task;
   } finally { store.close(); }
   f.app = await createApp(f.options);
@@ -118,6 +120,154 @@ test('独立复核拒绝复用拟合图片、旧标注版本、旧结果编号�
   assert.equal((await f.validate({ installation: f.reference.result.installation })).statusCode, 400);
   await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: { ...f.input, height: f.input.height + 1 } });
   assert.equal((await f.validate()).statusCode, 409);
+});
+
+test('原图基准对照返回理论海天线、左中右向下为正的像素差及独立误差口径', async (t) => {
+  const f = await independentValidationFixture(t);
+  const items = (await f.app.inject(`/api/recognition-tasks/${f.validationTask.id}/items`)).json().items;
+  const original = items.find((item) => item.snapshotId === 'validation-0');
+  const points = original.points.map((point) => ({ ...point, y: point.y + 12 / original.snapshot.height }));
+  const saved = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${f.validationTask.id}/items/${original.snapshotId}`,
+    payload: { revision: 0, points } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  const response = await f.validate({ revision: 1 });
+  assert.equal(response.statusCode, 200, response.body);
+  const row = response.json().perSnapshot.find((entry) => entry.snapshotId === original.snapshotId);
+  assert.ok(row.theoreticalHorizon.length > 0, '原图应有可见理论线');
+  assert.ok(row.theoreticalHorizon.flat().every((point) => point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1));
+  assert.deepEqual(row.verticalResiduals.map((residual) => residual.position), ['left', 'center', 'right']);
+  assert.deepEqual(row.verticalResiduals.map((residual) => residual.x), [0.1, 0.5, 0.9]);
+  for (const residual of row.verticalResiduals) {
+    assert.ok(Math.abs(residual.offsetPixels - 12) < 0.05, JSON.stringify(residual));
+    assert.ok(residual.observedY > residual.theoreticalY);
+  }
+  assert.equal(row.verticalOffsetPixels, row.verticalResiduals[1].offsetPixels);
+  assert.ok(Math.abs(row.directionDifferenceDegrees) < 0.01);
+  assert.equal(row.horizontalFieldAngle, original.snapshot.ptz.raw.HorizontalFieldAngle);
+  assert.equal(row.verticalFieldAngle, original.snapshot.ptz.raw.VerticalFieldAngle);
+  assert.equal(row.timeAlignment, 'unverified');
+  assert.ok(row.rmsResidualPixels > 11 && row.rmsAngularResidualDegrees > 0);
+});
+
+test('原图理论海天线不可见时明确返回不可比较原因，几何残差继续保留', async (t) => {
+  const f = await independentValidationFixture(t, { transformSnapshot: (snapshot) => ({ ...snapshot,
+    ptz: { ...snapshot.ptz, raw: { ...snapshot.ptz.raw, Tilt: 80 } } }) });
+  const response = await f.validate();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().status, 'failed');
+  for (const row of response.json().perSnapshot) {
+    assert.deepEqual(row.theoreticalHorizon, []);
+    assert.equal(row.verticalOffsetPixels, null);
+    for (const residual of row.verticalResiduals) {
+      assert.equal(residual.theoreticalY, null);
+      assert.equal(residual.offsetPixels, null);
+      assert.equal(residual.unavailableReason, '理论海天线未经过该图像竖线');
+    }
+    assert.ok(row.rmsResidualPixels > 5 && Number.isFinite(row.rmsResidualPixels));
+    assert.ok(row.rmsAngularResidualDegrees > 0 && Number.isFinite(row.rmsAngularResidualDegrees));
+  }
+});
+
+test('原图基准对照在没有截图条目的历史任务上返回无有效样本', async (t) => {
+  const f = await independentValidationFixture(t, { empty: true });
+  const response = await f.validate();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().status, 'insufficient_data');
+  assert.deepEqual(response.json().perSnapshot, []);
+  assert.equal(response.json().rmsResidualPixels, null);
+});
+
+test('原图测量逐项说明移动、无效姿态、通道、尺寸、正式标注和忽略项的排除原因', async (t) => {
+  const f = await independentValidationFixture(t, {
+    transformSnapshot: (snapshot, index) => {
+      if (index === 0) return { ...snapshot, poseChanged: true };
+      if (index === 1) return { ...snapshot, ptz: { ...snapshot.ptz, raw: { ...snapshot.ptz.raw, HorizontalFieldAngle: 0 } } };
+      if (index === 2) return { ...snapshot, code: 'other-channel' };
+      if (index === 3) return { ...snapshot, width: 0 };
+      return snapshot;
+    },
+    transformItem: (item, index) => index === 4 ? { ...item, points: [{ x: 0.4, y: 0.5 }, { x: 0.45, y: 0.5 }] }
+      : index === 5 ? { ...item, ignored: true, ignoreReason: '已人工忽略' } : item,
+  });
+  const response = await f.validate();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().status, 'insufficient_data');
+  const reasons = Object.fromEntries(response.json().excluded.map((item) => [item.snapshotId, item.reason]));
+  assert.match(reasons['validation-4'] || '', /标注.*10%/);
+  assert.match(reasons['validation-0'], /发生变化/);
+  assert.match(reasons['validation-1'], /PTZ.*无效/);
+  assert.match(reasons['validation-2'], /通道/);
+  assert.match(reasons['validation-3'], /尺寸/);
+  assert.equal(reasons['validation-5'], '已人工忽略');
+});
+
+test('原图向上偏差为负，相同角度在双倍尺寸下像素差翻倍且保存后更新', async (t) => {
+  let firstSnapshot;
+  const f = await independentValidationFixture(t, { transformSnapshot: (snapshot, index) => {
+    if (index === 0) firstSnapshot = snapshot;
+    return index === 1 ? { ...snapshot, width: firstSnapshot.width * 2, height: firstSnapshot.height * 2, ptz: firstSnapshot.ptz } : snapshot;
+  } });
+  const items = (await f.app.inject(`/api/recognition-tasks/${f.validationTask.id}/items`)).json().items;
+  const original = items.find((item) => item.snapshotId === 'validation-0');
+  const points = original.points.map((point) => ({ ...point, y: point.y - 6 / original.snapshot.height }));
+  for (const revision of [0, 1]) {
+    const saved = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${f.validationTask.id}/items/validation-${revision}`,
+      payload: { revision, points } });
+    assert.equal(saved.statusCode, 200, saved.body);
+  }
+  assert.equal((await f.validate()).statusCode, 409, '不能使用保存前的版本');
+  const response = await f.validate({ revision: 2 });
+  assert.equal(response.statusCode, 200, response.body);
+  const low = response.json().perSnapshot.find((row) => row.snapshotId === 'validation-0');
+  const high = response.json().perSnapshot.find((row) => row.snapshotId === 'validation-1');
+  assert.equal(high.width, 2 * low.width);
+  assert.equal(high.height, 2 * low.height);
+  assert.deepEqual(high.theoreticalHorizon, low.theoreticalHorizon);
+  for (let index = 0; index < 3; index++) {
+    assert.ok(Math.abs(low.verticalResiduals[index].offsetPixels + 6) < 0.05);
+    assert.ok(Math.abs(high.verticalResiduals[index].offsetPixels - 2 * low.verticalResiduals[index].offsetPixels) < 1e-8);
+  }
+  assert.ok(Math.abs(high.rmsResidualPixels - 2 * low.rmsResidualPixels) < 1e-8);
+  assert.ok(Math.abs(high.rmsAngularResidualDegrees - low.rmsAngularResidualDegrees) < 1e-10);
+});
+
+test('原图标注左右反向偏移保留方向差和几何误差，中心偏差不能代替全部测量', async (t) => {
+  const f = await independentValidationFixture(t);
+  const items = (await f.app.inject(`/api/recognition-tasks/${f.validationTask.id}/items`)).json().items;
+  const original = items.find((item) => item.snapshotId === 'validation-0');
+  const saved = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${f.validationTask.id}/items/${original.snapshotId}`,
+    payload: { revision: 0, points: original.points.map((point, index) => ({ ...point, y: point.y + (index ? 8 : -8) / original.snapshot.height })) } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  const response = await f.validate({ revision: 1 });
+  assert.equal(response.statusCode, 200, response.body);
+  const row = response.json().perSnapshot.find((entry) => entry.snapshotId === original.snapshotId);
+  assert.ok(Math.abs(row.verticalResiduals[0].offsetPixels + 8) < 0.05);
+  assert.ok(Math.abs(row.verticalOffsetPixels) < 0.05);
+  assert.ok(Math.abs(row.verticalResiduals[2].offsetPixels - 8) < 0.05);
+  assert.ok(row.directionDifferenceDegrees > 1 && row.directionDifferenceDegrees < 1.3);
+  assert.ok(row.rmsResidualPixels > 7.9 && row.rmsAngularResidualDegrees > 0);
+});
+
+test('已应用基准仍可测量，来源正式标注变化或参与截图删除后不能继续使用旧基准', async (t) => {
+  const f = await independentValidationFixture(t);
+  const applied = await post(f, f.reference.id, 'apply', 0);
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.equal((await f.validate()).statusCode, 200);
+  const deleted = await f.app.inject({ method: 'DELETE', url: `/api/snapshots/${f.reference.result.sourceSnapshotIds[0]}` });
+  assert.equal(deleted.statusCode, 204, deleted.body);
+  assert.equal((await f.validate()).statusCode, 409);
+  const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${f.reference.id}/items/${f.reference.result.sourceSnapshotIds[1]}`,
+    payload: { revision: 0, ignored: true } });
+  assert.equal(edited.statusCode, 200, edited.body);
+  assert.equal((await f.validate()).statusCode, 409);
+});
+
+test('原图基准来源拒绝历史预扫粗结果，未知来源保持未找到响应', async (t) => {
+  const f = await independentValidationFixture(t, { referencePhase: 'coarse' });
+  const response = await f.validate();
+  assert.equal(response.statusCode, 409, response.body);
+  assert.match(response.json().message, /历史预扫粗结果仅供查看/);
+  assert.equal((await f.validate({ referenceTaskId: 'unknown-reference' })).statusCode, 404);
 });
 
 test('全景参考线对已有识别任务缺省为空，未知任务返回 404', async (t) => {

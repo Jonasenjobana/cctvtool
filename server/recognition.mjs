@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { httpError } from './errors.mjs';
 import { calibrationKeys, calibrationOf } from './store.mjs';
 import { estimateInstallation, estimateZeroPose, evaluateInstallation, refineInstallation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
@@ -351,7 +352,8 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     ...bodyWithRevision, required: ['revision', 'selectionRevision', 'base', 'supplemental'], properties: {
       ...bodyWithRevision.properties, selectionRevision: { ...revisionSchema, maximum: Number.MAX_SAFE_INTEGER - 1 },
       base: { anyOf: [{ type: 'null' }, { ...sourceVersion, required: ['taskId', 'revision', 'resultId'],
-        properties: { ...sourceVersion.properties, resultId: { type: 'string', minLength: 1 } } }] },
+        properties: { ...sourceVersion.properties, resultId: { type: 'string', minLength: 1 },
+          model: { type: 'string', enum: ['wgs84-horizon-installation-v1', ZERO_POSE_MODEL] } } }] },
       supplemental: { type: 'array', items: sourceVersion },
     },
   } } }, async (request) => store.transaction(() => {
@@ -372,7 +374,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
     const input = refinementInputs(store, task, task.refinementSelection);
     const result = refineInstallation({ ...input.camera, ...input.baseCamera }, input.selected.map((item) => item.snapshot),
-      input.selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), input.range, input.baseSnapshotIds);
+      input.selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), input.range, input.baseSnapshotIds, input.model);
     const taskBySnapshot = new Map(input.selected.map((item) => [item.snapshotId, item.taskId]));
     for (const comparison of [result.before, result.after]) {
       comparison.perSnapshot = comparison.perSnapshot.map((row) => ({ ...row, taskId: taskBySnapshot.get(row.snapshotId) }));
@@ -386,7 +388,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       const currentTask = editable(task.id, task.revision);
       if (currentTask.refinementSelection?.revision !== refinement.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
       const latest = refinementInputs(store, currentTask, currentTask.refinementSelection);
-      if (Object.keys(input.camera).some((key) => input.camera[key] !== latest.camera[key])) {
+      if (!isDeepStrictEqual(input.camera, latest.camera)) {
         throw httpError(409, '计算期间摄像头配置已变化，请重新生成精修候选');
       }
       const changed = refinementStaleReasons(store, { ...currentTask, refinement });
@@ -403,20 +405,28 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const task = editable(request.params.id, request.body.revision);
     if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
     const input = refinementInputs(store, task, task.refinementSelection);
-    const after = request.body.mode === 'after';
-    if (after && (!task.refinement || task.refinement.resultId !== request.body.resultId)) throw httpError(409, '精修候选编号已变化，请刷新后重试');
-    if (after) {
+    const { mode, resultId } = request.body;
+    const frozen = mode === 'after' || (input.model === ZERO_POSE_MODEL && !!resultId);
+    const candidate = frozen ? task.refinement : null;
+    if (frozen) {
+      if (!candidate || candidate.resultId !== resultId) throw httpError(409, '精修候选编号已变化，请刷新后重试');
       const changed = refinementStaleReasons(store, task);
       if (changed.length) throw httpError(409, changed.join('；'));
     }
-    const result = evaluateInstallation({ ...input.camera, ...input.baseCamera, ...(after ? task.refinement.after.installation : {}) },
-      input.selected.map((item) => item.snapshot), input.selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), input.range);
-    const taskBySnapshot = new Map(input.selected.map((item) => [item.snapshotId, item.taskId]));
+    const frozenIds = candidate && new Set(candidate.sourceSnapshotIds);
+    const selected = frozenIds ? input.selected.filter((item) => frozenIds.has(item.snapshotId)) : input.selected;
+    if (frozenIds && selected.length !== frozenIds.size) throw httpError(409, '精修参与原图已变化，请重新生成候选');
+    const baseCamera = candidate?.baseCamera || input.baseCamera;
+    const comparison = candidate?.[mode];
+    const calibration = input.model === ZERO_POSE_MODEL ? { zeroPose: comparison?.zeroPose || baseCamera.zeroPose } : comparison?.installation;
+    const result = evaluateInstallation({ ...input.camera, ...baseCamera, ...calibration }, selected.map((item) => item.snapshot),
+      selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), candidate || input.range, input.model);
+    const taskBySnapshot = new Map(selected.map((item) => [item.snapshotId, item.taskId]));
     result.perSnapshot = result.perSnapshot.map((row) => ({ ...row, taskId: taskBySnapshot.get(row.snapshotId),
       group: input.baseSnapshotIds.includes(row.snapshotId) ? 'base' : 'high' }));
-    result.excluded.push(...input.excluded);
+    result.excluded = candidate?.excluded || [...result.excluded, ...input.excluded];
     return { ...result, taskId: task.id, revision: task.revision, selectionRevision: task.refinementSelection.revision,
-      mode: request.body.mode, resultId: after ? task.refinement.resultId : null };
+      mode, resultId: candidate?.resultId || null };
   });
   app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {

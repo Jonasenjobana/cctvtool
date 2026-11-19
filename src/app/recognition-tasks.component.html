@@ -179,7 +179,7 @@
               @if (displayedItem(); as entry) { <span class="annotation-source" [class.unsaved]="!sourceImage() && dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ sourceImage() ? ' · 只读' : dirty() ? ' · 未保存' : '' }}</span> }
             </div>
             @if (displayedItem(); as entry) {
-              @if (sourceImage(); as source) { <p class="image-info">参与图来源：{{ source.task.id === refinementBaseId() ? '基础' : '补充高倍' }}任务 · {{ source.task.createdAt | date:'MM-dd HH:mm:ss' }}</p> }
+              @if (sourceImage(); as source) { <p class="image-info">参与图来源：{{ source.task.id === task.refinementSelection?.base?.taskId ? '基础' : '补充高倍' }}任务 · {{ source.task.createdAt | date:'MM-dd HH:mm:ss' }}</p> }
               <p class="image-info">{{ entry.snapshot.width }} × {{ entry.snapshot.height }}<span>P {{ entry.snapshot.ptz.raw.Pan | number:'1.2-2' }}°</span><span>T {{ entry.snapshot.ptz.raw.Tilt | number:'1.2-2' }}°</span><span>Z {{ entry.snapshot.ptz.raw.Zoom }}</span></p>
               @if (entry.missing) { <p class="error">原图已删除，重新生成数据时会排除此图。</p> }
               @else {
@@ -432,11 +432,11 @@
           <section class="validation-section" aria-label="基础与高倍联合精修">
             <div class="section-heading"><h2>联合精修</h2></div>
             <label class="validation-source">基础标定结果
-              <select [ngModel]="refinementBaseId()" (ngModelChange)="selectRefinementBase($event)"
+              <select [ngModel]="refinementBaseKey()" (ngModelChange)="selectRefinementBase($event)"
                 [disabled]="busy() || loading() || running() || generatingPanorama()">
                 <option value="">选择合格基础结果</option>
-                @for (reference of refinementBaseSources(); track reference.id) {
-                  <option [value]="reference.id">{{ reference.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference) }} · {{ reference.result?.sourceSnapshotIds?.length }} 张</option>
+                @for (reference of refinementSourceOptions(); track reference.key) {
+                  <option [value]="reference.key">{{ reference.result.model === 'wgs84-horizon-zero-pose-v1' ? '零位候选' : '四参数结果' }} · {{ reference.task.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference.result) }} · {{ reference.result.sourceSnapshotIds.length }} 张</option>
                 }
               </select>
             </label>
@@ -466,14 +466,23 @@
                 {{ candidate.stale ? '精修候选已过期' : candidate.message }}</p>
               @if (candidate.stale) { <ul class="error">@for (reason of candidate.staleReasons; track $index) { <li>{{ reason }}</li> }</ul> }
               <table><thead><tr><th scope="col">参数</th><th scope="col">基准值</th><th scope="col">{{ candidate.status === 'unreliable' ? '求解值' : '候选值' }}</th></tr></thead><tbody>
-                @for (field of fields; track field.key) {
-                  <tr><th scope="row">{{ field.label }}</th><td>{{ candidate.before.installation[field.key] | number:'1.4-4' }}°</td>
-                    <td>{{ candidate.after.installation[field.key] | number:'1.4-4' }}°</td></tr>
+                @if (candidate.model === 'wgs84-horizon-zero-pose-v1') {
+                  @for (field of refinementZeroPoseFields; track field.key) {
+                    <tr><th scope="row">{{ field.label }}</th><td>{{ candidate.before.zeroPose[field.key] | number:'1.4-4' }}°</td>
+                      <td>{{ candidate.after.zeroPose[field.key] | number:'1.4-4' }}°</td></tr>
+                  }
+                } @else {
+                  @for (field of fields; track field.key) {
+                    <tr><th scope="row">{{ field.label }}</th><td>{{ candidate.before.installation[field.key] | number:'1.4-4' }}°</td>
+                      <td>{{ candidate.after.installation[field.key] | number:'1.4-4' }}°</td></tr>
+                  }
                 }
               </tbody></table>
-              <button type="button" class="primary apply-button" (click)="applyRefinement()"
-                [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || candidate.status !== 'estimated' || candidate.stale || candidate.applied">
-                <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '精修已应用' : '应用精修到摄像头' }}</button>
+              @if (candidate.model === 'wgs84-horizon-refinement-v1') {
+                <button type="button" class="primary apply-button" (click)="applyRefinement()"
+                  [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || candidate.status !== 'estimated' || candidate.stale || candidate.applied">
+                  <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '精修已应用' : '应用精修到摄像头' }}</button>
+              }
               <div class="validation-table" tabindex="0" role="region" aria-label="联合精修分组前后误差">
                 <table><thead><tr><th scope="col">组</th><th scope="col">有效图</th><th scope="col">Z</th><th scope="col">P 覆盖</th>
                   <th scope="col">RMS 前→后(px)</th><th scope="col">角度 RMS 前→后(°)</th></tr></thead><tbody>

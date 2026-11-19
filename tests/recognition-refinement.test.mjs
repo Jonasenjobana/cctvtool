@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,22 +8,26 @@ import { CameraStore } from '../server/store.mjs';
 import { createApp } from '../server/app.mjs';
 import { fixtureCamera, syntheticSnapshots } from './calibration-fixtures.mjs';
 
+const zeroPoseModel = 'wgs84-horizon-zero-pose-v1';
+const actualZeroPose = { roll: -1.75, pitch: 2.1, yaw: 133.7, tiltOffset: 1.2 };
+
 async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot, seed = () => {}, groupPans = {}, ptzFor = () => ({}),
-  livegbs = { configured: false }, includeValidation = false } = {}) {
+  livegbs = { configured: false }, includeValidation = false, zeroPose, savedZeroPose = zeroPose && { ...zeroPose, roll: 0, pitch: 0 } } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-refinement-test-'));
   const store = new CameraStore(dataDir);
   const input = Object.fromEntries(['name', 'serial', 'code', 'longitude', 'latitude', 'height',
     'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'].map((key) => [key, fixtureCamera[key]]));
+  if (savedZeroPose) input.zeroPose = savedZeroPose;
   const camera = store.saveCamera(input);
   const actual = { ...camera, tiltOffset: 1.1, imageRoll: -0.8 };
   const groups = new Map(), observations = new Map();
-  for (const [name, defaultPans] of [['base', [0, 60, 120, 180, 240, 300]],
+  for (const [name, defaultPans] of [['base', zeroPose ? [355, 20, 100, 190, 255, 305] : [0, 60, 120, 180, 240, 300]],
     ['main', [173, 9, 291, 38, 212]], ['extra', [338, 111, 69]],
     ...(includeValidation || groupPans.validation ? [['validation', [17, 143, 267, 313]]] : [])]) {
     const pans = groupPans[name] || defaultPans;
     const snapshots = pans.map((pan, index) => {
       const high = name !== 'base';
-      const generated = syntheticSnapshots({ camera: actual, pans: [pan], ptzOverrides: {
+      const generated = syntheticSnapshots({ camera: actual, zeroPose, pans: [pan], ptzOverrides: {
         Tilt: high ? 0.3 + index * 0.13 : 2 + index * 0.1, Zoom: high ? 12 + index * 1.3 : 3,
         HorizontalFieldAngle: high ? 11 - index * 0.4 : 24, VerticalFieldAngle: high ? 8 - index * 0.25 : 13.5,
         ...ptzFor(name, index, pan),
@@ -31,7 +35,7 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
       const original = generated.snapshots[0], id = `${name}-${index}`;
       const snapshot = { ...original, id, groupId: name, scanIndex: index,
         width: index % 2 ? 1920 : 960, height: index % 2 ? 1080 : 540,
-        fileName: `${id}.jpg`, imageUrl: `/api/snapshots/${id}/image` };
+        fileName: `${id}.jpg`, imageUrl: `/api/snapshots/${id}/image`, contentType: 'image/jpeg' };
       const points = generated.observations[0].points.filter((_, column) => column !== 1)
         .map((point, column) => ({ ...point, y: point.y + (!high && noise ? (1 + column * 0.3) / snapshot.height : 0) }));
       observations.set(id, points);
@@ -40,6 +44,7 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
     store.addSnapshotGroup({ id: name, cameraId: camera.id, cameraName: camera.name, kind: 'scan', status: 'completed',
       createdAt: snapshots[0].createdAt, sampleCount: snapshots.length, completedCount: snapshots.length });
     snapshots.forEach((snapshot) => store.addSnapshot(snapshot));
+    if (zeroPose) await Promise.all(snapshots.map((snapshot) => writeFile(join(dataDir, 'snapshots', snapshot.fileName), snapshot.id)));
     groups.set(name, snapshots);
   }
   seed(store, camera, groups);
@@ -70,7 +75,7 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
     payload: { revision: task.revision, ...payload } });
   f.select = (task, base, supplemental = [], selectionRevision = task.refinementSelection?.revision || 0) => f.app.inject({
     method: 'PUT', url: `/api/recognition-tasks/${task.id}/refinement-sources`, payload: { revision: task.revision, selectionRevision,
-      base: base ? { taskId: base.id, revision: base.revision, resultId: base.resultId } : null,
+      base: base ? { taskId: base.id, revision: base.revision, resultId: base.resultId, ...(base.baseModel ? { model: base.baseModel } : {}) } : null,
       supplemental: supplemental.map((entry) => ({ taskId: entry.id, revision: entry.revision })) },
   });
   f.base = (await f.post(await f.task('base'), 'generate')).json();
@@ -79,6 +84,161 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
   f.extra = await f.task('extra');
   return f;
 }
+
+test('联合精修使用同一批低倍与多来源高倍原图求解零位姿态，保留固定参数和已有标定', async (t) => {
+  const f = await fixture(t, { zeroPose: actualZeroPose });
+  const base = (await f.post(f.base, 'generate', { model: zeroPoseModel })).json();
+  assert.equal(base.zeroPoseCandidate?.status, 'estimated', JSON.stringify(base.zeroPoseCandidate));
+  const selection = { ...base, baseModel: zeroPoseModel, resultId: base.zeroPoseCandidate.resultId };
+  const saved = await f.select(f.main, selection, [f.extra]);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json().refinementSelection.base.model, zeroPoseModel);
+  const generated = await f.post(f.main, 'refine', { selectionRevision: 1 });
+  assert.equal(generated.statusCode, 200, generated.body);
+  const main = generated.json(), candidate = main.refinement;
+  assert.equal(candidate.model, zeroPoseModel);
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.equal(candidate.stale, false, candidate.staleReasons.join('，'));
+  assert.deepEqual(candidate.generatedCamera, f.camera);
+  assert.deepEqual(candidate.baseCamera.zeroPose, base.zeroPoseCandidate.zeroPose);
+  assert.deepEqual(candidate.before.zeroPose, base.zeroPoseCandidate.zeroPose);
+  assert.equal(candidate.zeroPose.yaw, actualZeroPose.yaw);
+  assert.equal(candidate.zeroPose.tiltOffset, actualZeroPose.tiltOffset);
+  assert.ok(Math.abs(candidate.zeroPose.roll - actualZeroPose.roll) < 0.08);
+  assert.ok(Math.abs(candidate.zeroPose.pitch - actualZeroPose.pitch) < 0.08);
+  assert.equal(candidate.before.base.sampleCount, 6);
+  assert.equal(candidate.before.high.sampleCount, 8);
+  assert.ok(candidate.before.high.rmsResidualPixels > candidate.after.high.rmsResidualPixels);
+  assert.ok(candidate.before.objective > candidate.after.objective);
+  assert.deepEqual(candidate.sources[0], { role: 'base', taskId: base.id, revision: base.revision,
+    model: zeroPoseModel, resultId: base.zeroPoseCandidate.resultId, inputSnapshotIds: base.zeroPoseCandidate.sourceSnapshotIds,
+    sourceSnapshotIds: base.zeroPoseCandidate.sourceSnapshotIds });
+  assert.deepEqual(candidate.sources.map((source) => source.sourceSnapshotIds.length), [6, 5, 3]);
+  assert.ok(Math.abs(candidate.after.overall.rmsResidualPixels - Math.hypot(
+    candidate.after.base.rmsResidualPixels, candidate.after.high.rmsResidualPixels,
+  ) / Math.sqrt(2)) < 1e-9);
+
+  for (const mode of ['before', 'after']) {
+    const measured = await f.post(main, 'refinement-measure', { mode, selectionRevision: 1, resultId: candidate.resultId });
+    assert.equal(measured.statusCode, 200, measured.body);
+    assert.equal(measured.json().model, zeroPoseModel);
+    assert.equal(measured.json().resultId, candidate.resultId);
+    assert.deepEqual(measured.json().perSnapshot, candidate[mode].perSnapshot);
+    assert.ok(measured.json().perSnapshot.every((row) => row.theoreticalHorizon.length && row.verticalResiduals.length === 3));
+  }
+  const original = await f.app.inject('/api/snapshots/extra-1/image');
+  assert.equal(original.statusCode, 200, original.body);
+  assert.equal(original.body, 'extra-1');
+  const high = candidate.after.perSnapshot.find((row) => row.snapshotId === 'extra-1');
+  assert.equal(high.taskId, f.extra.id);
+  assert.equal(high.group, 'high');
+  assert.equal(high.horizontalFieldAngle, 10.6);
+  assert.equal(high.width, 1920);
+  assert.equal(high.height, 1080);
+  for (const residual of high.verticalResiduals) {
+    assert.equal(residual.offsetPixels, (residual.observedY - residual.theoreticalY) * 1080);
+  }
+  assert.deepEqual(await f.get(base.id), base);
+  assert.deepEqual(await f.get(f.extra.id), f.extra);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), [f.camera]);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  assert.deepEqual((await f.get(main.id)).refinement, candidate);
+});
+
+test('零位精修拒绝混用模型、旧版本和重复图片，来源更新和相机草稿修改使候选过期', async (t) => {
+  const f = await fixture(t, { zeroPose: actualZeroPose });
+  const base = (await f.post(f.base, 'generate', { model: zeroPoseModel })).json();
+  const selection = { ...base, baseModel: zeroPoseModel, resultId: base.zeroPoseCandidate.resultId };
+  const duplicate = await f.task('extra');
+  for (const [request, message] of [
+    [() => f.select(f.main, { ...base, baseModel: zeroPoseModel }, [f.extra]), /零位候选编号/],
+    [() => f.select(f.main, { ...selection, baseModel: undefined }, [f.extra]), /基础标定来源/],
+    [() => f.select(f.main, { ...selection, revision: selection.revision + 1 }, [f.extra]), /标注版本/],
+    [() => f.select(f.main, selection, [{ ...f.extra, revision: f.extra.revision + 1 }]), /标注版本/],
+    [() => f.select(f.main, selection, [f.extra, duplicate]), /重复截图/],
+  ]) {
+    const response = await request();
+    assert.equal(response.statusCode, 409, response.body);
+    assert.match(response.json().message, message);
+    assert.equal((await f.get(f.main.id)).refinementSelection, undefined);
+  }
+  assert.equal((await f.select(f.main, selection, [f.extra])).statusCode, 200);
+  const generated = await f.post(f.main, 'refine', { selectionRevision: 1 });
+  assert.equal(generated.statusCode, 200, generated.body);
+  const main = generated.json(), resultId = main.refinement.resultId;
+  const oldPreview = (mode) => f.post(main, 'refinement-measure', { mode, selectionRevision: 1, resultId });
+  assert.equal((await f.post(main, 'refinement-measure', { mode: 'before', selectionRevision: 1, resultId: 'old' })).statusCode, 409);
+
+  const modified = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${f.extra.id}/items/extra-0`,
+    payload: { revision: f.extra.revision, ignored: true } });
+  assert.equal(modified.statusCode, 200, modified.body);
+  assert.match((await f.get(main.id)).refinement.staleReasons.join('，'), /正式标注版本/);
+  assert.equal((await oldPreview('after')).statusCode, 409);
+
+  const newBase = (await f.post(base, 'generate', { model: zeroPoseModel })).json();
+  assert.match((await f.get(main.id)).refinement.staleReasons.join('，'), /基础零位候选/);
+  assert.equal((await oldPreview('before')).statusCode, 409);
+  const saved = await f.select(main, { ...selection, resultId: newBase.zeroPoseCandidate.resultId }, [modified.json().task]);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.ok(saved.json().refinement.stale);
+  assert.equal(saved.json().refinement.resultId, resultId);
+  const replacement = await f.post(main, 'refine', { selectionRevision: 2 });
+  assert.equal(replacement.statusCode, 200, replacement.body);
+  assert.equal(replacement.json().refinement.stale, false);
+  assert.notEqual(replacement.json().refinement.resultId, resultId);
+
+  const camera = await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: {
+    ...f.input, zeroPose: { ...f.camera.zeroPose, yaw: f.camera.zeroPose.yaw + 1 },
+  } });
+  assert.equal(camera.statusCode, 200, camera.body);
+  const reopened = await f.get(main.id);
+  assert.match(reopened.refinement.staleReasons.join('，'), /相机配置版本/);
+  assert.equal((await f.post(reopened, 'refinement-measure', {
+    mode: 'after', selectionRevision: 2, resultId: reopened.refinement.resultId,
+  })).statusCode, 409);
+});
+
+test('零位候选靠真实有效的较高倍率原图，恢复非参与图片不会改变已冻结的前后对照', async (t) => {
+  const f = await fixture(t, { zeroPose: actualZeroPose, ptzFor: (name, index) => {
+    if (name === 'base') return {};
+    return { Zoom: name === 'extra' && index === 0 ? 14 : name === 'main' && index === 0 ? 30 : 3 };
+  }, highTransform: (shot) => shot.id === 'main-0' ? { ...shot, poseChanged: true } : shot });
+  const highImage = join(f.dataDir, 'snapshots', 'extra-0.jpg');
+  await unlink(highImage);
+  const base = (await f.post(f.base, 'generate', { model: zeroPoseModel })).json();
+  const selection = { ...base, baseModel: zeroPoseModel, resultId: base.zeroPoseCandidate.resultId };
+  assert.equal((await f.select(f.main, selection, [f.extra])).statusCode, 200);
+  const generated = await f.post(f.main, 'refine', { selectionRevision: 1 });
+  assert.equal(generated.statusCode, 200, generated.body);
+  const main = generated.json(), candidate = main.refinement;
+  assert.equal(candidate.status, 'insufficient_data', candidate.message);
+  assert.match(candidate.message, /倍率高于基础组/);
+  assert.equal(candidate.zeroPose, null);
+  assert.deepEqual(candidate.before, candidate.after);
+  assert.equal(candidate.before.high.sampleCount, 6);
+  assert.ok(candidate.excluded.some((row) => row.snapshotId === 'main-0' && /姿态发生变化/.test(row.reason)));
+  assert.ok(candidate.excluded.some((row) => row.snapshotId === 'extra-0' && /文件缺失/.test(row.reason)));
+
+  await writeFile(highImage, 'extra-0');
+  for (const mode of ['before', 'after']) {
+    const response = await f.post(main, 'refinement-measure', { mode, selectionRevision: 1, resultId: candidate.resultId });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json().sourceSnapshotIds, candidate.sourceSnapshotIds);
+    assert.deepEqual(response.json().excluded, candidate.excluded);
+  }
+  const regenerated = await f.post(main, 'refine', { selectionRevision: 1 });
+  assert.equal(regenerated.statusCode, 200, regenerated.body);
+  const latest = regenerated.json().refinement;
+  assert.equal(latest.status, 'estimated', latest.message);
+  assert.ok(latest.sourceSnapshotIds.includes('extra-0'));
+  await unlink(highImage);
+  const reopened = await f.get(main.id);
+  assert.match(reopened.refinement.staleReasons.join('，'), /原图文件缺失/);
+  const failed = await f.post(reopened, 'refinement-measure', { mode: 'after', selectionRevision: 1, resultId: latest.resultId });
+  assert.equal(failed.statusCode, 409, failed.body);
+  assert.deepEqual(await f.get(main.id), reopened);
+});
 
 test('有效精修候选可供新截图固定参数独立复核，复核保持候选、设备和来源原值', async (t) => {
   const f = await fixture(t, { includeValidation: true, ptzFor: (name, index) => name === 'validation' && index % 2 === 0
@@ -375,7 +535,7 @@ test('联合精修来源独立持久化，重启恢复并拒绝旧选择版本',
 });
 
 test('联合基础与多批随机高倍图生成独立候选和同批观测前后对照，不修改采样与设备', async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { savedZeroPose: actualZeroPose });
   const before = (await f.app.inject('/api/cameras')).json();
   const baseBefore = await f.get(f.base.id);
   const itemsBefore = (await f.app.inject(`/api/recognition-tasks/${f.main.id}/items`)).json().items;

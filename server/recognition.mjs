@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { calibratedZeroPose } from '#zero-pose';
 import { httpError } from './errors.mjs';
 import { calibrationOf } from './store.mjs';
 import { backfillCalibrationSources, calibrationSourceFor } from './calibration-source.mjs';
@@ -162,9 +163,26 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       if (reason) excluded.push({ snapshotId: item.snapshotId, reason }); else selected.push(item);
     }
     const dates = selected.length ? selected.map((item) => +new Date(item.snapshot.createdAt)) : [+new Date(task.createdAt)];
-    const result = estimateZeroPose(camera, selected.map((item) => item.snapshot), selected.map(({ snapshotId, points }) => ({ snapshotId, points })), {
-      startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
-    });
+    const snapshots = selected.map((item) => item.snapshot);
+    const observations = selected.map(({ snapshotId, points }) => ({ snapshotId, points }));
+    const range = { startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString() };
+    let result = estimateZeroPose(camera, snapshots, observations, range);
+    const historical = task.fitCamera;
+    const sameInstallation = historical && ['serial', 'code', 'longitude', 'latitude', 'height', 'panOffset']
+      .every((key) => historical[key] === camera[key]);
+    if (result.diagnostics?.rmsResidualPixels > result.diagnostics?.maximumAcceptedRmsPixels
+      && !camera.calibrationModel && task.appliedAt && sameInstallation && !historical.calibrationModel
+      && result.fixedCalibration.tiltOffset === 0 && result.fixedCalibration.imageRoll === 0
+      && [historical.tiltOffset, historical.imageRoll].every(Number.isFinite)
+      && (historical.tiltOffset !== 0 || historical.imageRoll !== 0)) {
+      // 兼容旧草稿丢失转台关系的情况。保留当前 Yaw，按本版正式标注重算。
+      const zeroPose = { ...(camera.zeroPose ?? calibratedZeroPose(camera)),
+        tiltOffset: historical.tiltOffset, imageRoll: historical.imageRoll };
+      const recovered = estimateZeroPose({ ...camera, zeroPose }, snapshots, observations, range);
+      if (recovered.status === 'estimated' && recovered.diagnostics.rmsResidualPixels < result.diagnostics.rmsResidualPixels) {
+        result = { ...recovered, message: `已沿用历史标定的机械转动关系。${recovered.message}` };
+      }
+    }
     return { zeroPoseCandidate: { ...result, excluded: [...excluded, ...result.excluded], resultId: randomUUID(),
       revision: task.revision, generatedCamera: camera, applied: false, appliedAt: null } };
   }
@@ -230,7 +248,10 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
         let candidate = {};
         const task = store.getRecognitionTask(id);
         if (task.autoGenerate) {
-          try { candidate = installationChanges(task); } catch (error) {
+          try {
+            candidate = store.getSnapshotGroup(task.sourceTaskId).horizon?.phase === 'coarse'
+              ? installationChanges(task) : zeroPoseChanges(task);
+          } catch (error) {
             console.error('自动生成安装候选失败', error);
             candidate = { error: `识别已完成，候选计算失败：${error.statusCode ? error.message : '请检查后端日志'}` };
           }
@@ -386,11 +407,12 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks/:id/refine', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'selectionRevision'], properties: {
       ...bodyWithRevision.properties, selectionRevision: revisionSchema,
+      model: { const: ZERO_POSE_MODEL },
     },
   } } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
     if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
-    const input = refinementInputs(store, task, task.refinementSelection);
+    const input = refinementInputs(store, task, task.refinementSelection, request.body.model);
     const result = refineInstallation({ ...input.camera, ...input.baseCamera }, input.selected.map((item) => item.snapshot),
       input.selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), input.range, input.baseSnapshotIds, input.model);
     const taskBySnapshot = new Map(input.selected.map((item) => [item.snapshotId, item.taskId]));
@@ -405,7 +427,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     return store.transaction(() => {
       const currentTask = editable(task.id, task.revision);
       if (currentTask.refinementSelection?.revision !== refinement.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
-      const latest = refinementInputs(store, currentTask, currentTask.refinementSelection);
+      const latest = refinementInputs(store, currentTask, currentTask.refinementSelection, request.body.model);
       if (!isDeepStrictEqual(input.camera, latest.camera)) {
         throw httpError(409, '计算期间摄像头配置已变化，请重新生成精修候选');
       }
@@ -423,7 +445,8 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const task = editable(request.params.id, request.body.revision);
     if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
     const { mode, resultId } = request.body;
-    const frozen = mode === 'after' || (task.refinementSelection.base?.model === ZERO_POSE_MODEL && !!resultId);
+    const frozen = mode === 'after' || (!!resultId
+      && (task.refinement?.model === ZERO_POSE_MODEL || task.refinementSelection.base?.model === ZERO_POSE_MODEL));
     const candidate = frozen ? task.refinement : null;
     if (frozen) {
       if (!candidate || candidate.resultId !== resultId) throw httpError(409, '精修候选编号已变化，请刷新后重试');
@@ -529,8 +552,8 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     },
   } } });
   function applyZeroPose(task, candidate, field, validationId) {
-    if (!validationId) throw httpError(400, '请提交通过的独立复核证据编号');
-    requireZeroPoseValidation(store, task, candidate, validationId);
+    if (field === 'refinement' && !validationId) throw httpError(400, '请提交通过的独立复核证据编号');
+    if (validationId) requireZeroPoseValidation(store, task, candidate, validationId);
     const camera = store.getCamera(task.cameraId);
     const source = calibrationSourceFor(task, candidate, field === 'refinement' ? 'refinement' : 'ordinary');
     const updatedCamera = store.saveCamera({ ...camera, zeroPose: candidate.zeroPose }, camera.id,

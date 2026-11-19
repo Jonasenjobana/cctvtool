@@ -1,6 +1,6 @@
 import { Cartesian3, Ellipsoid, Matrix3, Matrix4, Transforms } from 'cesium';
 import { createLocalRigRotation } from '#camera-rotation';
-import { createZeroPoseRigRotation, resolveZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
+import { calibratedZeroPose, createZeroPoseRigRotation, legacyZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
 import { httpError } from './errors.mjs';
 
 const rad = Math.PI / 180;
@@ -317,7 +317,7 @@ function linearizeInstallation(parameters, calculateResiduals) {
 const legacyLimits = [89, 89, 180, 180];
 
 function installationFitModel(camera, geometry, samples, model = installationModel) {
-  const zeroPose = model === ZERO_POSE_MODEL ? resolveZeroPose(camera) : null;
+  const zeroPose = model === ZERO_POSE_MODEL ? camera.zeroPose : null;
   const initial = zeroPose ? [zeroPose.roll, zeroPose.pitch] : [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
   // Roll 的周期为 360°，优化沿连续角度进行，在生成参数时归一化。
   const limits = zeroPose ? [Infinity, 90] : legacyLimits;
@@ -326,7 +326,7 @@ function installationFitModel(camera, geometry, samples, model = installationMod
   } }) : ([pAxisPitch, pAxisRoll, tiltOffset, imageRoll]) => ({ installation: { pAxisPitch, pAxisRoll, tiltOffset, imageRoll } });
   const rotation = zeroPose ? (parameters, ptz) => createZeroPoseRigRotation(calibrationOf(parameters).zeroPose, ptz).camera
     : (parameters, ptz) => legacyRotation(camera, parameters, ptz);
-  return { initial, limits, calibrationOf, rotation,
+  return { initial, limits, calibrationOf,
     residuals: (parameters) => residuals(parameters, camera, geometry, samples, rotation) };
 }
 
@@ -408,7 +408,7 @@ function horizonMeasurements(rotation, geometry, sample) {
 }
 
 function zeroPoseGeometry(camera, pose) {
-  if (!pose || ![pose.roll, pose.pitch, pose.yaw, pose.tiltOffset].every(Number.isFinite)
+  if (!pose || ![pose.roll, pose.pitch, pose.yaw, pose.tiltOffset, pose.imageRoll ?? 0].every(Number.isFinite)
     || Math.abs(pose.roll) > 180 || Math.abs(pose.pitch) > 90 || pose.yaw < 0 || pose.yaw >= 360) {
     throw httpError(400, '请先为该摄像头保存有效的零位姿态');
   }
@@ -451,8 +451,10 @@ export function evaluateInstallation(camera, snapshots, observations, requestedR
     rmsResidualPixels: null, rmsAngularResidualDegrees: null, maximumResidualPixels: null,
     message: '没有有效的停稳截图和海天线标注，无法独立复核' };
   // 复核只计算固定参数的残差，不调用优化器，也不按复核结果修改参数。
-  const perSnapshot = summarizeResiduals(samples, fit.residuals(fit.initial)).map((row, index) => ({
-    ...row, ...horizonMeasurements(fit.rotation(fit.initial, samples[index].ptz), geometry, samples[index]),
+  const pose = zeroPose ? camera.zeroPose : legacyZeroPose(camera);
+  const rotation = (_, ptz) => createZeroPoseRigRotation(pose, ptz).camera;
+  const perSnapshot = summarizeResiduals(samples, residuals(fit.initial, camera, geometry, samples, rotation)).map((row, index) => ({
+    ...row, ...horizonMeasurements(rotation(fit.initial, samples[index].ptz), geometry, samples[index]),
   }));
   const rms = (key) => Math.sqrt(perSnapshot.reduce((sum, item) => sum + item[key] ** 2, 0) / perSnapshot.length);
   const failedSnapshotIds = perSnapshot.filter((item) => !Number.isFinite(item.rmsResidualPixels)
@@ -517,14 +519,14 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
 
 export function estimateZeroPose(camera, snapshots, observations, requestedRange) {
   const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
-  const zeroPose = resolveZeroPose(camera);
+  const zeroPose = camera.zeroPose ?? calibratedZeroPose(camera);
   const geometry = zeroPoseGeometry(camera, zeroPose);
   const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
   const fit = installationFitModel({ ...camera, zeroPose }, geometry, samples, ZERO_POSE_MODEL);
   const base = {
     model: ZERO_POSE_MODEL, generatedAt: new Date().toISOString(), ...range,
     fixedCalibration: { longitude: camera.longitude, latitude: camera.latitude, height: camera.height,
-      yaw: zeroPose.yaw, tiltOffset: zeroPose.tiltOffset, imageRoll: 0, cameraUpdatedAt: camera.updatedAt },
+      yaw: zeroPose.yaw, tiltOffset: zeroPose.tiltOffset, imageRoll: zeroPose.imageRoll ?? 0, cameraUpdatedAt: camera.updatedAt },
     sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded,
     ...panCoverage(samples.map((sample) => sample.ptz.Pan)),
   };
@@ -541,15 +543,15 @@ export function estimateZeroPose(camera, snapshots, observations, requestedRange
   const failures = [];
   if (!solution.converged) failures.push('拟合未收敛');
   if (conditionNumber === null || conditionNumber >= 1e8) failures.push('零位 Roll 和 Pitch 不可可靠辨识');
-  if (!Number.isFinite(rmsResidualPixels) || rmsResidualPixels > maximumRmsPixels) {
-    failures.push(`均方根残差 ${rmsResidualPixels.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素门槛`);
-  }
+  if (!Number.isFinite(rmsResidualPixels)) failures.push('均方根残差无法计算');
+  const rmsNotice = Number.isFinite(rmsResidualPixels) && rmsResidualPixels > maximumRmsPixels
+    ? `。均方根残差 ${rmsResidualPixels.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素参考值` : '';
   return { ...base, status: failures.length ? 'unreliable' : 'estimated',
     zeroPose: failures.length ? null : fit.calibrationOf(solution.parameters).zeroPose,
     diagnostics: { converged: solution.converged, iterations: solution.iterations, conditionNumber,
       rmsResidualPixels, rmsAngularResidualDegrees: rms('rmsAngularResidualDegrees'),
       maximumAcceptedRmsPixels: maximumRmsPixels, perSnapshot },
-    message: failures.join('，') || '已生成零位姿态候选，请对照原图核查',
+    message: (failures.join('，') || '已生成零位姿态候选，请对照原图核查') + rmsNotice,
   };
 }
 
@@ -604,26 +606,35 @@ export function refineInstallation(camera, snapshots, observations, requestedRan
   const normal = linearizeInstallation(solution.parameters, fit.residuals);
   const conditionNumber = installationConditionNumber(normal.matrix);
   const attempted = compare(solution.parameters);
-  const withinRms = (comparison) => ['overall', 'base', 'high'].every((key) => Number.isFinite(comparison[key].rmsResidualPixels)
-    && comparison[key].rmsResidualPixels <= maximumRmsPixels);
+  const rmsGroups = [['overall', '总体'], ['base', '基础组'], ['high', '高倍组']];
+  const acceptableRms = (rms) => Number.isFinite(rms) && (zeroPose || rms <= maximumRmsPixels);
   const improved = before.objective - attempted.objective > 1e-12 * (1 + before.objective)
     && Math.hypot(...solution.parameters.map((value, index) => value - initial[index])) >= 1e-7;
   const failures = [];
   if (!solution.converged) failures.push('拟合未收敛');
   if (conditionNumber === null || conditionNumber >= 1e8) failures.push(zeroPose ? '零位 Roll 和 Pitch 不可可靠辨识' : '四参数不可可靠辨识');
-  for (const [key, label] of [['overall', '总体'], ['base', '基础组'], ['high', '高倍组']]) {
-    if (!Number.isFinite(attempted[key].rmsResidualPixels) || attempted[key].rmsResidualPixels > maximumRmsPixels) {
-      failures.push(`${label} RMS ${attempted[key].rmsResidualPixels?.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素门槛`);
-    }
+  for (const [key, label] of rmsGroups) {
+    const rms = attempted[key].rmsResidualPixels;
+    if (!Number.isFinite(rms)) failures.push(`${label} RMS 无法计算`);
+    else if (!acceptableRms(rms)) failures.push(`${label} RMS ${rms.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素门槛`);
   }
-  const noChange = !improved && !failures.length && withinRms(before);
+  const noChange = !improved && !failures.length && rmsGroups.every(([key]) => acceptableRms(before[key].rmsResidualPixels));
   if (!improved && !noChange) failures.push('联合稳健目标在现有终止精度内没有改善');
   const accepted = improved && !failures.length;
+  const after = noChange ? before : attempted;
+  const messages = failures.length ? [...failures] : [noChange
+    ? (zeroPose ? '精修未取得可辨识的改善，沿用基础姿态' : '基准已满足质量要求，无需修正')
+    : '已生成联合精修候选，请比较基准与候选误差'];
+  if (zeroPose) {
+    for (const [key, label] of rmsGroups) {
+      const rms = after[key].rmsResidualPixels;
+      if (Number.isFinite(rms) && rms > maximumRmsPixels) messages.push(`${label} RMS ${rms.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素参考值`);
+    }
+  }
   return { ...common, status: noChange ? 'no_change' : accepted ? 'estimated' : 'unreliable',
     ...(noChange ? fit.calibrationOf(initial) : accepted ? fit.calibrationOf(solution.parameters) : invalid),
-    after: noChange ? before : attempted,
+    after,
     diagnostics: { converged: solution.converged, conditionNumber, failures },
-    message: noChange ? '基准已满足质量要求，无需修正' : accepted ? '已生成联合精修候选，请比较基准与候选误差'
-      : failures.join('；'),
+    message: messages.join(zeroPose ? '。' : '；'),
   };
 }

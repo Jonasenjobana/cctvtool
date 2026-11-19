@@ -171,17 +171,6 @@ export interface InstallationEstimate {
   warnings?: string[];
   applied: boolean;
 }
-export interface InstallationValidation {
-  taskId: string; revision: number; generatedAt: string;
-  reference: { kind: 'ordinary' | 'refinement'; taskId: string; resultId: string; revision: number; createdAt: string;
-    selectionRevision?: number; sources?: InstallationRefinement['sources'] };
-  status: 'passed' | 'failed' | 'insufficient_data'; message: string;
-  installation: Pick<Calibration, 'pAxisPitch' | 'pAxisRoll' | 'tiltOffset' | 'imageRoll'>;
-  sourceSnapshotIds: string[]; excluded: { snapshotId: string; reason: string }[];
-  rmsResidualPixels: number | null; rmsAngularResidualDegrees: number | null; maximumResidualPixels: number | null;
-  maximumAcceptedRmsPixels: number; failedSnapshotIds: string[];
-  perSnapshot: HorizonMeasurement[];
-}
 export interface HorizonMeasurement {
   snapshotId: string; pan: number; tilt: number; zoom: number; width: number; height: number;
   horizontalFieldAngle: number; verticalFieldAngle: number; timeAlignment: string;
@@ -191,47 +180,13 @@ export interface HorizonMeasurement {
   directionDifferenceDegrees: number | null;
   rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null;
 }
-export interface ZeroPoseValidationCriteria {
-  minimumHighZoom: number; maximumVerticalOffsetPixels: number; maximumDirectionDifferenceDegrees: number; maximumRmsPixels: number;
-}
-export interface ZeroPoseValidationEvidence {
-  version: 1 | 2; id: string; generatedAt: string; status: ZeroPoseValidation['status'];
-  source: { kind: 'zero-pose' | 'zero-pose-refinement'; model: ZeroPoseCandidate['model']; taskId: string; revision: number;
-    resultId: string; sourceSnapshotIds: string[]; selectionRevision?: number; sources?: InstallationRefinement['sources'] };
-  validation: { taskId: string; revision: number; sourceSnapshotIds: string[] };
-  camera: { id: string; updatedAt: string };
-  baseline: { model: string; calibration: Calibration; sources: {
-    kind: InstallationValidation['reference']['kind']; model: string; taskId: string; resultId: string; revision: number;
-    sourceSnapshotIds: string[]; selectionRevision?: number;
-    sources?: Omit<InstallationRefinement['sources'][number], 'inputSnapshotIds'>[];
-  }[] };
-  criteria: ZeroPoseValidationCriteria;
-}
-export interface ZeroPoseValidation {
-  taskId: string; revision: number; generatedAt: string;
-  status: InstallationValidation['status'] | 'insufficient_coverage'; message: string;
-  reference: Omit<ZeroPoseValidationEvidence['source'], 'sourceSnapshotIds'> & { createdAt: string };
-  evidence: ZeroPoseValidationEvidence;
-  coverage: { lowSnapshotCount: number; highSnapshotCount: number; comparableHighSnapshotCount: number;
-    highPoseCount: number; distinctPanCount: number; panCoverageDegrees: number; reasons: string[] };
-  sourceSnapshotIds: string[]; failedSnapshotIds: string[]; excluded: InstallationValidation['excluded'];
-  baseline: { rmsResidualPixels: number | null } & ({
-    model: 'wgs84-horizon-installation-v1'; installation: InstallationValidation['installation'];
-  } | { model: typeof ZERO_POSE_MODEL; zeroPose: ZeroPose });
-  candidate: { model: ZeroPoseCandidate['model']; zeroPose: ZeroPose; rmsResidualPixels: number | null };
-  perSnapshot: {
-    snapshotId: string; pan: number; tilt: number; zoom: number; zoomGroup: 'low' | 'high';
-    baseline: HorizonMeasurement; candidate: HorizonMeasurement; baselineComparable: boolean; candidateComparable: boolean;
-    failures: string[]; regressions: string[];
-  }[];
-}
 export interface ZeroPoseCandidate {
   model: typeof ZERO_POSE_MODEL;
   resultId: string; revision: number; generatedAt: string; startTime: string; endTime: string;
   status: InstallationEstimate['status']; zeroPose: ZeroPose | null;
   generatedCamera: Camera;
   fixedCalibration: Pick<Calibration, 'longitude' | 'latitude' | 'height'> & Pick<ZeroPose, 'yaw' | 'tiltOffset'>
-    & { imageRoll: 0; cameraUpdatedAt: string };
+    & { imageRoll: number; cameraUpdatedAt: string };
   sourceSnapshotIds: string[]; excluded: InstallationEstimate['excluded'];
   distinctPanCount: number; panCoverageDegrees: number;
   diagnostics?: { converged: boolean; iterations: number; conditionNumber: number | null;
@@ -239,57 +194,11 @@ export interface ZeroPoseCandidate {
     perSnapshot: Omit<HorizonMeasurement, 'theoreticalHorizon' | 'verticalResiduals' | 'directionDifferenceDegrees' | 'verticalOffsetPixels'>[] };
   message: string; stale: boolean; staleReasons: string[];
   applied: boolean; appliedAt: string | null;
-  validation?: ZeroPoseValidationEvidence;
-  validationStaleReason?: string | null;
 }
 export interface ZeroPoseMeasurement {
   taskId: string; revision: number; resultId: string;
   model: ZeroPoseCandidate['model']; zeroPose: ZeroPose;
   perSnapshot: HorizonMeasurement[]; excluded: InstallationEstimate['excluded'];
-}
-type RefinementBaseModel = 'wgs84-horizon-installation-v1' | ZeroPoseCandidate['model'];
-export interface RefinementSelection {
-  revision: number;
-  base: { taskId: string; revision: number; resultId: string; model?: RefinementBaseModel } | null;
-  supplemental: { taskId: string; revision: number }[];
-}
-export interface RefinementSummary {
-  sampleCount: number; zoomRange: { min: number; max: number } | null;
-  distinctPanCount: number; panCoverageDegrees: number;
-  rmsResidualPixels: number | null; rmsAngularResidualDegrees: number | null;
-}
-export interface RefinementComparison {
-  overall: RefinementSummary; base: RefinementSummary; high: RefinementSummary; objective: number;
-  perSnapshot: (HorizonMeasurement & { taskId: string; group: 'base' | 'high' })[];
-}
-interface RefinementState {
-  resultId: string; generatedAt: string; selectionRevision: number;
-  status: 'estimated' | 'no_change' | 'insufficient_data' | 'unreliable';
-  generatedCamera: Camera;
-  sources: { role: 'base' | 'high'; taskId: string; revision: number; resultId?: string; model?: RefinementBaseModel;
-    inputSnapshotIds: string[]; sourceSnapshotIds: string[] }[];
-  sourceSnapshotIds: string[]; excluded: { taskId?: string; snapshotId: string; reason: string }[];
-  diagnostics: { converged: boolean; conditionNumber: number | null; failures: string[] };
-  maximumAcceptedRmsPixels: number; message: string; stale: boolean; staleReasons: string[];
-  applied: boolean; appliedAt: string | null;
-}
-type LegacyRefinementComparison = RefinementComparison & { installation: NonNullable<InstallationEstimate['installation']> };
-type ZeroPoseRefinementComparison = RefinementComparison & { zeroPose: ZeroPose };
-export type InstallationRefinement = RefinementState & ({
-  model: 'wgs84-horizon-refinement-v1'; installation: InstallationEstimate['installation'];
-  before: LegacyRefinementComparison; after: LegacyRefinementComparison;
-  baseCamera: Calibration & Pick<Camera, 'serial' | 'code' | 'updatedAt'>;
-} | {
-  model: ZeroPoseCandidate['model']; zeroPose: ZeroPose | null;
-  before: ZeroPoseRefinementComparison; after: ZeroPoseRefinementComparison;
-  baseCamera: Camera & { zeroPose: ZeroPose };
-  validation?: ZeroPoseValidationEvidence;
-  validationStaleReason?: string | null;
-});
-export interface RefinementMeasurement {
-  taskId: string; revision: number; selectionRevision: number; mode: 'before' | 'after'; resultId: string | null;
-  model: RefinementBaseModel;
-  perSnapshot: RefinementComparison['perSnapshot']; excluded: { snapshotId: string; reason: string }[];
 }
 export interface RecognitionTask {
   id: string; sourceTaskId: string; cameraId: string; cameraName: string;
@@ -300,8 +209,6 @@ export interface RecognitionTask {
   resultRevision?: number;
   fitCamera?: Calibration;
   zeroPoseCandidate?: ZeroPoseCandidate;
-  refinementSelection?: RefinementSelection;
-  refinement?: InstallationRefinement;
 }
 export interface RecognitionItem {
   snapshotId: string; snapshot: Snapshot; points: HorizonPoint[]; detectedPoints: HorizonPoint[];

@@ -142,12 +142,11 @@
 .zero-pose-section button{padding:5px 8px;font-size:11px}
 .zero-pose-source{margin:7px 0 10px;font-size:11px;color:#526278}
 .zero-pose-reset{margin-top:10px}
+.zero-pose-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0}
+.zero-pose-values dt{font-size:11px;color:#666f7c}
+.zero-pose-values dd{margin:4px 0 0;font-size:12px;font-variant-numeric:tabular-nums}
 .parameter-heading{display:flex;align-items:center;gap:7px;margin-bottom:13px}
 .parameter-heading h3{margin-bottom:0}
-.field-heading{display:flex;align-items:center;gap:6px;margin-bottom:6px;min-height:16px}
-.form-section .field-heading label{flex:1;min-width:0;margin-bottom:0}
-.advanced-calibration summary{font-size:11px;color:#7b8797;cursor:pointer}
-.advanced-calibration[open] summary{margin-bottom:13px}
 .form-section label{display:flex;flex-wrap:wrap;justify-content:space-between;font-size:11px;color:#666f7c;line-height:1.4;gap:6px;margin-bottom:12px}
 .form-section label:last-child{margin-bottom:0}
 .form-section label>span{color:#a4acb8}

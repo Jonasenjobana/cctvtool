@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { ZERO_POSE_MODEL } from '#zero-pose';
 import { CameraStore, calibrationKeys, calibrationOf } from './store.mjs';
 import { LiveGbsClient } from './livegbs.mjs';
 import { readImageInfo } from './image.mjs';
@@ -48,12 +49,19 @@ const cameraSchema = {
         pitch: { type: 'number', minimum: -90, maximum: 90 },
         yaw: { type: 'number', minimum: 0, exclusiveMaximum: 360 },
         tiltOffset: calibrationProperties.tiltOffset,
+        imageRoll: calibrationProperties.imageRoll,
       },
       required: ['roll', 'pitch', 'yaw', 'tiltOffset'],
     },
+    applyZeroPose: { type: 'boolean' },
   },
   required: ['name', 'serial', 'code', ...calibrationKeys],
 };
+function manualCalibration({ applyZeroPose, zeroPose }) {
+  if (!applyZeroPose) return;
+  if (!zeroPose) throw httpError(400, '保存并应用零位姿态需要完整的姿态参数');
+  return { calibrationModel: ZERO_POSE_MODEL, activeZeroPose: zeroPose, source: null };
+}
 const preciseProperties = {
   pan: { type: 'number', minimum: 0, maximum: 360 },
   tilt: { type: 'number', minimum: -90, maximum: 90 },
@@ -277,7 +285,7 @@ export async function createApp({
       input[key] = input[key].trim();
       if (!input[key]) throw httpError(400, `请填写${fieldLabels[key]}`);
     }
-    return reply.code(201).send(store.saveCamera(input));
+    return reply.code(201).send(store.saveCamera(input, undefined, manualCalibration(input)));
   });
   app.put('/api/cameras/:id', { schema: { body: cameraSchema } }, async (request) => {
     if (isBusy(request.params.id)) throw httpError(409, '该摄像头正在控制或截图，请先停止控制后保存');
@@ -286,7 +294,7 @@ export async function createApp({
       input[key] = input[key].trim();
       if (!input[key]) throw httpError(400, `请填写${fieldLabels[key]}`);
     }
-    return store.transaction(() => store.saveCamera(input, request.params.id));
+    return store.transaction(() => store.saveCamera(input, request.params.id, manualCalibration(input)));
   });
   app.get('/api/cameras/:id/ptz', async (request) => livegbs.readPtz(store.getCamera(request.params.id)));
 

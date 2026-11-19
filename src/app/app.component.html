@@ -271,43 +271,42 @@
             }
           </section>
         }
-        @if (selectedId() && !selectedSnapshot() && page() === 'scene') {
+        @if (page() === 'scene') {
           <section class="form-section zero-pose-section">
             <div class="parameter-heading">
               <h3>零位姿态</h3>
-              <button type="button" [attr.aria-expanded]="!!zeroPosePreview()" (click)="setZeroPoseView(zeroPosePreview() ? null : 'external')">
-                {{ zeroPosePreview() ? '退出预览' : '编辑并预览' }}
-              </button>
+              @if (selectedId() && !selectedSnapshot()) {
+                <button type="button" [attr.aria-expanded]="!!zeroPosePreview()" (click)="setZeroPoseView(zeroPosePreview() ? null : 'current')">
+                  {{ zeroPosePreview() ? '退出预览' : '编辑并预览' }}
+                </button>
+              }
             </div>
-            <div class="zero-pose-source">生效模型 {{ selectedCamera()?.calibrationModel ?? '四参数安装模型' }}</div>
             @if (zeroPosePreview(); as preview) {
-              <div class="zero-pose-source" role="status">{{ sceneReading() ? '按实时 P/T 回读预览草稿' : '草稿零位参考 · P 0° / T 0° / Z 1' }}</div>
-              <app-zero-pose-editor [pose]="preview.pose" [disabled]="saving()" (changed)="editZeroPose($event)" />
+              <div class="parameter-heading">
+                <div class="zero-pose-source" role="status">
+                  {{ preview.showDraft ? '零位草稿' : '当前镜头姿态' }} ·
+                  {{ sceneReading() ? '实时 P/T' : '零位参考 · P 0° / T 0° / Z 1' }}
+                </div>
+                <button type="button" (click)="showZeroPoseDraft.set(!preview.showDraft)">
+                  {{ preview.showDraft ? '查看当前姿态' : '查看零位草稿' }}
+                </button>
+              </div>
+              <app-zero-pose-editor [pose]="preview.pose" [(angleStep)]="zeroPoseAngleStep"
+                [disabled]="saving()" (changed)="editZeroPose($event)" />
               <button type="button" class="zero-pose-reset" [disabled]="!zeroPoseDirty()" (click)="editZeroPose(selectedCamera()?.zeroPose)">放弃零位修改</button>
+            } @else if (!selectedId()) {
+              <app-zero-pose-editor [pose]="zeroPose()" [(angleStep)]="zeroPoseAngleStep"
+                [disabled]="saving()" (changed)="editZeroPose($event)" />
+            } @else {
+              @let pose = savedZeroPose();
+              <dl class="zero-pose-values">
+                <div><dt>Yaw</dt><dd>{{ pose.yaw | number:'1.0-6' }}°</dd></div>
+                <div><dt>Pitch</dt><dd>{{ pose.pitch | number:'1.0-6' }}°</dd></div>
+                <div><dt>Roll</dt><dd>{{ pose.roll | number:'1.0-6' }}°</dd></div>
+              </dl>
             }
           </section>
         }
-        <section class="form-section">
-          <div class="parameter-heading"><h3>云台 P 轴姿态</h3><app-calibration-help topic="p-axis" /></div>
-          <div class="field-grid">
-            <label for="axis-pitch">前后倾 <span>°</span><input id="axis-pitch" name="pAxisPitch" type="number" step="0.01" min="-180" max="180" required [ngModel]="formValue().pAxisPitch" (ngModelChange)="editNumber('pAxisPitch', $event)"></label>
-            <label for="axis-roll">左右倾 <span>°</span><input id="axis-roll" name="pAxisRoll" type="number" step="0.01" min="-180" max="180" required [ngModel]="formValue().pAxisRoll" (ngModelChange)="editNumber('pAxisRoll', $event)"></label>
-          </div>
-          <label for="pan-offset">默认朝向（P 偏移）<span>°</span><input id="pan-offset" name="panOffset" type="number" step="0.01" min="-360" max="360" required [ngModel]="formValue().panOffset" (ngModelChange)="editNumber('panOffset', $event)"></label>
-        </section>
-        <details class="form-section advanced-calibration">
-          <summary>高级标定</summary>
-          <div class="field-grid">
-            <div class="calibration-field">
-              <div class="field-heading"><label for="tilt-offset">四参数 T 偏移<span>°</span></label><app-calibration-help topic="tilt-offset" /></div>
-              <input id="tilt-offset" name="tiltOffset" type="number" step="0.01" min="-180" max="180" required title="四参数 T 偏移正值上抬" [ngModel]="formValue().tiltOffset" (ngModelChange)="editNumber('tiltOffset', $event)">
-            </div>
-            <div class="calibration-field">
-              <div class="field-heading"><label for="image-roll">画面 Roll 修正<span>°</span></label><app-calibration-help topic="image-roll" /></div>
-              <input id="image-roll" name="imageRoll" type="number" step="0.01" min="-180" max="180" required [ngModel]="formValue().imageRoll" (ngModelChange)="editNumber('imageRoll', $event)">
-            </div>
-          </div>
-        </details>
         <section class="form-section">
           <h3>安装位置</h3>
           <div class="field-grid">
@@ -327,7 +326,7 @@
       <div class="form-footer">
         @if (formError()) { <p class="inline-error" role="alert">{{ formError() }}</p> }
         @if (formMessage()) { <p class="saved-message" role="status"><app-icon name="check" />{{ formMessage() }}</p> }
-        <button type="submit" class="save-button" [disabled]="!formValid() || saving() || !!operating() || scanning() || !!selectedSnapshot() || (!isDirty() && !!selectedId() && !(zeroPosePreview() && !selectedCamera()?.zeroPose))"><app-icon name="save" />{{ saving() ? '正在保存…' : selectedId() ? '保存配置' : '注册并保存' }}</button>
+        <button type="submit" class="save-button" [disabled]="!formValid() || saving() || !!operating() || scanning() || !!selectedSnapshot() || (!isDirty() && !!selectedId() && !zeroPoseToApply())"><app-icon name="save" />{{ saving() ? '正在保存…' : !selectedId() ? '注册并保存' : zeroPoseToApply() ? '保存并应用姿态' : '保存配置' }}</button>
       </div>
     </form>
   </aside>

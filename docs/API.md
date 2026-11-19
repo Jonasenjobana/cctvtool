@@ -56,7 +56,9 @@
 | `POST /api/recognition-tasks/:id/refinement-measure` | `{ revision, selectionRevision, mode, resultId? }` 只读计算参与图的基准或候选理论线与偏差，不作为独立复核 |
 | `POST /api/recognition-tasks/:id/validate` | `{ revision, referenceTaskId, referenceResultId, referenceKind?, criteria? }` 按独立原图测量固定四参数，或对比普通／精修零位候选与当前生效模型并保存证据 |
 | `POST /api/recognition-tasks/:id/refinement-apply` | `{ revision, resultId, model?, validationId? }` 应用服务端保存的精修结果，零位模型要求通过的独立复核，返回 `{ task, camera }` |
-| `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId, model?, validationId? }` 应用服务端保存的普通结果，零位模型要求通过的独立复核，返回 `{ task, camera }` |
+| `POST /api/recognition-tasks/:id/apply` | `{ revision, resultId, model?, validationId? }` 应用服务端保存的普通结果，普通零位候选可直接确认应用，返回 `{ task, camera }` |
+
+识别页用生成、原图测量和普通应用接口完成零位标定。精修与独立复核接口供历史记录和旧客户端使用。
 
 设备创建与保存的请求体为：
 
@@ -83,11 +85,11 @@
 
 `maxZoom` 为每台摄像头持久保存的最大倍率，数字且不小于 1；新建请求省略时，名称为“天津船闸”默认 32，其他默认 73；更新请求省略时保留已保存值。名称变化不重置上限。前端在“设备信息”编辑并保存后生效，刷新及重启后保留。该字段是设备配置，不属于历史截图的 `calibration`。
 
-`zeroPose` 为可选的零位姿态草稿，由 `{ roll, pitch, yaw, tiltOffset }` 组成，均为度。Roll 与 T 补偿范围为 -180°～180°，Pitch 为 -90°～90°，Yaw 为 [0°, 360°) 的绝对真北方位。旧摄像头在保存草稿前省略该字段。更新请求省略该字段时保留已存值，提交时整组校验并随摄像头配置写入。`panOffset` 保留 P 朝向基准，`tiltOffset` 是四参数安装模型的 T 偏移。
+`zeroPose` 为可选的零位姿态，包括 `yaw/pitch/roll` 三个可编辑角度、用于机械相对转动的 `tiltOffset` 及兼容旧模型的可选 `imageRoll`。单位为度，Yaw 为 [0°, 360°) 的绝对真北方位，Pitch 为 -90°～90°，其余角度为 -180°～180°。更新时省略 `zeroPose` 会保留草稿。随完整 `zeroPose` 提交 `applyZeroPose: true` 可同时生效并清除现行拟合来源。只提交 `zeroPose` 的请求保存草稿。
 
-摄像头响应中的 `calibrationModel: "wgs84-horizon-zero-pose-v1"` 和 `activeZeroPose: { roll, pitch, yaw, tiltOffset }` 表示已应用的零位模型及其生效参数。两项由标定应用事务同时保存。普通配置保存时，同一设备通道保留生效零位，手动改变生效四参数时清除对应拟合来源。更换设备编号或通道编号时清除此前生效的零位及标定来源，并使用本次保存的四参数。四参数安装模型生效时省略这两个字段。实时投影和目标反算根据生效字段选择旋转关系。
+摄像头响应中的 `calibrationModel: "wgs84-horizon-zero-pose-v1"` 和 `activeZeroPose` 表示已应用的零位模型及其生效参数。手调生效或确认应用候选时两项随配置一起保存。普通配置保存时，同一设备通道保留生效零位。未提交新生效姿态而更换通道时清除此前生效的零位及标定来源。历史安装配置的响应省略这两个字段，实时投影和目标反算由其旧参数转换得到等价零位姿态。
 
-零位姿态在当地 ENU 中使用 `R0 = Rz(-yaw) × Rx(pitch) × Ry(roll)`。以草稿的 `tiltOffset` 为 δ，设备当前姿态用 `R0 × Rx(-δ) × Rz(-Pan) × Rx(δ - Tilt)`。补偿由 δ 调至 δ′ 时，将 `R0 × Rx(δ′ - δ)` 转回三角，保留机械俯仰校正。存储保存四个角度，矩阵和四元数从角度派生。
+零位姿态在当地 ENU 中使用 `R0 = Rz(-yaw) × Rx(pitch) × Ry(roll)`。设 `tiltOffset` 为 δ，旧模型的末端 `imageRoll` 为 ρ，设备当前姿态用 `R0 × Ry(-ρ) × Rx(-δ) × Rz(-Pan) × Rx(δ - Tilt) × Ry(ρ)`。设备 P/T 回零时相对转动抵消，镜头旋转就是 `R0`，俯仰直接取零位 Pitch。旧记录使用其 P/T 回零的旋转矩阵分解三角，原始标定及截图记录按拍摄时的数据读取。
 
 应用启动时为旧数据库补齐 `tiltOffset/imageRoll/maxZoom/zeroPose/activeCalibration`。两项修正初始化为 0，最大倍率按上述设备默认值初始化，零位草稿和生效零位校准初始为空。生效来源可由留存的最近一次应用记录和当前参数确认时回填，未知来源留空。读取历史截图时缺少两项修正按 0 处理。MCP 只读打开旧库时按同样默认值兼容。
 
@@ -264,7 +266,9 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 
 `generate` 的失败消息区分未收敛、不可辨识和 RMS 超限；已收敛但残差超限会明确显示实际 RMS 与 5 像素门槛。每次生成新的 `resultId` 并清除当前结果的应用状态。
 
-`generate` 指定 `model=wgs84-horizon-zero-pose-v1` 时，按现存原图的正式海天线、原始 P/T、实测 FOV 和尺寸拟合零位 Roll、Pitch。固定位置及已保存 `zeroPose` 的 Yaw、T 补偿，独立光轴旋转为零。旧摄像头用已保存 P 朝向和 T 补偿，并从旧模型在设备零位的姿态初始化 Roll、Pitch。求解采用同一 WGS84 切线残差和各图等权的 4 像素 Huber 损失。模型收敛、未加阻尼的二参数矩阵条件数小于 `1e8`，且各图等权 RMS 不超过 5 原图像素时返回 `status=estimated` 和 `zeroPose={roll,pitch,yaw,tiltOffset}`。无有效图返回 `insufficient_data`，数值检查未通过返回 `unreliable`，两种状态的 `zeroPose` 均为 `null`。
+`generate` 指定 `model=wgs84-horizon-zero-pose-v1` 时，按现存原图的正式海天线、原始 P/T、实测 FOV 和尺寸拟合零位 Roll、Pitch。沿用已保存的 Yaw、安装位置及机械相对转动关系。旧摄像头由旧模型在设备回零时的旋转初始化三角。求解采用同一 WGS84 切线残差和各图等权的 4 像素 Huber 损失。模型收敛、未加阻尼的二参数矩阵条件数小于 `1e8` 且 RMS 为有限值时返回 `status=estimated` 和 `zeroPose`。零位候选的 `diagnostics.maximumAcceptedRmsPixels=5` 表示拟合误差参考值，超过时在 `message` 提示并保留可预览、可手动应用的候选。无有效图返回 `insufficient_data`，数值检查未通过返回 `unreliable`，两种状态的 `zeroPose` 均为 `null`。
+
+旧任务曾应用标定、相机尚未启用零位模型、两项机械修正都为零且拟合 RMS 超过参考值时，以任务 `fitCamera` 中的旧机械参数重算。重算要求设备通道、位置和已存安装方位相同，沿用当前 Yaw 和同一批正式标注。重算取得有效候选且 RMS 更低时，保存该候选及其实际固定参数。
 
 新版普通候选保存在 `task.zeroPoseCandidate`，含 `model/resultId/revision/generatedAt/generatedCamera/fixedCalibration/sourceSnapshotIds`。每次生成分配新编号，`revision` 对应正式标注和忽略状态版本，`generatedCamera` 是生成时完整配置，`fixedCalibration` 记录位置、Yaw、T 补偿、独立光轴旋转和配置更新时间。`diagnostics` 记录收敛、条件数、像素和角度 RMS 及每张参与原图的误差，`distinctPanCount/panCoverageDegrees` 记录 P 覆盖，`excluded` 记录忽略、正式标注、设备通道、采样姿态、视场角、尺寸和源图缺失等检查的排除项。读取任务时返回 `stale/staleReasons`，相机配置或正式标注版本变更、模型版本变化或任一参与原图删除或缺失时显示过期诊断。旧普通结果和历史预扫粗结果继续使用四参数字段。
 
@@ -285,16 +289,16 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 
 基础来源必须属于同一摄像头，其普通候选的编号与 `base.resultId` 一致，正式标注版本有效，且通过普通拟合质量检查。`base.model` 为 `wgs84-horizon-zero-pose-v1` 时读取 `task.zeroPoseCandidate`，校验完整相机配置版本和基础拟合原图。省略时使用 `wgs84-horizon-installation-v1`，读取四参数结果并核对基础 `fitCamera` 的经纬度、高度、默认朝向和设备通道。历史预扫粗结果仅供查看。主任务和补充任务需结束识别，使用各任务的正式标注。跨来源重复的截图编号返回 409，重复姿态的独立原图可参与。
 
-`refine` 从已保存选择生成 `task.refinement`，每次计算使用新 `resultId`。零位精修模型为 `wgs84-horizon-zero-pose-v1`，四参数精修模型为 `wgs84-horizon-refinement-v1`。基础组仅使用所选普通结果的 `sourceSnapshotIds` 及其正式标注，高倍组包含主任务和全部补充任务的有效图。忽略、缺图、无效正式标注、移动、无效 PTZ/FOV、通道或尺寸等排除原因保存在 `excluded`。零位精修检查实际原图文件。两组均需有效观测，高倍组至少一张实际有效原图的 Zoom 严格高于基础实际参与图最大 Zoom。
+`refine` 从已保存选择生成 `task.refinement`，每次计算使用新 `resultId`。选择零位基础或请求指定 `model=wgs84-horizon-zero-pose-v1` 时，求解零位姿态。历史基础在后者中转换为等价零位姿态并绑定原结果编号。使用历史基础且省略 `model` 的兼容请求沿用 `wgs84-horizon-refinement-v1`。基础组仅使用所选普通结果的 `sourceSnapshotIds` 及其正式标注，高倍组包含主任务和全部补充任务的有效图。排除原因保存在 `excluded`，零位精修还检查实际原图文件。两组均需有效观测，高倍组至少一张实际有效原图的 Zoom 严格高于基础实际参与图最大 Zoom。
 
-求解从同一模型的冻结基础参数开始。零位模型仅求解 Roll 与 Pitch，固定基础的经纬度、高度、Yaw 和 T 补偿，独立光轴滚转取零。四参数模型固定基础的经纬度、高度和默认朝向，求解四项修正。每个残差点的权重为 `1/(2×该组有效图数×该图有效点数)`，同一权重用于稳健目标、梯度及未加阻尼矩阵。所有高倍任务共同构成一组。
+求解从冻结的基础参数开始。零位模型求解 Roll 与 Pitch，沿用基础的经纬度、高度、Yaw 及机械相对转动关系。四参数兼容模型固定基础的经纬度、高度和默认朝向，求解四项修正。每个残差点的权重为 `1/(2×该组有效图数×该图有效点数)`，同一权重用于稳健目标、梯度及未加阻尼矩阵。所有高倍任务共同构成一组。
 
 `refinement` 字段契约：
 
 | 字段 | 内容 |
 | --- | --- |
 | `model/resultId/generatedAt/selectionRevision` | 精修模型、独立结果编号、生成时间和本次来源选择版本 |
-| `baseCamera` | 冻结的位置及基础解。零位结果来自基础候选的 `generatedCamera` 与求解后的 `zeroPose`，四参数结果来自基础的 `fitCamera` 与 `installation` |
+| `baseCamera` | 冻结的位置及基础解。零位基础使用 `generatedCamera` 与 `zeroPose`，历史基础使用 `fitCamera` 与 `installation` 并在零位精修时附等价 `zeroPose` |
 | `generatedCamera` | 生成时相机的完整已保存配置，包括 `updatedAt`。零位精修用它校验相机版本，四参数精修在应用时校验 |
 | `sources` | 基础、主任务及补充任务的角色、任务编号、正式标注版本、检查图 `inputSnapshotIds`、实际参与图 `sourceSnapshotIds`。基础来源包含普通结果编号及选择时的模型字段 |
 | `sourceSnapshotIds` | 基础和高倍全部实际参与图片的并集，独立复核按此排除参与图 |
@@ -308,7 +312,7 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 | `validation` | 零位精修最近一份独立复核证据，包含冻结的来源版本与参与图 |
 | `validationStaleReason` | 零位普通或精修候选的复核证据失效原因，有效或尚未提交时为 `null` |
 
-合格候选须收敛，所求参数对应的未加阻尼矩阵条件数小于 `1e8`，总体、基础组和高倍组 RMS 均不超过 5 原图像素，且联合稳健目标降低超过 `1e-12×(1+基准目标)`、参数变化不小于 `1e-7` 度。基准满足质量要求且无实际改善时返回 `no_change`，`before/after` 保留基础值。无有效组或没有有效较高倍率返回 `insufficient_data`，其他质量失败为 `unreliable`。
+有效精修候选须收敛，所求参数对应的未加阻尼矩阵条件数小于 `1e8`，总体、基础组和高倍组 RMS 为有限值，且联合稳健目标降低超过 `1e-12×(1+基准目标)`、参数变化不小于 `1e-7` 度。零位精修的 `maximumAcceptedRmsPixels=5` 是误差参考值，超过时提示误差并保留候选供复核。四参数兼容接口要求各组 RMS 不超过 5 原图像素。基准满足相应条件且无实际改善时返回 `no_change`，`before/after` 保留基础值。无有效组或没有有效较高倍率返回 `insufficient_data`，其他数值检查失败为 `unreliable`。
 
 计算在写事务之外完成。保存前在 `BEGIN IMMEDIATE` 内重新核对选择版本、全部正式标注版本、基础结果编号、参与源图和完整当前相机配置。冲突返回 409，候选保存为一次完整写入。任务详情、列表和默认条目响应实时核对来源选择、基础结果、来源标注与参与图。零位精修还检查原图文件和完整相机配置版本，四参数精修检查固定安装条件。客户端分页使用 `taskState=version` 读取条目及版本字段，并单独读取任务详情获取候选及原图检查结果。生成、精修和独立复核共用横向跨度至少为图宽 10% 的正式两端点校验。
 
@@ -337,9 +341,11 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 
 此模式必须提交 `criteria={minimumHighZoom, maximumVerticalOffsetPixels, maximumDirectionDifferenceDegrees, maximumRmsPixels}`。高倍指 `Z >= minimumHighZoom`，起始 Z 至少为 1。三项误差均取绝对值校验，要求正数门槛，方向差门槛至多 180°。操作者依据重复拍摄和重复标注确定这些门槛。响应中 `baseline` 和 `candidate` 分别给出模型、参数和总体 RMS。每个 `perSnapshot` 按原图 ID 配对两个模型的完整测量，标明 `zoomGroup`、可比较性、超差项 `failures` 和其中相对生效模型变差的 `regressions`。总体验收状态按无有效图、逐图超差、覆盖不足、通过依次判定为 `insufficient_data/failed/insufficient_coverage/passed`。`coverage` 返回高低倍样本数、同时可比较的高倍样本数、实际 P/T 组数、P 方向数及覆盖范围与原因。通过需要所有有效原图的候选偏差和方向均可比较，且两套模型均可比较的高倍图至少覆盖两个不同 P 方位。方位按 0.01° 归并，同方位复拍计入样本。
 
-客户端显式提交零位独立复核。在写事务中核对候选、相机和复核标注版本，测量后在来源任务的 `zeroPoseCandidate.validation` 或 `refinement.validation` 保存最新 `evidence`。证据 `version=2` 包括 `id/status/generatedAt`、来源模型与候选编号、正式标注版本和拟合图 ID、复核任务及正式标注版本和实际复核图 ID、相机 ID 与配置时间、生效标定基准及已知来源，以及本次门槛。精修证据的 `source` 和响应的 `reference` 同时包含 `selectionRevision/sources`。复核任务重标、原图缺失或证据版本过期时，任务详情返回 `validationStaleReason`，需重新提交复核。
+旧客户端可显式提交零位独立复核。在写事务中核对候选、相机和复核标注版本，测量后在来源任务的 `zeroPoseCandidate.validation` 或 `refinement.validation` 保存最新 `evidence`。证据 `version=2` 包括 `id/status/generatedAt`、来源模型与候选编号、正式标注版本和拟合图 ID、复核任务及正式标注版本和实际复核图 ID、相机 ID 与配置时间、生效标定基准及已知来源，以及本次门槛。精修证据的 `source` 和响应的 `reference` 同时包含 `selectionRevision/sources`。复核任务重标、原图缺失或证据版本过期时，任务详情返回 `validationStaleReason`，需重新提交复核。
 
-应用普通候选使用 `apply`，应用精修候选使用 `refinement-apply`。两者必填当前任务的 `revision` 和候选的 `resultId`，以服务端保存的参数为准。应用零位候选时还须提交 `model: "wgs84-horizon-zero-pose-v1"` 及该候选最新通过证据的 `validationId`。取得 `BEGIN IMMEDIATE` 写锁后，重读相机完整配置、候选、来源选择及各来源版本、参与原图和设备占用，按证据重测独立复核并核对实际参与图与记录。通过后一次保存 `calibrationModel`、`activeZeroPose`、同步的 `zeroPose` 草稿与候选的 `applied/appliedAt`。各模型均在本次事务中冻结生效标定的模型版本、来源任务、候选与标注版本及参与原图 ID。精修还保存基础及高倍来源版本。任务重算或重标后，已冻结的生效来源仍可供下次复核排除原拟合图。任一写入失败整体回滚。候选质量失败或过期、证据失效、设备占用及重复应用返回 409。缺少必填字段或包含额外角度返回 400。
+应用普通候选使用 `apply`，应用精修候选使用 `refinement-apply`。两者要求当前任务的 `revision` 和候选的 `resultId`。应用零位模型时提交 `model: "wgs84-horizon-zero-pose-v1"`，角度取服务器保存的候选。普通零位候选可直接应用。提交 `validationId` 时按兼容契约校验最新通过的复核证据。旧客户端应用零位精修候选时须提交该证据。
+
+取得 `BEGIN IMMEDIATE` 写锁后核对候选、相机配置、标注版本、参与原图和设备占用。核对通过后，一次保存 `calibrationModel`、`activeZeroPose`、同步的 `zeroPose` 草稿、标定来源和候选的 `applied/appliedAt`。任一写入失败整体回滚。过期、不可用、设备占用及重复应用返回 409。携带复核证据时，证据失效也返回 409。缺少必填字段或包含额外角度返回 400。
 
 四参数应用可以省略 `model`，也可提交普通模型 `wgs84-horizon-installation-v1` 或精修模型 `wgs84-horizon-refinement-v1`。应用成功后启用四参数模型，写入四项修正与对应的应用状态。普通应用核对生成时的校准参数、模型版本、设备通道和参与图，保存 `appliedAt/appliedRevision`。精修应用另核对全部来源与生成时完整 `generatedCamera`，并保存 `refinement.applied/appliedAt`。四参数精修应用后仍可用冻结值独立复核。各应用接口返回 `{ task, camera }`，供页面同步当前生效标定。应用只写摄像头配置及所属候选状态，设备控制和原始采样沿用各自入口，MCP 保持只读。
 

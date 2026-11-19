@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { Cartesian3, Cartographic, Matrix3, Matrix4, Quaternion, Transforms } from 'cesium';
 import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, observationFov, pointTargetPtz, videoFovPlane } from '../src/app/camera-math.ts';
 import type { CameraDraft, RawPtz } from '../src/app/models.ts';
-import { createZeroPoseQuaternion, createZeroPoseRotation, resolveZeroPose, updateZeroPoseTiltOffset } from '#zero-pose';
+import { createLocalRigRotation } from '#camera-rotation';
+import { createZeroPoseQuaternion, createZeroPoseRigRotation, createZeroPoseRotation, legacyZeroPose } from '#zero-pose';
 
-const camera: CameraDraft = {
+const camera = {
   name: 'test', serial: '01', code: '02', longitude: 113.9, latitude: 22.1, height: 100,
   pAxisPitch: 0, pAxisRoll: 0, panOffset: 0, tiltOffset: 0, imageRoll: 0,
-};
+} satisfies CameraDraft;
 const ptz: RawPtz = { Pan: 0, Tilt: 0, Zoom: 15, HorizontalFieldAngle: 4.32, VerticalFieldAngle: 2.43 };
 const near = (a: number, b: number, epsilon = 1e-9) => assert.ok(Math.abs(a - b) <= epsilon, `${a} ≠ ${b}`);
 
@@ -59,43 +60,51 @@ test('生效零位模型使用冻结姿态，设备回零、跨零 P 和多组 T
   assert.ok(Cartesian3.distance(legacy.direction, createCameraPose(active, ptz).direction) > 1);
 });
 
-test('旧转台的零位角可初始化草稿，补偿调整保留机械 P 轴且四元数与姿态等价', () => {
-  const legacy = { ...camera, panOffset: -15, pAxisPitch: 12, pAxisRoll: 0, tiltOffset: 7, imageRoll: -11 };
-  const initial = resolveZeroPose(legacy);
-  near(initial.yaw, 345);
-  near(initial.pitch, 19);
-  near(initial.roll, -11);
-  assert.equal(initial.tiltOffset, 7);
-  const verticalLegacy = resolveZeroPose({ ...legacy, pAxisPitch: 83 });
-  near(verticalLegacy.yaw, 345);
-  near(verticalLegacy.pitch, 90);
-  near(verticalLegacy.roll, -11);
+test('打开零位编辑时沿用当前镜头，查看草稿时才按零位三角重算', () => {
+  const legacy = { ...camera, panOffset: 2, imageRoll: 1 };
+  const reading = { ...ptz, Pan: 90 };
+  const zeroPose = { ...legacyZeroPose(legacy), yaw: 5 };
+  const active = { ...legacy, calibrationModel: 'wgs84-horizon-zero-pose-v1' as const,
+    activeZeroPose: { ...zeroPose, yaw: 20 }, zeroPose };
+  for (const setup of [legacy, active]) {
+    const current = createCameraPose(setup, reading);
+    assert.deepEqual(createZeroPosePreview(setup, null, reading).pose, current);
+    const draft = createZeroPosePreview(setup, zeroPose, reading);
+    assert.ok(Cartesian3.distance(current.direction, draft.basis.direction) > 0.01);
+    assert.ok(Cartesian3.equals(current.position, draft.basis.position));
+  }
 
-  const zeroPose = { roll: 14, pitch: -12, yaw: 305, tiltOffset: 17 };
-  assert.deepEqual(resolveZeroPose({ ...legacy, zeroPose }), zeroPose);
-  const adjusted = updateZeroPoseTiltOffset(zeroPose, -10);
-  assert.equal(adjusted.tiltOffset, -10);
-  assert.notEqual(adjusted.pitch, zeroPose.pitch);
-  assert.notEqual(adjusted.yaw, zeroPose.yaw);
-  const quaternion = createZeroPoseQuaternion(adjusted);
-  near(Quaternion.magnitude(quaternion), 1);
-  assert.ok(Matrix3.equalsEpsilon(Matrix3.fromQuaternion(quaternion), createZeroPoseRotation(adjusted), 1e-12));
-  for (const Pan of [0.1, 359.9, 110]) {
-    for (const Tilt of [-30, 0, 40]) {
-      const before = createZeroPosePreview(camera, zeroPose, { ...ptz, Pan, Tilt: Tilt + 27 });
-      const after = createZeroPosePreview(camera, adjusted, { ...ptz, Pan, Tilt });
-      near(Cartesian3.distance(before.basis.panAxis, after.basis.panAxis), 0);
-      near(Cartesian3.distance(before.basis.direction, after.basis.direction), 0);
-      near(Cartesian3.distance(before.basis.up, after.basis.up), 0);
+  const reference = createZeroPosePreview(legacy, null, null);
+  assert.equal(reference.pose, null);
+  const expected = createCameraPose(legacy, ptz);
+  near(Cartesian3.distance(reference.basis.direction, expected.direction), 0);
+  near(Cartesian3.distance(reference.basis.up, expected.up), 0);
+});
+
+test('旧截图转成零位三角后保留多组 P/T 的光轴、画面滚转和机械 P 轴', () => {
+  const legacy = { ...camera, panOffset: -15, pAxisPitch: 12, pAxisRoll: -3, tiltOffset: 7, imageRoll: -11 };
+  for (const installation of [legacy, { ...legacy, pAxisRoll: 0, pAxisPitch: 83 },
+    { ...legacy, pAxisRoll: 0, pAxisPitch: -97 }]) {
+    const converted = legacyZeroPose(installation);
+    assert.equal(converted.tiltOffset, 7);
+    assert.equal(converted.imageRoll, -11);
+    const quaternion = createZeroPoseQuaternion(converted);
+    near(Quaternion.magnitude(quaternion), 1);
+    assert.ok(Matrix3.equalsEpsilon(Matrix3.fromQuaternion(quaternion), createZeroPoseRotation(converted), 1e-12));
+    for (const Pan of [0, 0.1, 110, 359.9]) {
+      for (const Tilt of [-30, 0, 40]) {
+        const reading = { ...ptz, Pan, Tilt, HorizontalFieldAngle: 1, VerticalFieldAngle: 0.5625 };
+        const expected = createLocalRigRotation(installation, reading);
+        const rig = createZeroPoseRigRotation(converted, reading);
+        assert.ok(Matrix3.equalsEpsilon(rig.mount, expected.mount, 1e-12));
+        assert.ok(Matrix3.equalsEpsilon(rig.camera, expected.camera, 1e-12));
+        if (Pan === 0 && Tilt === 0) {
+          assert.ok(Matrix3.equalsEpsilon(rig.camera, createZeroPoseRotation(converted), 1e-12));
+        }
+        assert.deepEqual(createCameraPose(installation, reading), createZeroPosePreview(installation, converted, reading).pose);
+      }
     }
   }
-  const nearVertical = { roll: 0, pitch: 60, yaw: 40, tiltOffset: 5 };
-  const vertical = updateZeroPoseTiltOffset(nearVertical, 35);
-  const before = createZeroPosePreview(camera, nearVertical, { ...ptz, Pan: 91, Tilt: -20 });
-  const after = createZeroPosePreview(camera, vertical, { ...ptz, Pan: 91, Tilt: 10 });
-  near(vertical.pitch, 90);
-  near(Cartesian3.distance(before.basis.direction, after.basis.direction), 0);
-  near(Cartesian3.distance(before.basis.up, after.basis.up), 0);
 });
 
 test('无底座倾斜时安装朝向与 P 角偏移等价，原始 PTZ 保持不变，零值位置有效', () => {

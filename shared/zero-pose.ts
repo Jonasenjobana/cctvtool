@@ -8,7 +8,10 @@ export interface ZeroPose {
   pitch: number;
   yaw: number;
   tiltOffset: number;
+  imageRoll?: number;
 }
+
+type LegacyOrientation = Parameters<typeof createLocalRigRotation>[0];
 
 export interface ActiveCalibration {
   calibrationModel?: typeof ZERO_POSE_MODEL;
@@ -30,11 +33,14 @@ export function createZeroPoseRotation(pose: ZeroPose): Matrix3 {
 }
 
 export function createZeroPoseRigRotation(pose: ZeroPose, ptz: { Pan: number; Tilt: number }) {
-  // 先抵消设备零位的机械俯仰，再应用实际 P/T，确保设备回零时光轴取表单姿态。
-  const mount = Matrix3.multiply(createZeroPoseRotation(pose),
-    Matrix3.fromRotationX(CesiumMath.toRadians(-pose.tiltOffset)), new Matrix3());
+  const mount = createZeroPoseRotation(pose);
+  const imageRoll = CesiumMath.toRadians(pose.imageRoll ?? 0);
+  // 零位 Pitch 已包含设备回零时的俯仰。先还原机械底座，转动后再按原顺序应用 P/T 和画面 Roll。
+  if (imageRoll) Matrix3.multiply(mount, Matrix3.fromRotationY(-imageRoll), mount);
+  Matrix3.multiply(mount, Matrix3.fromRotationX(CesiumMath.toRadians(-pose.tiltOffset)), mount);
   const camera = Matrix3.multiply(mount, Matrix3.fromRotationZ(CesiumMath.toRadians(-ptz.Pan)), new Matrix3());
   Matrix3.multiply(camera, Matrix3.fromRotationX(CesiumMath.toRadians(pose.tiltOffset - ptz.Tilt)), camera);
+  if (imageRoll) Matrix3.multiply(camera, Matrix3.fromRotationY(imageRoll), camera);
   return { mount, camera };
 }
 
@@ -42,33 +48,27 @@ export function createZeroPoseQuaternion(pose: ZeroPose): Quaternion {
   return Quaternion.fromRotationMatrix(createZeroPoseRotation(pose));
 }
 
-function zeroPoseAngles(rotation: Matrix3, yawBasis?: number) {
+function zeroPoseAngles(rotation: Matrix3) {
   const east = rotation[Matrix3.COLUMN1ROW0], north = rotation[Matrix3.COLUMN1ROW1];
   const up = rotation[Matrix3.COLUMN1ROW2];
   const horizontal = Math.hypot(east, north);
   const vertical = horizontal < CesiumMath.EPSILON12;
-  const canonicalYaw = CesiumMath.toDegrees(vertical
+  const yaw = CesiumMath.toDegrees(vertical
     ? Math.atan2(-rotation[Matrix3.COLUMN0ROW1], rotation[Matrix3.COLUMN0ROW0]) : Math.atan2(east, north));
-  const yaw = yawBasis ?? canonicalYaw;
-  // 光轴垂直时由 Roll 承接固定 Yaw 与分解结果之间的差值。
-  const coupledRoll = CesiumMath.toRadians((yaw - canonicalYaw) * Math.sign(up));
+  // 光轴垂直时 Yaw 与 Roll 耦合，取 Roll 为零仍能重建同一旋转。
   return {
     yaw: ((yaw % 360) + 360) % 360,
     pitch: CesiumMath.toDegrees(Math.atan2(up, horizontal)),
-    roll: CesiumMath.toDegrees(vertical ? Math.atan2(Math.sin(coupledRoll), Math.cos(coupledRoll))
-      : Math.atan2(-rotation[Matrix3.COLUMN0ROW2], rotation[Matrix3.COLUMN2ROW2])),
+    roll: vertical ? 0 : CesiumMath.toDegrees(Math.atan2(-rotation[Matrix3.COLUMN0ROW2], rotation[Matrix3.COLUMN2ROW2])),
   };
 }
 
-export function resolveZeroPose(installation: Parameters<typeof createLocalRigRotation>[0] & { zeroPose?: ZeroPose }): ZeroPose {
-  if (installation.zeroPose) return installation.zeroPose;
+export function legacyZeroPose(installation: LegacyOrientation): ZeroPose {
   const { camera } = createLocalRigRotation(installation, { Pan: 0, Tilt: 0 });
-  return { ...zeroPoseAngles(camera, installation.panOffset), tiltOffset: installation.tiltOffset };
+  return { ...zeroPoseAngles(camera), tiltOffset: installation.tiltOffset,
+    ...(installation.imageRoll ? { imageRoll: installation.imageRoll } : {}) };
 }
 
-export function updateZeroPoseTiltOffset(pose: ZeroPose, tiltOffset: number): ZeroPose {
-  if (pose.tiltOffset === tiltOffset) return pose;
-  const rotation = Matrix3.multiply(createZeroPoseRotation(pose),
-    Matrix3.fromRotationX(CesiumMath.toRadians(tiltOffset - pose.tiltOffset)), new Matrix3());
-  return { ...zeroPoseAngles(rotation), tiltOffset };
+export function calibratedZeroPose(calibration: LegacyOrientation & ActiveCalibration): ZeroPose {
+  return activeZeroPoseOf(calibration) ?? legacyZeroPose(calibration);
 }

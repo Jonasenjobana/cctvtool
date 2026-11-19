@@ -1,5 +1,5 @@
 import { Cartesian3, Ellipsoid, Matrix3, Matrix4, Transforms } from 'cesium';
-import { createLocalRigRotation } from '#camera-rotation';
+import { calibratedZeroPose, createZeroPoseRigRotation } from '#zero-pose';
 import { httpError } from './errors.mjs';
 
 const rad = Math.PI / 180;
@@ -23,8 +23,8 @@ function horizonGeometry(calibration) {
   };
 }
 
-function centerOffset(calibration, geometry, rawPtz) {
-  const rotation = createLocalRigRotation(calibration, rawPtz).camera;
+function centerOffset(zeroPose, geometry, rawPtz) {
+  const rotation = createZeroPoseRigRotation(zeroPose, rawPtz).camera;
   const world = Matrix3.multiply(geometry.enu, rotation, new Matrix3());
   const direction = Cartesian3.multiplyComponents(
     Matrix3.getColumn(world, 1, new Cartesian3()), Ellipsoid.WGS84.oneOverRadii, new Cartesian3(),
@@ -37,7 +37,8 @@ export function horizonOffsetDegrees(calibration, rawPtz) {
   if (!rawPtz || ![rawPtz.Pan, rawPtz.Tilt].every(Number.isFinite)) {
     throw httpError(400, '海天线中心角差需要有效的原始 P/T');
   }
-  return centerOffset(calibration, horizonGeometry(calibration), rawPtz);
+  const geometry = horizonGeometry(calibration);
+  return centerOffset(calibratedZeroPose(calibration), geometry, rawPtz);
 }
 
 export function solveHorizonTilt(calibration, options) {
@@ -47,8 +48,11 @@ export function solveHorizonTilt(calibration, options) {
     throw httpError(400, 'P 必须位于 0～360°，参考 T 必须位于 -90～90° 内的允许区间');
   }
   const geometry = horizonGeometry(calibration);
-  if (Math.abs(centerOffset(calibration, geometry, { Pan: pan, Tilt: referenceTilt })) < 1e-9) return referenceTilt;
-  const rotation = createLocalRigRotation({ ...calibration, imageRoll: 0 }, { Pan: pan, Tilt: 0 }).camera;
+  const zeroPose = calibratedZeroPose(calibration);
+  if (Math.abs(centerOffset(zeroPose, geometry, { Pan: pan, Tilt: referenceTilt })) < 1e-9) return referenceTilt;
+  const { camera: rotation } = createZeroPoseRigRotation(zeroPose, { Pan: pan, Tilt: 0 });
+  // 求解 T 时使用机械俯仰平面，逆转末端的画面 Roll。
+  if (zeroPose.imageRoll) Matrix3.multiply(rotation, Matrix3.fromRotationY(-zeroPose.imageRoll * rad), rotation);
   const world = Matrix3.multiply(geometry.enu, rotation, new Matrix3());
   const forward = Matrix3.getColumn(world, 1, new Cartesian3());
   const down = Cartesian3.negate(Matrix3.getColumn(world, 2, new Cartesian3()), new Cartesian3());
@@ -66,7 +70,7 @@ export function solveHorizonTilt(calibration, options) {
   const projection = Math.hypot(x, y), dip = Math.sin(geometry.dip);
   // 显式检查边界本身是否相切，避免将真正越界的 T 硬截到边界。
   const candidates = [tiltMin, tiltMax].filter((tilt) =>
-    Math.abs(centerOffset(calibration, geometry, { Pan: pan, Tilt: tilt })) < 1e-9);
+    Math.abs(centerOffset(zeroPose, geometry, { Pan: pan, Tilt: tilt })) < 1e-9);
   if (projection > 1e-14 && projection >= dip) {
     const radial = Cartesian3.add(Cartesian3.multiplyByScalar(first, x / projection, new Cartesian3()),
       Cartesian3.multiplyByScalar(second, y / projection, new Cartesian3()), new Cartesian3());

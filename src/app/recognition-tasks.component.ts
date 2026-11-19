@@ -4,10 +4,9 @@ import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
-import type { Camera, HorizonPoint, InstallationRefinement, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement,
-  RefinementSelection, SnapshotGroup, ZeroPoseCandidate, ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
-import { ZERO_POSE_MODEL } from '#zero-pose';
-import type { ZeroPose } from '#zero-pose';
+import type { Camera, HorizonPoint, RecognitionItem, RecognitionTask, SnapshotGroup,
+  ZeroPoseCandidate, ZeroPoseMeasurement } from './models';
+import { legacyZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
 import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
   panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
@@ -17,13 +16,6 @@ import { fullHorizonView, horizonPixelStep, horizonUpperClip, horizonView, shift
 import type { HorizonAdjustment, HorizonView } from './horizon-precision';
 import { renderTaskPanorama, renderTaskPanoramaFrame } from './task-panorama';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
-
-type ZeroPoseApplicationCandidate = ZeroPoseCandidate | Extract<InstallationRefinement, { model: typeof ZERO_POSE_MODEL }>;
-
-type ValidationSource = { key: string; task: RecognitionTask; resultId: string; sourceSnapshotIds: string[] } & (
-  { kind: InstallationValidation['reference']['kind']; installation: InstallationValidation['installation'] }
-  | { kind: ZeroPoseValidation['reference']['kind']; zeroPose: ZeroPose }
-);
 
 @Component({
   selector: 'app-recognition-tasks', standalone: true,
@@ -42,34 +34,29 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly items = signal<RecognitionItem[]>([]);
   readonly selectedItemId = signal('');
   readonly item = computed(() => this.items().find((item) => item.snapshotId === this.selectedItemId()) || null);
-  // 外部参与图只用于当前候选的只读对照，不进入主任务的标注草稿和保存路径。
-  readonly sourceImage = signal<{ task: RecognitionTask; item: RecognitionItem } | null>(null);
-  readonly displayedItem = computed(() => this.sourceImage()?.item || this.item());
-  readonly displayedPoints = computed(() => this.sourceImage()?.item.points || this.points());
   readonly points = signal<HorizonPoint[]>([]);
   readonly ignored = signal(false);
   readonly precisionMode = signal(false);
-  readonly precisionActive = computed(() => this.precisionMode() && !this.sourceImage());
   readonly precisionView = signal<HorizonView>(fullHorizonView);
   private readonly annotationSize = signal<{ width: number; height: number } | null>(null);
   readonly precisionStep = computed(() => {
-    const size = this.annotationSize(), snapshot = this.displayedItem()?.snapshot;
+    const size = this.annotationSize(), snapshot = this.item()?.snapshot;
     return size && snapshot ? horizonPixelStep(this.precisionView().zoom, snapshot, size) : null;
   });
   readonly precisionTarget = signal<HorizonAdjustment>('line');
   readonly precisionZooms = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
   readonly precisionTargets = [{ value: 'line', label: '整线' }, { value: 0, label: '端点 1' }, { value: 1, label: '端点 2' }] as const;
-  readonly originalView = computed(() => this.precisionActive() ? this.precisionView() : fullHorizonView);
+  readonly originalView = computed(() => this.precisionMode() ? this.precisionView() : fullHorizonView);
   readonly originalViewBox = computed(() => {
-    const { width = 1, height = 1 } = this.displayedItem()?.snapshot ?? {};
+    const { width = 1, height = 1 } = this.item()?.snapshot ?? {};
     const { left, top, zoom } = this.originalView();
     return `${left * width} ${top * height} ${width / zoom} ${height / zoom}`;
   });
   readonly originalLineClip = computed(() => {
-    const snapshot = this.displayedItem()?.snapshot;
-    return snapshot ? horizonUpperClip(this.displayedPoints(), snapshot.width, snapshot.height) : '';
+    const snapshot = this.item()?.snapshot;
+    return snapshot ? horizonUpperClip(this.points(), snapshot.width, snapshot.height) : '';
   });
-  readonly originalEditable = computed(() => !this.sourceImage() && !this.running() && !this.busy() && !this.loading()
+  readonly originalEditable = computed(() => !this.running() && !this.busy() && !this.loading()
     && !this.generatingPanorama() && !this.guideDrawing() && !!this.item() && !this.item()?.missing
     && this.singleImageId() === this.selectedItemId());
   readonly dirty = signal(false);
@@ -79,131 +66,28 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly message = signal('');
   readonly nextTaskOffset = signal<number | null>(null);
   readonly nextItemOffset = signal<number | null>(null);
-  readonly validationReferenceId = signal('');
   readonly measuring = signal(false);
-  private readonly validationResult = signal<InstallationValidation | ZeroPoseValidation | null>(null);
-  readonly validationModel = signal<'baseline' | 'candidate'>('candidate');
-  readonly validationCriteriaDraft = signal<Partial<Record<keyof ZeroPoseValidationCriteria, number | null>>>({});
-  readonly validationCriteriaFields = [
-    { key: 'minimumHighZoom', label: '高倍起始 Z', min: 1 },
-    { key: 'maximumVerticalOffsetPixels', label: '最大垂直偏差 (px)', min: 0 },
-    { key: 'maximumDirectionDifferenceDegrees', label: '最大方向差 (°)', min: 0 },
-    { key: 'maximumRmsPixels', label: '最大逐图 RMS (px)', min: 0 },
-  ] as const;
-  readonly validationCriteria = computed<ZeroPoseValidationCriteria | undefined>(() => {
-    const { minimumHighZoom, maximumVerticalOffsetPixels, maximumDirectionDifferenceDegrees, maximumRmsPixels } = this.validationCriteriaDraft();
-    if (minimumHighZoom == null || maximumVerticalOffsetPixels == null
-      || maximumDirectionDifferenceDegrees == null || maximumRmsPixels == null) return;
-    if (minimumHighZoom >= 1 && maximumVerticalOffsetPixels > 0 && maximumDirectionDifferenceDegrees > 0
-      && maximumDirectionDifferenceDegrees <= 180 && maximumRmsPixels > 0) {
-      return { minimumHighZoom, maximumVerticalOffsetPixels, maximumDirectionDifferenceDegrees, maximumRmsPixels };
-    }
-    return undefined;
-  });
-  readonly validationSourceLabels = { ordinary: '普通结果', refinement: '精修候选', 'zero-pose': '零位普通候选',
-    'zero-pose-refinement': '零位精修候选' };
-  readonly comparisonMode = signal<'validation' | 'before' | 'after' | 'zero-pose'>('validation');
+  readonly previewingZeroPose = signal(false);
   private readonly zeroPoseMeasurementResult = signal<ZeroPoseMeasurement | null>(null);
   readonly zeroPoseCandidate = computed(() => this.selected()?.zeroPoseCandidate);
+  readonly historicalFitAngles = computed(() => {
+    const task = this.selected();
+    if (!task?.fitCamera || !task.result?.installation) return;
+    return { before: legacyZeroPose(task.fitCamera), after: legacyZeroPose({ ...task.fitCamera, ...task.result.installation }) };
+  });
   readonly canPreviewZeroPose = computed(() => this.zeroPoseCandidate()?.status === 'estimated' && !this.zeroPoseCandidate()?.stale
     && !this.busy() && !this.loading() && !this.dirty() && !this.running() && !this.generatingPanorama() && !this.guideDrawing());
-  private readonly refinementMeasurementResult = signal<RefinementMeasurement | null>(null);
-  readonly refinement = computed(() => this.selected()?.refinement);
-  readonly refinementBaseKey = signal('');
-  readonly refinementSupplementalIds = signal<string[]>([]);
-  readonly refinementSupplementalSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
-    && task.id !== this.selected()?.refinementSelection?.base?.taskId && task.cameraId === this.selected()?.cameraId
-    && !['queued', 'running'].includes(task.status)));
-  readonly refinementGroups = [{ key: 'overall', label: '总体（两组等权）' }, { key: 'base', label: '基础组' }, { key: 'high', label: '高倍组' }] as const;
-  readonly refinementBaseSources = computed(() => this.tasks().filter((task) => task.id !== this.selected()?.id
-    && task.cameraId === this.selected()?.cameraId && task.result?.status === 'estimated'
-    && task.result.model === 'wgs84-horizon-installation-v1' && task.resultRevision === task.revision
-    && !['queued', 'running'].includes(task.status)));
-  readonly validationSources = computed<ValidationSource[]>(() => this.tasks().flatMap((task): ValidationSource[] => {
-    if (task.id === this.selected()?.id || task.cameraId !== this.selected()?.cameraId || ['queued', 'running'].includes(task.status)) return [];
-    const entries: ValidationSource[] = [];
-    if (task.result?.status === 'estimated' && task.result.model === 'wgs84-horizon-installation-v1'
-      && task.resultRevision === task.revision && task.resultId && task.result.installation) {
-      entries.push({ key: `ordinary:${task.id}`, kind: 'ordinary', task, resultId: task.resultId,
-        installation: task.result.installation, sourceSnapshotIds: task.result.sourceSnapshotIds });
-    }
-    const { refinement, zeroPoseCandidate: candidate } = task;
-    if (refinement?.status === 'estimated' && !refinement.stale && refinement.model === 'wgs84-horizon-refinement-v1' && refinement.installation) {
-      entries.push({ key: `refinement:${task.id}`, kind: 'refinement', task, resultId: refinement.resultId,
-        installation: refinement.installation, sourceSnapshotIds: refinement.sourceSnapshotIds });
-    }
-    if (candidate?.status === 'estimated' && !candidate.stale && !candidate.applied && candidate.zeroPose) {
-      entries.push({ key: `zero-pose:${task.id}`, kind: 'zero-pose', task, resultId: candidate.resultId,
-        zeroPose: candidate.zeroPose, sourceSnapshotIds: candidate.sourceSnapshotIds });
-    }
-    if (refinement?.status === 'estimated' && !refinement.stale && !refinement.applied
-      && refinement.model === ZERO_POSE_MODEL && refinement.zeroPose) {
-      entries.push({ key: `zero-pose-refinement:${task.id}`, kind: 'zero-pose-refinement', task, resultId: refinement.resultId,
-        zeroPose: refinement.zeroPose, sourceSnapshotIds: refinement.sourceSnapshotIds });
-    }
-    return entries;
-  }));
-  readonly validationSource = computed(() => this.validationSources().find((entry) => entry.key === this.validationReferenceId()));
-  readonly validationNeedsCriteria = computed(() => {
-    const source = this.validationSource();
-    return !!source && 'zeroPose' in source;
-  });
-  readonly refinementSourceOptions = computed(() => [
-    ...this.tasks().flatMap((task) => {
-      const result = task.zeroPoseCandidate;
-      return task.id !== this.selected()?.id && task.cameraId === this.selected()?.cameraId
-        && !['queued', 'running'].includes(task.status) && result?.status === 'estimated' && !result.stale && result.zeroPose
-        ? [{ key: `zero-pose:${task.id}`, task, result, base: { taskId: task.id, revision: task.revision, resultId: result.resultId, model: result.model } }]
-        : [];
-    }),
-    ...this.refinementBaseSources().flatMap((task) => task.result && task.resultId
-      ? [{ key: task.id, task, result: task.result, base: { taskId: task.id, revision: task.revision, resultId: task.resultId } }] : []),
-  ]);
-  private readonly currentValidation = computed(() => {
-    const result = this.validationResult(), task = this.selected(), reference = this.validationSource();
-    return result && task && reference && !this.dirty() && result.taskId === task.id && result.revision === task.revision
-      && result.reference.kind === reference.kind && result.reference.taskId === reference.task.id
-      && result.reference.resultId === reference.resultId ? result : null;
-  });
-  readonly validation = computed(() => {
-    const result = this.currentValidation();
-    return result && !('evidence' in result) ? result : null;
-  });
-  readonly zeroPoseComparison = computed(() => {
-    const result = this.currentValidation();
-    return result && 'evidence' in result ? result : null;
-  });
-  readonly refinementMeasurement = computed(() => {
-    const result = this.refinementMeasurementResult(), task = this.selected();
-    return result && task && !this.dirty() && result.taskId === task.id && result.revision === task.revision
-      && result.selectionRevision === task.refinementSelection?.revision && result.mode === this.comparisonMode()
-      && (result.resultId === null ? result.mode === 'before'
-        : !task.refinement?.stale && result.resultId === task.refinement?.resultId) ? result : null;
-  });
-  private readonly zeroPoseMeasurement = computed(() => {
+  readonly measurement = computed(() => {
     const result = this.zeroPoseMeasurementResult(), task = this.selected(), candidate = this.zeroPoseCandidate();
-    return result && task && candidate && !this.dirty() && !candidate.stale && result.taskId === task.id
-      && result.revision === task.revision && result.resultId === candidate.resultId ? result : null;
+    if (!this.previewingZeroPose() || !result || !task || !candidate || this.dirty() || candidate.stale
+      || this.singleImageError() || result.taskId !== task.id || result.revision !== task.revision
+      || result.resultId !== candidate.resultId) return;
+    return result.perSnapshot.find((row) => row.snapshotId === this.selectedItemId());
   });
-  private readonly comparison = computed(() => {
-    if (this.comparisonMode() === 'zero-pose') return this.zeroPoseMeasurement();
-    if (this.comparisonMode() !== 'validation') return this.refinementMeasurement();
-    const result = this.zeroPoseComparison();
-    return result ? { excluded: result.excluded, perSnapshot: result.perSnapshot.map((row) => row[this.validationModel()]) } : this.validation();
-  });
-  readonly measurement = computed(() => this.comparison()
-    ?.perSnapshot.find((row) => row.snapshotId === this.displayedItem()?.snapshotId && !this.singleImageError()));
-  readonly measurementExclusion = computed(() =>
-    (this.comparisonMode() === 'zero-pose' && !this.dirty() && !this.zeroPoseCandidate()?.stale ? this.zeroPoseCandidate() : this.comparison())
-      ?.excluded.find((row) => row.snapshotId === this.displayedItem()?.snapshotId)?.reason);
-  readonly theoreticalLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选理论海天线' : this.comparisonMode() === 'validation'
-    ? this.zeroPoseComparison() ? `${this.validationModel() === 'baseline' ? '生效模型' : '零位候选'}理论海天线`
-      : this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
-    : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
-  readonly measurementLabel = computed(() => {
-    const mode = this.comparisonMode(), source = this.validationSource();
-    if (mode === 'validation') return `${source ? this.validationSourceLabels[source.kind] : '普通结果'}独立复核`;
-    return mode === 'zero-pose' ? '零位候选原图预览' : mode === 'after' ? '候选海天线对照' : '基准海天线对照';
+  readonly measurementExclusion = computed(() => {
+    const candidate = this.zeroPoseCandidate();
+    return this.previewingZeroPose() && !this.dirty() && !candidate?.stale
+      ? candidate?.excluded.find((row) => row.snapshotId === this.selectedItemId())?.reason : undefined;
   });
   readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
@@ -326,19 +210,14 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   });
   readonly running = computed(() => ['queued', 'running'].includes(this.selected()?.status || ''));
   readonly coarse = computed(() => this.sourceGroup()?.horizon?.phase === 'coarse');
-  readonly fields = [
-    { key: 'pAxisPitch', label: 'P 轴前后倾' }, { key: 'pAxisRoll', label: 'P 轴左右倾' },
-    { key: 'tiltOffset', label: 'T 偏移' }, { key: 'imageRoll', label: '画面 Roll 修正' },
-  ] as const;
-  readonly refinementZeroPoseFields = [
-    { key: 'roll', label: '零位 Roll' }, { key: 'pitch', label: '零位 Pitch' },
-    { key: 'yaw', label: '固定 Yaw' }, { key: 'tiltOffset', label: '固定 T 补偿' },
+  readonly zeroPoseFields = [
+    { key: 'yaw', label: 'Yaw' }, { key: 'pitch', label: 'Pitch' }, { key: 'roll', label: 'Roll' },
   ] as const;
   readonly statuses = { queued: '等待识别', running: '识别中', completed: '识别完成', failed: '识别失败', cancelled: '已取消', interrupted: '已中断' };
   private timer?: ReturnType<typeof setInterval>;
   private destroyed = false;
   private revision = 0;
-  private validationRequest = 0;
+  private measurementRequest = 0;
   private guideRevision = 0;
   private savedGuide: PanoramaGuide | null = null;
   private dragIndex: number | null = null;
@@ -389,12 +268,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   async loadTask(id: string, save = true) {
     if (this.busy() || (save && !await this.save())) return;
-    this.validationRequest++;
-    this.measuring.set(false);
-    this.validationResult.set(null);
-    this.refinementMeasurementResult.set(null);
-    this.zeroPoseMeasurementResult.set(null);
-    this.closeSourceImage();
+    this.clearZeroPoseMeasurement();
     this.clearPanorama();
     const revision = ++this.revision;
     this.loading.set(true);
@@ -430,15 +304,6 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         return;
       }
       this.setTask(task);
-      const sourceIds = [...new Set([this.validationSource()?.task.id, task.refinementSelection?.base?.taskId,
-        ...task.refinementSelection?.supplemental.map((source) => source.taskId) || []]
-        .filter((source): source is string => !!source))];
-      const sourceResults = await Promise.allSettled(sourceIds.map((source) => this.api.recognitionTask(source)));
-      if (this.destroyed || revision !== this.revision) return;
-      const sources = sourceResults.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
-      for (const result of sourceResults) if (result.status === 'rejected') this.problem.set(`标定来源读取失败：${errorMessage(result.reason)}`);
-      this.tasks.update((tasks) => [...tasks.filter((task) => !sourceIds.includes(task.id)), ...sources]);
-      if (this.validationReferenceId() && !this.validationSource() && !this.problem()) this.problem.set('所选独立复核来源已失效，请选择合格的最新结果');
       this.items.set(entries);
       this.nextItemOffset.set(offset);
       this.selectItem(entries.find((item) => item.snapshotId === this.selectedItemId()) || entries[0]);
@@ -460,27 +325,20 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     finally {
       if (revision === this.revision) {
         this.loading.set(false);
-        if (loaded) void this.measure();
+        if (loaded) void this.measureZeroPose();
       }
     }
   }
 
   private setTask(task: RecognitionTask) {
-    const previous = this.selected();
-    if (previous?.id !== task.id || previous.revision !== task.revision || previous.refinement?.resultId !== task.refinement?.resultId
-      || previous.refinementSelection?.revision !== task.refinementSelection?.revision || task.refinement?.stale) {
-      this.validationRequest++;
-      this.measuring.set(false);
-      this.validationResult.set(null);
-      this.refinementMeasurementResult.set(null);
-      this.closeSourceImage();
+    const previous = this.selected(), candidate = task.zeroPoseCandidate;
+    if (previous?.id !== task.id || !candidate?.zeroPose || candidate.stale) {
+      this.stopZeroPosePreview();
+    } else if (previous.revision !== task.revision || previous.zeroPoseCandidate?.resultId !== candidate.resultId) {
+      this.clearZeroPoseMeasurement();
     }
     if (previous?.id !== task.id) {
       this.precisionMode.set(false);
-      this.comparisonMode.set(task.refinementSelection?.base ? task.refinement && !task.refinement.stale ? 'after' : 'before' : 'validation');
-      this.validationReferenceId.set('');
-      this.validationCriteriaDraft.set({});
-      this.validationModel.set('candidate');
       this.clearPanorama();
       this.guide.set(null);
       this.savedGuide = null;
@@ -490,22 +348,13 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.guideError.set('');
     }
     if (previous?.sourceTaskId !== task.sourceTaskId) this.sourceGroup.set(null);
-    if (this.comparisonMode() === 'after' && (!task.refinement || task.refinement.stale)) {
-      this.comparisonMode.set(task.refinementSelection?.base ? 'before' : 'validation');
-    }
-    if (this.comparisonMode() === 'zero-pose' && (!task.zeroPoseCandidate?.zeroPose || task.zeroPoseCandidate.stale)) {
-      this.comparisonMode.set('validation');
-    }
     this.selected.set(task);
-    this.refinementBaseKey.set(this.refinementKey(task.refinementSelection?.base));
-    this.refinementSupplementalIds.set(task.refinementSelection?.supplemental.map((source) => source.taskId) || []);
     this.tasks.update((tasks) => tasks.some((item) => item.id === task.id)
       ? tasks.map((item) => item.id === task.id ? task : item) : [task, ...tasks]);
   }
 
   selectItem(item?: RecognitionItem) {
     this.endPanoramaDrag();
-    this.closeSourceImage();
     const changed = item?.snapshotId !== this.selectedItemId();
     if (changed) {
       this.activePanoramaEndpoint.set(0);
@@ -518,23 +367,23 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.ignored.set(item?.ignored ?? true);
     this.dirty.set(false);
     this.endDrag();
-    if (changed && this.precisionActive()) this.centerPrecision();
+    if (changed && this.precisionMode()) this.centerPrecision();
   }
 
   async openItem(item: RecognitionItem) {
     if (!this.busy() && !this.loading() && !this.guideDrawing() && await this.save()) {
       this.selectItem(this.items().find((entry) => entry.snapshotId === item.snapshotId) || item);
-      void this.measure();
+      void this.measureZeroPose();
       if (this.panorama()) this.showFocusedPanorama();
-      if (this.precisionActive()) this.focusAnnotationCanvas();
+      if (this.precisionMode()) this.focusAnnotationCanvas();
       else this.focusPanorama();
     }
   }
-  undo() { const item = this.item(); if (item) { this.selectItem(item); void this.measure(); } }
+  undo() { const item = this.item(); if (item) { this.selectItem(item); void this.measureZeroPose(); } }
 
   openPanoramaItem(snapshotId: string) {
     if (this.guideDrawing()) return;
-    if (snapshotId === this.selectedItemId() && !this.sourceImage()) { this.showFocusedPanorama(); this.focusPanorama(); return; }
+    if (snapshotId === this.selectedItemId()) { this.showFocusedPanorama(); this.focusPanorama(); return; }
     const entry = this.items().find((item) => item.snapshotId === snapshotId);
     if (entry) void this.openItem(entry);
   }
@@ -570,7 +419,6 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   showFocusedPanorama() {
     if (!this.panorama() || this.item()?.missing || !this.item()) return;
-    this.closeSourceImage();
     this.endGuideDrag(undefined, false);
     this.guideDrawing.set(null);
     this.panoramaFocused.set(true);
@@ -802,11 +650,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
 
   imageLoaded(snapshotId: string) {
-    if (snapshotId === this.displayedItem()?.snapshotId) { this.singleImageId.set(snapshotId); this.singleImageError.set(''); }
+    if (snapshotId === this.item()?.snapshotId) { this.singleImageId.set(snapshotId); this.singleImageError.set(''); }
   }
 
   imageFailed(snapshotId: string) {
-    if (snapshotId === this.displayedItem()?.snapshotId) {
+    if (snapshotId === this.item()?.snapshotId) {
       this.singleImageId.set('');
       this.singleImageError.set('当前原图读取失败，图片已删除或文件不可用，请刷新后重试');
     }
@@ -995,16 +843,16 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.message.set('');
   }
   annotationCoordinate(value: number, dimension: number) {
-    return this.precisionActive() ? Number((value * dimension).toFixed(6)) : value;
+    return this.precisionMode() ? Number((value * dimension).toFixed(6)) : value;
   }
   editAnnotationCoordinate(index: number, axis: 'x' | 'y', value: number | null, dimension: number) {
-    this.editPoint(index, axis, value === null || !this.precisionActive() ? value : value / dimension);
+    this.editPoint(index, axis, value === null || !this.precisionMode() ? value : value / dimension);
   }
   togglePrecision() {
     if (!this.originalEditable()) return;
     this.endDrag();
     this.precisionMode.update(value => !value);
-    if (this.precisionActive()) {
+    if (this.precisionMode()) {
       this.precisionTarget.set('line');
       this.centerPrecision(16);
       this.focusAnnotationCanvas();
@@ -1026,7 +874,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (this.precisionZooms.includes(zoom)) this.precisionView.update(view => zoomHorizonView(view, zoom, anchor));
   }
   zoomAnnotation(event: WheelEvent) {
-    if (!this.precisionActive() || this.precisionDrag || !event.deltaY) return;
+    if (!this.precisionMode() || this.precisionDrag || !event.deltaY) return;
     const anchor = this.annotationPointer(event);
     if (!anchor) return;
     event.preventDefault();
@@ -1035,13 +883,13 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   nudgePrecision(direction: 1 | -1) {
     const item = this.item(), step = this.precisionStep();
-    if (!this.precisionActive() || !this.originalEditable() || !item || step === null) return;
+    if (!this.precisionMode() || !this.originalEditable() || !item || step === null) return;
     this.updateEditedPoints(shiftHorizonPixels(this.points(), this.precisionTarget(),
       direction * step, item.snapshot.height));
     this.focusAnnotationCanvas();
   }
   annotationKeydown(event: KeyboardEvent) {
-    if (!this.precisionActive() || !this.originalEditable() || event.defaultPrevented || event.isComposing || event.altKey) return;
+    if (!this.precisionMode() || !this.originalEditable() || event.defaultPrevented || event.isComposing || event.altKey) return;
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
       event.preventDefault();
       void this.save();
@@ -1056,7 +904,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   setIgnored(value: boolean) { this.ignored.set(value); this.dirty.set(true); this.message.set(''); }
   resetLine() {
     this.updateEditedPoints([{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }]);
-    if (this.precisionActive()) this.centerPrecision();
+    if (this.precisionMode()) this.centerPrecision();
   }
   private annotationPointer(event: MouseEvent): HorizonPoint | null {
     const rect = (event.currentTarget as SVGSVGElement).getBoundingClientRect();
@@ -1068,7 +916,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     const svg = event.currentTarget as SVGSVGElement;
     const start = this.annotationPointer(event);
     if (!start) return;
-    if (this.precisionActive()) {
+    if (this.precisionMode()) {
       event.preventDefault();
       this.focusAnnotationCanvas();
       const hit = event.shiftKey ? null : event.target as Element | null;
@@ -1154,23 +1002,23 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     } catch (error) { this.problem.set(errorMessage(error)); return false; }
     finally {
       this.busy.set(false);
-      if (saved && saveAnnotation) void this.measure();
+      if (saved && saveAnnotation) void this.measureZeroPose();
     }
   }
 
   saveGuide() { return this.save(false); }
 
-  async generate(zeroPose = false) {
-    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
+  async generate() {
+    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || this.coarse() || !await this.save()) return;
     const task = this.selected();
     if (!task) return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
     try {
-      const result = await this.api.generateInstallation(task.id, task.revision, zeroPose ? ZERO_POSE_MODEL : undefined);
+      const result = await this.api.generateInstallation(task.id, task.revision, ZERO_POSE_MODEL);
       if (!this.destroyed) this.setTask(result);
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
-    if (zeroPose && this.comparisonMode() === 'zero-pose') void this.measureZeroPose();
+    if (this.previewingZeroPose()) void this.measureZeroPose();
   }
   previewZeroPose(snapshotId: string) {
     if (!this.canPreviewZeroPose()) return;
@@ -1180,303 +1028,51 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       return;
     }
     this.problem.set('');
-    this.comparisonMode.set('zero-pose');
+    this.previewingZeroPose.set(true);
     this.selectItem(item);
     this.focusAnnotationCanvas();
     void this.measureZeroPose();
   }
   stopZeroPosePreview() {
-    this.comparisonMode.set('validation');
-    void this.measure();
+    this.previewingZeroPose.set(false);
+    this.clearZeroPoseMeasurement();
   }
-  private async measureZeroPose() {
-    const task = this.selected(), candidate = this.zeroPoseCandidate(), item = this.item();
-    const request = ++this.validationRequest;
+
+  private clearZeroPoseMeasurement() {
+    this.measurementRequest++;
     this.zeroPoseMeasurementResult.set(null);
     this.measuring.set(false);
-    if (this.destroyed || !task || !candidate?.zeroPose || candidate.stale || !item || item.missing || this.dirty()
-      || !candidate.sourceSnapshotIds.includes(item.snapshotId)) return;
+  }
+
+  private async measureZeroPose() {
+    this.clearZeroPoseMeasurement();
+    const task = this.selected(), candidate = this.zeroPoseCandidate(), item = this.item();
+    const request = this.measurementRequest;
+    if (this.destroyed || !this.previewingZeroPose() || !task || !candidate?.zeroPose || candidate.stale
+      || !item || item.missing || this.dirty() || !candidate.sourceSnapshotIds.includes(item.snapshotId)) return;
     this.measuring.set(true);
     try {
       const result = await this.api.measureZeroPose(task.id, task.revision, candidate.resultId, item.snapshotId);
-      if (!this.destroyed && request === this.validationRequest) this.zeroPoseMeasurementResult.set(result);
-    } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
-    finally { if (request === this.validationRequest) this.measuring.set(false); }
-  }
-  async validate() {
-    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
-    this.closeSourceImage();
-    this.comparisonMode.set('validation');
-    this.problem.set('');
-    await this.measure(true);
-  }
-  selectValidationSource(id: string) {
-    this.problem.set('');
-    this.closeSourceImage();
-    this.comparisonMode.set('validation');
-    this.validationRequest++;
-    this.measuring.set(false);
-    this.validationResult.set(null);
-    this.validationModel.set('candidate');
-    this.validationReferenceId.set(id);
-    void this.measure();
-  }
-  setValidationCriterion(key: keyof ZeroPoseValidationCriteria, value: number | null) {
-    this.validationCriteriaDraft.update((criteria) => ({ ...criteria, [key]: value }));
-    this.validationResult.set(null);
-  }
-  selectValidationModel(model: 'baseline' | 'candidate') {
-    this.comparisonMode.set('validation');
-    this.validationModel.set(model);
-  }
-  private async measure(submitValidation = false) {
-    if (this.comparisonMode() === 'zero-pose') return this.measureZeroPose();
-    if (this.comparisonMode() !== 'validation') return this.measureRefinement();
-    if (this.destroyed) return;
-    const task = this.selected(), reference = this.validationSource();
-    const zeroPose = reference && 'zeroPose' in reference;
-    const criteria = zeroPose ? this.validationCriteria() : undefined;
-    // 新版仅在显式提交时保存复核证据，打开另一张图只切换当前对照。
-    if (zeroPose && (!submitValidation || !criteria)) return;
-    const request = ++this.validationRequest;
-    this.validationResult.set(null);
-    this.measuring.set(false);
-    if (!task || !reference?.resultId || this.dirty() || this.running()) return;
-    const revision = this.revision;
-    this.measuring.set(true);
-    try {
-      const result = await this.api.validateInstallation(task.id, task.revision, reference.task.id, reference.resultId, reference.kind, criteria);
-      if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
-        && task.revision === this.selected()?.revision && reference.key === this.validationSource()?.key
-        && reference.resultId === this.validationSource()?.resultId) this.validationResult.set(result);
-    } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
-    finally { if (request === this.validationRequest) this.measuring.set(false); }
-  }
-  selectComparisonMode(mode: 'before' | 'after') {
-    this.problem.set('');
-    this.comparisonMode.set(mode);
-    void this.measure();
-  }
-  private async measureRefinement() {
-    if (this.destroyed) return;
-    const request = ++this.validationRequest, task = this.selected(), mode = this.comparisonMode();
-    this.refinementMeasurementResult.set(null);
-    this.validationResult.set(null);
-    this.measuring.set(false);
-    if (!task?.refinementSelection?.base || this.dirty() || this.running() || (mode !== 'before' && mode !== 'after')
-      || (mode === 'after' && (!task.refinement || task.refinement.stale))) return;
-    const revision = this.revision, selectionRevision = task.refinementSelection.revision;
-    const candidate = task.refinement;
-    const resultId = candidate && !candidate.stale && (mode === 'after' || candidate.model === ZERO_POSE_MODEL)
-      ? candidate.resultId : undefined;
-    this.measuring.set(true);
-    try {
-      const result = await this.api.measureRefinement(task.id, task.revision, selectionRevision, mode, resultId);
-      if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
-        && task.revision === this.selected()?.revision && selectionRevision === this.selected()?.refinementSelection?.revision
-        && mode === this.comparisonMode()) this.refinementMeasurementResult.set(result);
-    } catch (error) {
-      if (!this.destroyed && request === this.validationRequest) { this.closeSourceImage(); this.problem.set(errorMessage(error)); }
-    }
-    finally { if (request === this.validationRequest) this.measuring.set(false); }
-  }
-  private refinementKey(base: RefinementSelection['base'] | undefined) {
-    return base?.model === ZERO_POSE_MODEL ? `zero-pose:${base.taskId}` : base?.taskId || '';
-  }
-  async selectRefinementBase(key: string) {
-    const base = this.refinementSourceOptions().find((source) => source.key === key)?.base;
-    await this.saveRefinementSources(key, this.refinementSupplementalIds().filter((id) => id !== base?.taskId));
-  }
-  async selectRefinementSupplemental(taskId: string, checked: boolean) {
-    const ids = this.refinementSupplementalIds().filter((id) => id !== taskId);
-    if (checked) ids.push(taskId);
-    await this.saveRefinementSources(this.refinementBaseKey(), ids);
-  }
-  private async saveRefinementSources(baseKey: string, supplementalIds: string[], measure = true): Promise<boolean> {
-    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return false;
-    const task = this.selected(), base = this.refinementSourceOptions().find((source) => source.key === baseKey)?.base;
-    if (!task) return false;
-    if (baseKey && !base) {
-      this.problem.set('所选基础标定不可用，请刷新来源任务或重新选择合格结果');
-      return false;
-    }
-    this.refinementBaseKey.set(baseKey);
-    this.refinementSupplementalIds.set(supplementalIds);
-    this.busy.set(true); this.problem.set(''); this.message.set('');
-    let saved = false;
-    try {
-      const result = await this.api.saveRefinementSources(task.id, task.revision, { revision: task.refinementSelection?.revision || 0,
-        base: base || null,
-        supplemental: supplementalIds.map((id) => ({ taskId: id, revision: this.tasks().find((source) => source.id === id)!.revision })) });
-      if (this.destroyed) return false;
-      this.setTask(result);
-      this.comparisonMode.set(base ? 'before' : 'validation');
-      this.message.set('精修来源已保存');
-      saved = true;
-    } catch (error) { this.problem.set(errorMessage(error)); }
-    finally {
-      this.busy.set(false);
-      this.refinementBaseKey.set(this.refinementKey(this.selected()?.refinementSelection?.base));
-      this.refinementSupplementalIds.set(this.selected()?.refinementSelection?.supplemental.map((source) => source.taskId) || []);
-    }
-    if (saved && measure) void this.measure();
-    return saved;
-  }
-  async refine() {
-    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
-    const selected = this.selected();
-    if (!selected?.refinementSelection?.base || !await this.saveRefinementSources(this.refinementKey(selected.refinementSelection.base),
-      selected.refinementSelection.supplemental.map((source) => source.taskId), false)) return;
-    const task = this.selected()!;
-    this.busy.set(true); this.problem.set(''); this.message.set('');
-    let generated = false;
-    try {
-      const result = await this.api.refineInstallation(task.id, task.revision, task.refinementSelection!.revision);
-      if (this.destroyed) return;
-      this.setTask(result);
-      this.comparisonMode.set('after');
-      generated = true;
-    } catch (error) { this.problem.set(errorMessage(error)); }
-    finally { this.busy.set(false); }
-    if (generated) void this.measure();
-  }
-  async openValidationItem(snapshotId: string) {
-    const item = this.items().find((entry) => entry.snapshotId === snapshotId);
-    if (item) await this.openItem(item);
-  }
-  async openRefinementItem(snapshotId: string, taskId: string) {
-    if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || this.guideDrawing() || this.dirty()) return;
-    const task = this.selected(), candidate = task?.refinement;
-    const source = candidate?.sources.find((entry) => entry.taskId === taskId && entry.sourceSnapshotIds.includes(snapshotId));
-    if (!task || !candidate || candidate.stale || !source) return;
-    const mode = this.comparisonMode() === 'before' ? 'before' : 'after';
-    if (taskId === task.id) {
-      let item = this.items().find((entry) => entry.snapshotId === snapshotId);
-      while (!item && this.nextItemOffset() !== null) {
-        const offset = this.nextItemOffset();
-        await this.loadMore('items');
-        if (this.destroyed || this.selected()?.refinement?.resultId !== candidate.resultId || this.nextItemOffset() === offset) return;
-        item = this.items().find((entry) => entry.snapshotId === snapshotId);
-      }
-      if (!item || item.missing) {
-        this.problem.set('精修参与图的原图已删除，请刷新并重新生成候选');
-        return;
-      }
-      this.comparisonMode.set(mode);
-      await this.openItem(item);
-      return;
-    }
-    const revision = this.revision;
-    this.validationRequest++;
-    this.refinementMeasurementResult.set(null);
-    this.measuring.set(false);
-    this.loading.set(true);
-    this.problem.set('');
-    try {
-      let offset: number | null = 0;
-      while (offset !== null) {
-        const page = await this.api.recognitionItems(taskId, offset);
-        if (this.destroyed || revision !== this.revision || this.selected()?.refinement?.resultId !== candidate.resultId
-          || this.selected()?.refinementSelection?.revision !== candidate.selectionRevision) return;
-        if (page.task.revision !== source.revision || ['queued', 'running'].includes(page.task.status)) {
-          throw new Error('精修参与图的来源版本已变化，请刷新并重新生成候选');
-        }
-        const item = page.items.find((entry) => entry.snapshotId === snapshotId);
-        if (item) {
-          if (item.missing) throw new Error('精修参与图的原图已删除，请刷新并重新生成候选');
-          const currentSource = await this.api.recognitionTask(taskId);
-          if (this.destroyed || revision !== this.revision || this.selected()?.refinement?.resultId !== candidate.resultId
-            || this.selected()?.refinementSelection?.revision !== candidate.selectionRevision) return;
-          const baseResultId = source.model === ZERO_POSE_MODEL ? currentSource.zeroPoseCandidate?.resultId : currentSource.resultId;
-          if (currentSource.updatedAt !== page.task.updatedAt || (source.role === 'base' && baseResultId !== source.resultId)) {
-            throw new Error('精修参与图的来源版本已变化，请刷新并重新生成候选');
-          }
-          this.showOverview();
-          this.endDrag();
-          this.singleImageId.set('');
-          this.singleImageError.set('');
-          this.sourceImage.set({ task: currentSource, item });
-          this.comparisonMode.set(mode);
-          await this.measureRefinement();
-          return;
-        }
-        offset = page.nextOffset;
-      }
-      throw new Error('精修参与图已不存在，请刷新并重新生成候选');
-    } catch (error) {
-      if (!this.destroyed && revision === this.revision) {
-        this.closeSourceImage();
-        this.problem.set(error instanceof Error && error.name === 'Error' ? error.message : errorMessage(error));
-      }
-    } finally { if (revision === this.revision) this.loading.set(false); }
-  }
-  closeSourceImage() {
-    if (!this.sourceImage()) return;
-    this.sourceImage.set(null);
-    this.singleImageId.set('');
-    this.singleImageError.set('');
-  }
-  calibrationZoom(result: NonNullable<RecognitionTask['result'] | RecognitionTask['zeroPoseCandidate']>) {
-    const values = result.diagnostics?.perSnapshot.flatMap((row) => row.zoom === undefined ? [] : [row.zoom]) || [];
-    if (!values.length) return '—';
-    const min = Math.min(...values), max = Math.max(...values);
-    return min === max ? min.toFixed(1) : `${min.toFixed(1)}～${max.toFixed(1)}`;
+      if (!this.destroyed && request === this.measurementRequest) this.zeroPoseMeasurementResult.set(result);
+    } catch (error) { if (!this.destroyed && request === this.measurementRequest) this.problem.set(errorMessage(error)); }
+    finally { if (request === this.measurementRequest) this.measuring.set(false); }
   }
   signedResidual(value: number | null, digits = 2) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(digits)}`; }
-  zeroPoseValidationStatus(candidate: ZeroPoseApplicationCandidate) {
-    if (candidate.validationStaleReason) return `复核证据已过期。${candidate.validationStaleReason}`;
-    if (!candidate.validation) return '待独立复核';
-    return {
-      passed: '独立复核通过', failed: '独立复核超差', insufficient_data: '独立复核缺少有效原图', insufficient_coverage: '独立复核覆盖不足',
-    }[candidate.validation.status];
-  }
-  canApplyZeroPose(candidate: ZeroPoseApplicationCandidate) {
-    return candidate.status === 'estimated' && candidate.validation?.status === 'passed' && !candidate.validationStaleReason
-      && !candidate.applied && !candidate.stale
+  canApplyZeroPose(candidate: ZeroPoseCandidate) {
+    return candidate.status === 'estimated' && !!candidate.zeroPose && !candidate.applied && !candidate.stale
       && !this.busy() && !this.loading() && !this.dirty() && !this.running() && !this.generatingPanorama() && !this.guideDrawing();
   }
-  async applyZeroPose(refinement: boolean) {
-    const task = this.selected(), candidate = refinement ? task?.refinement : task?.zeroPoseCandidate;
-    if (!task || candidate?.model !== ZERO_POSE_MODEL || !candidate.validation || !this.canApplyZeroPose(candidate)) return;
-    const name = refinement ? '零位精修候选' : '零位普通候选';
-    if (!window.confirm(`将「${candidate.generatedCamera.name}」的生效标定切换为这份${name}？\n${candidate.model}`)) return;
+  async applyZeroPose() {
+    const task = this.selected(), candidate = task?.zeroPoseCandidate;
+    if (!task || !candidate || !this.canApplyZeroPose(candidate)) return;
+    if (!window.confirm(`将「${candidate.generatedCamera.name}」的生效标定切换为这份零位姿态候选？`)) return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
     try {
-      const id = candidate.validation.id;
-      const result = await (refinement ? this.api.applyRefinement(task.id, task.revision, candidate.resultId, id)
-        : this.api.applyInstallation(task.id, task.revision, candidate.resultId, id));
+      const result = await this.api.applyZeroPose(task.id, task.revision, candidate.resultId);
       if (this.destroyed) return;
       this.setTask(result.task);
       this.applied.emit(result.camera);
-      this.message.set(`${name}已应用到摄像头`);
-    } catch (error) { this.problem.set(errorMessage(error)); }
-    finally { this.busy.set(false); }
-  }
-  async applyRefinement() {
-    const task = this.selected(), candidate = task?.refinement;
-    if (!task || candidate?.model !== 'wgs84-horizon-refinement-v1' || candidate.status !== 'estimated' || candidate.stale || candidate.applied
-      || this.busy() || this.loading() || this.dirty() || this.running() || this.generatingPanorama()) return;
-    this.busy.set(true); this.problem.set(''); this.message.set('');
-    try {
-      const result = await this.api.applyRefinement(task.id, task.revision, candidate.resultId);
-      if (this.destroyed) return;
-      this.setTask(result.task);
-      this.applied.emit(result.camera);
-      this.message.set('精修四项安装参数已应用到摄像头配置');
-    } catch (error) { this.problem.set(errorMessage(error)); }
-    finally { this.busy.set(false); }
-  }
-  async apply() {
-    const task = this.selected();
-    if (!task || !task.resultId || this.busy() || this.loading() || this.dirty() || this.running() || this.generatingPanorama()
-      || !this.sourceGroup() || this.coarse() || task.result?.status !== 'estimated') return;
-    this.busy.set(true); this.problem.set(''); this.message.set('');
-    try {
-      const result = await this.api.applyInstallation(task.id, task.revision, task.resultId);
-      if (this.destroyed) return;
-      this.setTask(result.task);
-      this.applied.emit(result.camera);
-      this.message.set('四项安装参数已应用到摄像头配置');
+      this.message.set('零位姿态已应用到摄像头');
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
   }
@@ -1498,6 +1094,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
   }
-  residual(snapshotId: string) { return this.selected()?.result?.diagnostics?.perSnapshot.find((item) => item.snapshotId === snapshotId)?.rmsResidualPixels; }
+  residual(snapshotId: string) {
+    const candidate = this.zeroPoseCandidate();
+    if (this.dirty() || candidate?.stale) return undefined;
+    const result = candidate ?? this.selected()?.result;
+    return result?.diagnostics?.perSnapshot.find((item) => item.snapshotId === snapshotId)?.rmsResidualPixels;
+  }
   ngOnDestroy() { this.destroyed = true; this.revision++; clearInterval(this.timer); this.clearPanorama(); }
 }

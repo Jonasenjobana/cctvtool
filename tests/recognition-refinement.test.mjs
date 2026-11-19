@@ -12,7 +12,8 @@ const zeroPoseModel = 'wgs84-horizon-zero-pose-v1';
 const actualZeroPose = { roll: -1.75, pitch: 2.1, yaw: 133.7, tiltOffset: 1.2 };
 
 async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot, seed = () => {}, groupPans = {}, ptzFor = () => ({}),
-  livegbs = { configured: false }, includeValidation = false, zeroPose, savedZeroPose = zeroPose && { ...zeroPose, roll: 0, pitch: 0 } } = {}) {
+  livegbs = { configured: false }, includeValidation = false, zeroPose, savedZeroPose = zeroPose && { ...zeroPose, roll: 0, pitch: 0 },
+  writeImages = !!zeroPose } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-refinement-test-'));
   const store = new CameraStore(dataDir);
   const input = Object.fromEntries(['name', 'serial', 'code', 'longitude', 'latitude', 'height',
@@ -44,7 +45,7 @@ async function fixture(t, { noise = true, highTransform = (snapshot) => snapshot
     store.addSnapshotGroup({ id: name, cameraId: camera.id, cameraName: camera.name, kind: 'scan', status: 'completed',
       createdAt: snapshots[0].createdAt, sampleCount: snapshots.length, completedCount: snapshots.length });
     snapshots.forEach((snapshot) => store.addSnapshot(snapshot));
-    if (zeroPose) await Promise.all(snapshots.map((snapshot) => writeFile(join(dataDir, 'snapshots', snapshot.fileName), snapshot.id)));
+    if (writeImages) await Promise.all(snapshots.map((snapshot) => writeFile(join(dataDir, 'snapshots', snapshot.fileName), snapshot.id)));
     groups.set(name, snapshots);
   }
   seed(store, camera, groups);
@@ -144,6 +145,48 @@ test('联合精修使用同一批低倍与多来源高倍原图求解零位姿�
   await f.app.close();
   f.app = await createApp(f.options);
   assert.deepEqual((await f.get(main.id)).refinement, candidate);
+});
+
+test('历史安装结果转为零位姿态参与高倍联合精修，冻结原有基准和来源版本', async (t) => {
+  const f = await fixture(t, { writeImages: true, includeValidation: true });
+  const saved = await f.select(f.main, f.base, [f.extra]);
+  assert.equal(saved.statusCode, 200, saved.body);
+  const selectionRevision = saved.json().refinementSelection.revision;
+  const baseline = await f.post(f.main, 'refinement-measure', { mode: 'before', selectionRevision });
+  assert.equal(baseline.statusCode, 200, baseline.body);
+  const generated = await f.post(f.main, 'refine', { model: zeroPoseModel, selectionRevision });
+  assert.equal(generated.statusCode, 200, generated.body);
+  const task = generated.json(), candidate = task.refinement;
+  assert.equal(candidate.model, zeroPoseModel);
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.equal(candidate.stale, false, candidate.staleReasons.join('，'));
+  assert.equal(candidate.sources[0].resultId, f.base.resultId);
+  assert.equal(candidate.before.zeroPose.tiltOffset, f.base.result.installation.tiltOffset);
+  assert.equal(candidate.before.zeroPose.imageRoll, f.base.result.installation.imageRoll);
+  assert.equal(candidate.zeroPose.yaw, candidate.before.zeroPose.yaw);
+  assert.deepEqual(candidate.sources.map((source) => source.sourceSnapshotIds.length), [6, 5, 3]);
+  const before = await f.post(task, 'refinement-measure', { mode: 'before', selectionRevision, resultId: candidate.resultId });
+  assert.equal(before.statusCode, 200, before.body);
+  assert.equal(before.json().model, zeroPoseModel);
+  assert.deepEqual(before.json().perSnapshot, candidate.before.perSnapshot);
+  for (const row of before.json().perSnapshot) {
+    const legacy = baseline.json().perSnapshot.find((entry) => entry.snapshotId === row.snapshotId);
+    assert.ok(Math.abs(legacy.verticalOffsetPixels - row.verticalOffsetPixels) < 1e-8, row.snapshotId);
+  }
+  assert.deepEqual(await f.get(f.base.id), f.base);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), [f.camera]);
+  const validation = await f.task('validation');
+  const reviewed = await f.post(validation, 'validate', {
+    referenceKind: 'zero-pose-refinement', referenceTaskId: task.id, referenceResultId: candidate.resultId,
+    criteria: { minimumHighZoom: 10, maximumVerticalOffsetPixels: 5, maximumDirectionDifferenceDegrees: 0.5, maximumRmsPixels: 5 },
+  });
+  assert.equal(reviewed.statusCode, 200, reviewed.body);
+  assert.equal(reviewed.json().status, 'passed', reviewed.body);
+  const regenerated = await f.post(f.base, 'generate');
+  assert.equal(regenerated.statusCode, 200, regenerated.body);
+  assert.equal((await f.get(task.id)).refinement.stale, true);
+  const rejected = await f.post(task, 'refinement-measure', { mode: 'before', selectionRevision, resultId: candidate.resultId });
+  assert.equal(rejected.statusCode, 409, rejected.body);
 });
 
 test('零位精修拒绝混用模型、旧版本和重复图片，来源更新和相机草稿修改使候选过期', async (t) => {
@@ -891,7 +934,7 @@ test('有效高倍组为空或只有低倍率时返回明确原因，过滤掉�
 });
 
 test('总体低误差不能掩盖高倍组超差，固定模型保留相反方向的真实残差', async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { writeImages: true, includeValidation: true });
   let main = f.main, extra = f.extra;
   for (const name of ['main', 'extra']) {
     let task = name === 'main' ? main : extra;
@@ -917,6 +960,23 @@ test('总体低误差不能掩盖高倍组超差，固定模型保留相反方�
   assert.ok(result.after.perSnapshot.some((row) => row.verticalOffsetPixels > 0));
   assert.ok(result.after.perSnapshot.some((row) => row.verticalOffsetPixels < 0));
   assert.equal((await f.post(response.json(), 'refinement-apply', { resultId: result.resultId })).statusCode, 409);
+
+  const generated = await f.post(main, 'refine', { selectionRevision: 1, model: zeroPoseModel });
+  assert.equal(generated.statusCode, 200, generated.body);
+  const candidate = generated.json().refinement;
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.ok(candidate.zeroPose);
+  assert.ok(candidate.after.high.rmsResidualPixels > 5);
+  assert.match(candidate.message, /高倍组 RMS .*超过 5 像素参考值/);
+  const preview = await f.post(main, 'refinement-measure', { selectionRevision: 1, mode: 'after', resultId: candidate.resultId });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json().zeroPose, candidate.zeroPose);
+  const reviewed = await f.post(await f.task('validation'), 'validate', {
+    referenceKind: 'zero-pose-refinement', referenceTaskId: main.id, referenceResultId: candidate.resultId,
+    criteria: { minimumHighZoom: 10, maximumVerticalOffsetPixels: 5, maximumDirectionDifferenceDegrees: 0.5, maximumRmsPixels: 5 },
+  });
+  assert.equal(reviewed.statusCode, 200, reviewed.body);
+  assert.equal(reviewed.json().evidence.source.resultId, candidate.resultId);
 });
 
 test('高倍观测集中且量级悬殊时保留四参数不可辨识诊断，不用阻尼制造合格候选', async (t) => {

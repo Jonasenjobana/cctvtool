@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { legacyZeroPose } from '#zero-pose';
 import { httpError } from './errors.mjs';
 import { invalidHorizonAnnotation, validHorizonAnnotation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
 import { matchesZeroPoseCamera, requireZeroPoseCandidate } from './zero-pose-candidate.mjs';
@@ -25,7 +26,7 @@ export function refinementStaleReasons(store, task) {
     }
     if (current.revision !== source.revision || activeStatuses.includes(current.status)) reasons.push(`来源任务 ${source.taskId} 的正式标注版本已变化或识别未结束`);
     if (source.role === 'base') {
-      if (zeroPose) {
+      if (source.model === ZERO_POSE_MODEL) {
         const candidate = current.zeroPoseCandidate;
         if (candidate?.resultId !== source.resultId || candidate?.model !== source.model
           || candidate?.revision !== current.revision || candidate?.status !== 'estimated' || !candidate.zeroPose) {
@@ -60,31 +61,33 @@ export function requireZeroPoseRefinement(store, task, resultId) {
   }
   const changed = refinementStaleReasons(store, task);
   if (changed.length) throw httpError(409, changed.join('；'));
-  const { sources } = refinementInputs(store, task, task.refinementSelection);
+  const { sources } = refinementInputs(store, task, task.refinementSelection, candidate.model);
   if (!isDeepStrictEqual(sources, candidate.sources.map(({ sourceSnapshotIds, ...source }) => source))) {
     throw httpError(409, '精修来源或输入截图已变化，请重新生成精修候选');
   }
   return candidate;
 }
 
-export function refinementInputs(store, task, selection) {
+export function refinementInputs(store, task, selection, requestedModel) {
   if (!selection?.base) throw httpError(409, '请先选择合格的基础标定结果');
   const { base } = selection;
-  const zeroPose = base.model === ZERO_POSE_MODEL;
+  const zeroPoseBase = base.model === ZERO_POSE_MODEL;
+  const zeroPose = zeroPoseBase || requestedModel === ZERO_POSE_MODEL;
   const camera = store.getCamera(task.cameraId);
   const reference = store.getRecognitionTask(base.taskId);
   if (reference.cameraId !== task.cameraId) throw httpError(409, '精修来源必须属于同一摄像头');
-  const baseResult = zeroPose ? requireZeroPoseCandidate(store, reference, base.resultId, base.revision) : reference.result;
-  if (!zeroPose && (baseResult?.status !== 'estimated' || baseResult.model !== 'wgs84-horizon-installation-v1'
+  const baseResult = zeroPoseBase ? requireZeroPoseCandidate(store, reference, base.resultId, base.revision) : reference.result;
+  if (!zeroPoseBase && (baseResult?.status !== 'estimated' || baseResult.model !== 'wgs84-horizon-installation-v1'
     || reference.resultRevision !== reference.revision || reference.resultId !== base.resultId)) {
     throw httpError(409, '基础标定来源没有合格的最新结果，或结果编号已变化');
   }
   if (store.getSnapshotGroup(reference.sourceTaskId).horizon?.phase === 'coarse') throw httpError(409, '历史预扫粗结果仅供查看，请选择正式基础标定结果');
-  if (!zeroPose && fixedKeys.some((key) => camera[key] !== reference.fitCamera?.[key])) {
+  if (!zeroPoseBase && fixedKeys.some((key) => camera[key] !== reference.fitCamera?.[key])) {
     throw httpError(409, '固定安装条件或设备通道已变化，请重新生成基础标定结果');
   }
-  const baseCamera = zeroPose ? { ...baseResult.generatedCamera, zeroPose: baseResult.zeroPose }
+  const baseCamera = zeroPoseBase ? { ...baseResult.generatedCamera, zeroPose: baseResult.zeroPose }
     : { ...reference.fitCamera, ...baseResult.installation };
+  if (zeroPose && !zeroPoseBase) baseCamera.zeroPose = legacyZeroPose(baseCamera);
   const baseSnapshotIds = new Set(baseResult.sourceSnapshotIds);
   const sources = [], selected = [], excluded = [];
   const taskIds = new Set(), snapshotIds = new Set();

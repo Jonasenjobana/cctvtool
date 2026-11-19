@@ -49,6 +49,8 @@ class VideoPlanePrimitive extends Primitive {
   }
 }
 
+export type ZeroPoseView = 'current' | 'external' | 'lens';
+
 @Component({
   selector: 'app-camera-scene',
   standalone: true,
@@ -60,7 +62,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @ViewChild('container', { static: true }) container!: ElementRef<HTMLDivElement>;
   @Input() camera: CameraDraft | null = null;
   @Input() reading: PtzReading | null = null;
-  @Input() zeroPosePreview: { pose: ZeroPose; view: 'external' | 'lens' } | null = null;
+  @Input() zeroPosePreview: { pose: ZeroPose; view: ZeroPoseView; showDraft: boolean } | null = null;
   @Input() following = true;
   @Input() video: HTMLVideoElement | null = null;
   @Input() snapshotUrl: string | null = null;
@@ -88,7 +90,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   private marker?: Entity;
   private pose?: CameraPose;
   private previewBasis?: CameraBasis;
-  private previewExterior = false;
+  private previewView?: ZeroPoseView;
   private observer?: ResizeObserver;
   private previousKey = '';
   private wasFollowing = false;
@@ -135,7 +137,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         this.observer = new ResizeObserver(() => {
           if (!this.viewer || this.viewer.isDestroyed()) return;
           this.viewer.resize();
-          if (this.zeroPosePreview ? this.zeroPosePreview.view === 'lens' : this.following) this.focus();
+          this.focusIfFollowing();
           this.viewer.scene.requestRender();
         });
         this.observer.observe(this.container.nativeElement);
@@ -233,21 +235,31 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     viewer.scene.requestRender();
   }
 
+  private usesCurrentView() {
+    return !this.zeroPosePreview || this.zeroPosePreview.view === 'current';
+  }
+
+  private focusIfFollowing() {
+    if (this.zeroPosePreview?.view === 'lens' || (this.usesCurrentView() && this.following && this.pose)) this.focus();
+  }
+
   private update() {
     const viewer = this.viewer;
     if (!viewer || viewer.isDestroyed()) return;
     const raw = this.reading?.raw;
     const preview = this.zeroPosePreview;
+    const currentView = this.usesCurrentView();
     const key = JSON.stringify([this.camera, preview, raw?.Pan, raw?.Tilt, raw?.Zoom, raw?.HorizontalFieldAngle, raw?.VerticalFieldAngle]);
     if (key === this.previousKey) {
-      if (!preview && this.following && !this.wasFollowing) this.focus();
+      if (currentView && this.following && !this.wasFollowing && this.pose) this.focus();
       this.wasFollowing = this.following;
       this.updateVideo();
       return;
     }
     const exterior = preview?.view === 'external';
-    const centerExterior = exterior && (!this.previewExterior || !this.previewBasis);
-    this.previewExterior = exterior;
+    const centerExterior = exterior && (this.previewView !== 'external' || !this.previewBasis);
+    const openingEditor = preview?.view === 'current' && this.previewView === undefined;
+    this.previewView = preview?.view;
     this.previousKey = key;
     this.pose = undefined;
     this.previewBasis = undefined;
@@ -258,10 +270,10 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       if (!this.camera) throw new Error('请选择或注册摄像头');
       if (this.camera.longitude !== null && this.camera.latitude !== null && this.camera.height !== null && this.marker) {
         this.marker.position = new ConstantPositionProperty(Cartesian3.fromDegrees(this.camera.longitude, this.camera.latitude, this.camera.height));
-        this.marker.show = !preview;
+        this.marker.show = currentView;
       }
       if (preview) {
-        const geometry = createZeroPosePreview(this.camera, preview.pose, raw ?? null);
+        const geometry = createZeroPosePreview(this.camera, preview.showDraft ? preview.pose : null, raw ?? null);
         this.previewBasis = geometry.basis;
         this.pose = geometry.pose ?? undefined;
         if (exterior) this.drawZeroPoseModel(geometry.basis);
@@ -275,7 +287,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         const frustumColor = Color.fromCssColorString('#ffd77a');
         corners.forEach((corner, index) => this.setLine(`ray-${index}`, [pose.position, corner], frustumColor));
         this.setLine('frame', [...corners, corners[0]], frustumColor);
-        if (!preview) {
+        if (currentView) {
           this.setLine('axis', [pose.position, Cartesian3.add(pose.position,
             Cartesian3.multiplyByScalar(pose.panAxis, 50, new Cartesian3()), new Cartesian3())], Color.fromCssColorString('#68cda4'));
         }
@@ -283,7 +295,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       }
       this.problem.set(preview && raw && !pose ? '回读视场角无效，当前显示相机姿态' : '');
       if (centerExterior) this.focusZeroPoseExterior();
-      else if (preview ? preview.view === 'lens' : this.following) this.focus();
+      else if (!openingEditor) this.focusIfFollowing();
     } catch (error) {
       this.problem.set(error instanceof Error ? error.message : '无法生成当前视场');
     }

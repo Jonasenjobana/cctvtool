@@ -5,6 +5,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { legacyZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
 import { createApp } from '../server/app.mjs';
 import { LiveGbsClient } from '../server/livegbs.mjs';
 import { readImageInfo } from '../server/image.mjs';
@@ -192,6 +193,34 @@ test('显式和默认截图校准冻结生效零位，历史截图保留拍摄�
   assert.equal(current.usesDraft, false);
   assert.deepEqual(current.ptz.raw, historical.ptz.raw);
   assert.deepEqual((await f.app.inject(url)).json().find((snapshot) => snapshot.id === historical.id), historical);
+});
+
+test('手调零位三角显式保存生效，旧截图保留原标定且新截图冻结转换后的姿态', async (t) => {
+  const f = await fixture(t);
+  const url = `/api/cameras/${f.camera.id}`;
+  const capture = () => f.app.inject({ method: 'POST', url: `${url}/snapshots`, payload: {} });
+  const historical = await capture();
+  assert.equal(historical.statusCode, 201, historical.body);
+  const converted = legacyZeroPose(f.camera);
+  const zeroPose = { ...converted, pitch: converted.pitch + 0.125 };
+  const save = (payload) => f.app.inject({ method: 'PUT', url, payload });
+  const missingPose = await save({ ...input, applyZeroPose: true });
+  assert.equal(missingPose.statusCode, 400, missingPose.body);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), [f.camera]);
+  const applied = await save({ ...input, zeroPose, applyZeroPose: true });
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.equal(applied.json().calibrationModel, ZERO_POSE_MODEL);
+  assert.deepEqual(applied.json().activeZeroPose, zeroPose);
+  assert.deepEqual(applied.json().zeroPose, zeroPose);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  const newSnapshot = await capture();
+  assert.equal(newSnapshot.statusCode, 201, newSnapshot.body);
+  assert.deepEqual(newSnapshot.json().calibration, {
+    ...historical.json().calibration, calibrationModel: ZERO_POSE_MODEL, activeZeroPose: zeroPose,
+  });
+  assert.deepEqual((await f.app.inject(`${url}/snapshots`)).json().find((snapshot) => snapshot.id === historical.json().id), historical.json());
+  assert.deepEqual(f.state.ptzCommands, []);
 });
 
 test('并发回读只登录一次，token 被拒绝后合并重新登录且不向前端泄露认证数据', async (t) => {

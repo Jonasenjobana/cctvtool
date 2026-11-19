@@ -28,10 +28,9 @@
           @if (running()) { <button type="button" [disabled]="busy() || loading()" (click)="cancel()">取消识别</button> }
           @else {
             <button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama()" (click)="recreate()">创建新一轮识别</button>
-            <button type="button" [class.primary]="coarse()" [disabled]="busy() || loading() || generatingPanorama()" (click)="generate()">生成安装参数</button>
             @if (!coarse()) {
               <button type="button" class="primary" [disabled]="busy() || loading() || generatingPanorama() || !sourceGroup()"
-                (click)="generate(true)">{{ busy() ? '处理中…' : '生成零位候选' }}</button>
+                (click)="generate()">{{ busy() ? '处理中…' : '生成零位姿态' }}</button>
             }
           }
         </div>
@@ -41,9 +40,9 @@
         <p class="stage-info">{{ horizon.phase === 'coarse' ? '历史低倍率预扫描识别 · 粗标定' : '历史高倍率正式扫描识别' }} · 正式目标 Z {{ horizon.targetZoom }} · 允许原始 T {{ horizon.tiltMin }}° ～ {{ horizon.tiltMax }}°</p>
       }
       <div class="workbench">
-        <section class="review" aria-label="截图复核">
-          <section class="panorama-panel" aria-label="海天线全景复核">
-            <div class="section-heading"><h3>全景复核</h3><button type="button"
+        <section class="review" aria-label="截图与标注">
+          <section class="panorama-panel" aria-label="海天线全景标注">
+            <div class="section-heading"><h3>全景标注</h3><button type="button"
               [disabled]="busy() || loading() || running() || generatingPanorama() || task.sampleCount < 2"
               (click)="generatePanorama()">{{ generatingPanorama() ? '正在生成…' : panorama() ? '重新生成全景图' : '生成全景图' }}</button></div>
             @if (generatingPanorama()) {
@@ -85,7 +84,7 @@
                           @if (!panoramaFocused() || selectedItemId() === line.snapshotId) {
                             <g [class.ignored]="line.ignored" [class.current]="selectedItemId() === line.snapshotId" role="button"
                               [attr.tabindex]="guideDrawing() ? null : 0"
-                              [attr.aria-label]="'复核 P ' + line.pan + '° 截图' + (line.ignored ? '，已忽略' : '')"
+                              [attr.aria-label]="'编辑 P ' + line.pan + '° 截图' + (line.ignored ? '，已忽略' : '')"
                               (click)="openPanoramaItem(line.snapshotId)" (keydown.enter)="openPanoramaItem(line.snapshotId)"
                               (keydown.space)="$event.preventDefault(); openPanoramaItem(line.snapshotId)">
                               <title>P {{ line.pan | number:'1.1-2' }}° · {{ line.ignored ? '已忽略' : '参与计算' }}</title>
@@ -167,49 +166,42 @@
             </fieldset>
           </section>
           <section class="editor" aria-label="海天线编辑">
-            <div class="section-heading"><h3>海天线复核</h3>
+            <div class="section-heading"><h3>海天线标注</h3>
               <div class="actions">
-                @if (sourceImage()) {
-                  <button type="button" [disabled]="busy() || loading()" (click)="closeSourceImage()">返回主任务图片</button>
-                } @else {
-                  <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().previous" (click)="navigate('previous')">上一张</button>
-                  <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().next" (click)="navigate('next')">下一张</button>
-                }
+                <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().previous" (click)="navigate('previous')">上一张</button>
+                <button type="button" [disabled]="busy() || loading() || generatingPanorama() || guideDrawing() !== null || !navigation().next" (click)="navigate('next')">下一张</button>
               </div>
-              @if (displayedItem(); as entry) { <span class="annotation-source" [class.unsaved]="!sourceImage() && dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ sourceImage() ? ' · 只读' : dirty() ? ' · 未保存' : '' }}</span> }
+              @if (item(); as entry) { <span class="annotation-source" [class.unsaved]="dirty()">{{ entry.source === 'manual' ? '人工标注' : '模型标注' }}{{ dirty() ? ' · 未保存' : '' }}</span> }
             </div>
-            @if (displayedItem(); as entry) {
-              @if (sourceImage(); as source) { <p class="image-info">参与图来源：{{ source.task.id === task.refinementSelection?.base?.taskId ? '基础' : '补充高倍' }}任务 · {{ source.task.createdAt | date:'MM-dd HH:mm:ss' }}</p> }
+            @if (item(); as entry) {
               <p class="image-info">{{ entry.snapshot.width }} × {{ entry.snapshot.height }}<span>P {{ entry.snapshot.ptz.raw.Pan | number:'1.2-2' }}°</span><span>T {{ entry.snapshot.ptz.raw.Tilt | number:'1.2-2' }}°</span><span>Z {{ entry.snapshot.ptz.raw.Zoom }}</span></p>
               @if (entry.missing) { <p class="error">原图已删除，重新生成数据时会排除此图。</p> }
               @else {
-                @if (!sourceImage()) {
-                  <div class="precision-toolbar">
-                    <button type="button" [disabled]="!originalEditable()" [attr.aria-pressed]="precisionActive()" (click)="togglePrecision()">高精度调试</button>
-                    @if (precisionActive()) {
-                      <label>局部放大
-                        <select [ngModel]="precisionView().zoom" (ngModelChange)="setPrecisionZoom($event)" aria-label="局部放大倍率">
-                          @for (zoom of precisionZooms; track zoom) { <option [ngValue]="zoom">{{ zoom }}×</option> }
-                        </select>
-                      </label>
-                      <div class="precision-targets" role="group" aria-label="微调对象">
-                        @for (target of precisionTargets; track target.value) {
-                          <button type="button" [attr.aria-pressed]="precisionTarget() === target.value" [disabled]="points().length !== 2"
-                            (click)="selectPrecisionTarget(target.value)">{{ target.label }}</button>
-                        }
-                      </div>
-                      @let step = precisionStep();
-                      <div class="precision-targets" role="group" aria-label="每步移动一个屏幕像素">
-                        <button type="button" aria-label="上移一个屏幕像素" [disabled]="!originalEditable() || points().length !== 2 || step === null" (click)="nudgePrecision(-1)">↑</button>
-                        <button type="button" aria-label="下移一个屏幕像素" [disabled]="!originalEditable() || points().length !== 2 || step === null" (click)="nudgePrecision(1)">↓</button>
-                      </div>
-                      @if (step !== null) { <span>{{ step | number:'1.0-6' }} 原图 px / 步</span> }
-                    }
-                  </div>
-                }
-                <div class="annotation" [class.precision-annotation]="precisionActive()" [style.aspect-ratio]="entry.snapshot.width + ' / ' + entry.snapshot.height">
+                <div class="precision-toolbar">
+                  <button type="button" [disabled]="!originalEditable()" [attr.aria-pressed]="precisionMode()" (click)="togglePrecision()">高精度调试</button>
+                  @if (precisionMode()) {
+                    <label>局部放大
+                      <select [ngModel]="precisionView().zoom" (ngModelChange)="setPrecisionZoom($event)" aria-label="局部放大倍率">
+                        @for (zoom of precisionZooms; track zoom) { <option [ngValue]="zoom">{{ zoom }}×</option> }
+                      </select>
+                    </label>
+                    <div class="precision-targets" role="group" aria-label="微调对象">
+                      @for (target of precisionTargets; track target.value) {
+                        <button type="button" [attr.aria-pressed]="precisionTarget() === target.value" [disabled]="points().length !== 2"
+                          (click)="selectPrecisionTarget(target.value)">{{ target.label }}</button>
+                      }
+                    </div>
+                    @let step = precisionStep();
+                    <div class="precision-targets" role="group" aria-label="每步移动一个屏幕像素">
+                      <button type="button" aria-label="上移一个屏幕像素" [disabled]="!originalEditable() || points().length !== 2 || step === null" (click)="nudgePrecision(-1)">↑</button>
+                      <button type="button" aria-label="下移一个屏幕像素" [disabled]="!originalEditable() || points().length !== 2 || step === null" (click)="nudgePrecision(1)">↓</button>
+                    </div>
+                    @if (step !== null) { <span>{{ step | number:'1.0-6' }} 原图 px / 步</span> }
+                  }
+                </div>
+                <div class="annotation" [class.precision-annotation]="precisionMode()" [style.aspect-ratio]="entry.snapshot.width + ' / ' + entry.snapshot.height">
                   @for (source of [entry]; track source.snapshotId) {
-                    <img [src]="source.snapshot.imageUrl" [class.ready]="singleImageId() === source.snapshotId && !precisionActive()" alt="当前复核原图"
+                    <img [src]="source.snapshot.imageUrl" [class.ready]="singleImageId() === source.snapshotId && !precisionMode()" alt="当前原图"
                       (load)="imageLoaded(source.snapshotId)" (error)="imageFailed(source.snapshotId)">
                   }
                   @if (singleImageId() !== entry.snapshotId) {
@@ -218,10 +210,10 @@
                   <svg #annotationCanvas [attr.viewBox]="originalViewBox()" tabindex="0" role="img" aria-label="海天线标注与理论线，红线下沿为标注"
                     (keydown)="annotationKeydown($event)" (wheel)="zoomAnnotation($event)"
                     (pointerdown)="startDrag($event)" (pointermove)="drag($event)" (pointerup)="endDrag($event)" (pointercancel)="endDrag($event)" (lostpointercapture)="endDrag($event)">
-                    @if (precisionActive() && singleImageId() === entry.snapshotId) {
+                    @if (precisionMode() && singleImageId() === entry.snapshotId) {
                       <image class="precision-source" [attr.href]="entry.snapshot.imageUrl" [attr.width]="entry.snapshot.width" [attr.height]="entry.snapshot.height" />
                     }
-                    @if (!sourceImage() && showNeighbors()) {
+                    @if (showNeighbors()) {
                       @for (reference of neighbors(); track reference.side) {
                         <g class="neighbor-reference" [class.previous]="reference.side === 'previous'" [class.next]="reference.side === 'next'" [class.ignored]="reference.ignored" aria-hidden="true">
                           @for (line of reference.lines; track $index) { <polyline [attr.points]="line" /> }
@@ -231,14 +223,14 @@
                         </g>
                       }
                     }
-                    @if (!sourceImage() && showGuide()) {
+                    @if (showGuide()) {
                       @for (line of singleGuide().lines; track $index) { <polyline class="guide-line" [attr.points]="line" /> }
                     }
                     @if (measurement(); as row) {
                       <g class="horizon-measurement" aria-hidden="true">
                         <defs><marker id="horizon-residual-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 8 4 L 0 8 z" /></marker></defs>
                         @for (line of row.theoreticalHorizon; track $index) { <polyline class="theoretical-line" [attr.points]="imageLinePoints(line, entry)" /> }
-                        @for (residual of precisionActive() ? [] : row.verticalResiduals; track residual.position) {
+                        @for (residual of precisionMode() ? [] : row.verticalResiduals; track residual.position) {
                           @if (residual.theoreticalY !== null) {
                             <line class="residual-arrow" [attr.x1]="residual.x * row.width" [attr.x2]="residual.x * row.width"
                               [attr.y1]="residual.theoreticalY * row.height" [attr.y2]="residual.observedY * row.height" marker-end="url(#horizon-residual-arrow)" />
@@ -248,42 +240,38 @@
                         }
                       </g>
                     }
-                    @if (displayedPoints().length === 2) {
-                      @let x1 = displayedPoints()[0].x * entry.snapshot.width;
-                      @let y1 = displayedPoints()[0].y * entry.snapshot.height;
-                      @let x2 = displayedPoints()[1].x * entry.snapshot.width;
-                      @let y2 = displayedPoints()[1].y * entry.snapshot.height;
+                    @if (points().length === 2) {
+                      @let x1 = points()[0].x * entry.snapshot.width;
+                      @let y1 = points()[0].y * entry.snapshot.height;
+                      @let x2 = points()[1].x * entry.snapshot.width;
+                      @let y2 = points()[1].y * entry.snapshot.height;
                       <defs><clipPath id="original-horizon-upper-clip"><polygon [attr.points]="originalLineClip()" /></clipPath></defs>
                       <line class="edited-line" clip-path="url(#original-horizon-upper-clip)" [attr.x1]="x1" [attr.y1]="y1" [attr.x2]="x2" [attr.y2]="y2" />
-                      @if (precisionActive()) {
+                      @if (precisionMode()) {
                         <line class="precision-line-hit" data-annotation-line aria-hidden="true" [attr.x1]="x1" [attr.y1]="y1" [attr.x2]="x2" [attr.y2]="y2" />
                       }
-                      @if (!sourceImage()) {
-                        @for (point of displayedPoints(); track $index) {
-                          <circle [attr.data-annotation-endpoint]="$index" [class.precision-selected]="precisionActive() && precisionTarget() === $index"
-                            [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height"
-                            [attr.r]="entry.snapshot.width / (100 * originalView().zoom)" />
-                        }
+                      @for (point of points(); track $index) {
+                        <circle [attr.data-annotation-endpoint]="$index" [class.precision-selected]="precisionMode() && precisionTarget() === $index"
+                          [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height"
+                          [attr.r]="entry.snapshot.width / (100 * originalView().zoom)" />
                       }
                     }
                   </svg>
                 </div>
               }
               <div class="legend reference-legend"><span><i class="edited-swatch" aria-hidden="true"></i>当前标注（红线下沿）</span>
-                @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>{{ theoreticalLabel() }}</span> }
-                @if (!sourceImage()) {
-                  <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
-                  <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
-                  @for (reference of neighbors(); track reference.side) {
-                    <span [class.reference-ignored]="reference.ignored"><i [class.previous-swatch]="reference.side === 'previous'" [class.next-swatch]="reference.side === 'next'" aria-hidden="true"></i>{{ reference.label }}：{{ reference.state }}</span>
-                  }
+                @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>零位候选理论海天线</span> }
+                <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
+                <label><input type="checkbox" [ngModel]="showGuide()" (ngModelChange)="cancelGuideDrawing(); showGuide.set($event)"><i class="guide-swatch" aria-hidden="true"></i>全景参考线</label>
+                @for (reference of neighbors(); track reference.side) {
+                  <span [class.reference-ignored]="reference.ignored"><i [class.previous-swatch]="reference.side === 'previous'" [class.next-swatch]="reference.side === 'next'" aria-hidden="true"></i>{{ reference.label }}：{{ reference.state }}</span>
                 }
               </div>
-              @if (!sourceImage() && showGuide() && singleGuide().error) { <p class="error" role="alert">全景参考线映射失败：{{ singleGuide().error }}</p> }
-              @if (measuring()) { <p class="image-info" role="status">正在计算{{ measurementLabel() }}…</p> }
+              @if (showGuide() && singleGuide().error) { <p class="error" role="alert">全景参考线映射失败：{{ singleGuide().error }}</p> }
+              @if (measuring()) { <p class="image-info" role="status">正在计算理论海天线…</p> }
               @if (measurement(); as row) {
                 <section class="measurement" aria-label="原图海天线测量">
-                  <h4>{{ measurementLabel() }}</h4>
+                  <h4>候选海天线对照</h4>
                   <dl class="measurement-metrics">
                     @for (residual of row.verticalResiduals; track residual.position) {
                       <div><dt>{{ residualPositions[residual.position] }}垂直偏差</dt><dd>
@@ -303,32 +291,30 @@
                 </section>
               }
               @if (measurementExclusion(); as reason) { <p class="image-info" role="status">本图已排除：{{ reason }}</p> }
-              @if (!sourceImage()) {
-                <fieldset [disabled]="!originalEditable()">
-                  <div class="annotation-actions">
-                    <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
-                    <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
-                      <button type="button" class="primary" [disabled]="!dirty()" (click)="save()"><app-icon name="save" />保存标注</button></div>
-                  </div>
-                  @if (precisionActive() && points().length) { <div class="coordinate-unit">原图像素</div> }
-                  <div class="coordinates">
-                    @for (point of points(); track $index; let i = $index) {
-                      <div class="coordinate-point"><span>端点 {{ i + 1 }}</span>
-                        <label>X<input type="number" min="0" [max]="precisionActive() ? entry.snapshot.width : 1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'"
-                          [ngModel]="annotationCoordinate(point.x, entry.snapshot.width)" (ngModelChange)="editAnnotationCoordinate(i, 'x', $event, entry.snapshot.width)"></label>
-                        <label>Y<input type="number" min="0" [max]="precisionActive() ? entry.snapshot.height : 1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'"
-                          [ngModel]="annotationCoordinate(point.y, entry.snapshot.height)" (ngModelChange)="editAnnotationCoordinate(i, 'y', $event, entry.snapshot.height)"></label>
-                      </div>
-                    }
-                  </div>
-                </fieldset>
-              }
+              <fieldset [disabled]="!originalEditable()">
+                <div class="annotation-actions">
+                  <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
+                  <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
+                    <button type="button" class="primary" [disabled]="!dirty()" (click)="save()"><app-icon name="save" />保存标注</button></div>
+                </div>
+                @if (precisionMode() && points().length) { <div class="coordinate-unit">原图像素</div> }
+                <div class="coordinates">
+                  @for (point of points(); track $index; let i = $index) {
+                    <div class="coordinate-point"><span>端点 {{ i + 1 }}</span>
+                      <label>X<input type="number" min="0" [max]="precisionMode() ? entry.snapshot.width : 1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'"
+                        [ngModel]="annotationCoordinate(point.x, entry.snapshot.width)" (ngModelChange)="editAnnotationCoordinate(i, 'x', $event, entry.snapshot.width)"></label>
+                      <label>Y<input type="number" min="0" [max]="precisionMode() ? entry.snapshot.height : 1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'"
+                        [ngModel]="annotationCoordinate(point.y, entry.snapshot.height)" (ngModelChange)="editAnnotationCoordinate(i, 'y', $event, entry.snapshot.height)"></label>
+                    </div>
+                  }
+                </div>
+              </fieldset>
               @if (entry.ignoreReason && !dirty()) { <p class="note">{{ entry.ignoreReason }}</p> }
               @if (entry.detection?.error; as detectionError) { <p class="error">{{ detectionError }}</p> }
               @for (warning of entry.detection?.warnings || []; track $index) { <p class="note">{{ warning }}</p> }
               @let pixels = residual(entry.snapshotId);
               @if (pixels !== undefined) { <p class="note">本图拟合残差：{{ pixels | number:'1.2-2' }} 像素</p> }
-            } @else { <p class="empty editor-empty">{{ running() ? '正在读取本地模型，请等待识别结果。' : '选择截图复核海天线。' }}</p> }
+            } @else { <p class="empty editor-empty">{{ running() ? '正在读取本地模型，请等待识别结果。' : '选择截图与标注海天线。' }}</p> }
           </section>
           <section class="images-panel" aria-label="识别截图列表">
             <div class="section-heading"><h3>截图列表</h3><span>{{ items().length }} 张已加载</span></div>
@@ -337,22 +323,68 @@
                 <button type="button" class="image-row" [class.current]="selectedItemId() === entry.snapshotId" [class.ignored]="entry.ignored || entry.missing" [class.missing]="entry.missing"
                   [attr.aria-current]="selectedItemId() === entry.snapshotId ? 'true' : null" [disabled]="busy() || loading() || guideDrawing() !== null" (click)="openItem(entry)">
                   <span class="thumbnail">
-                    @if (!entry.missing) { <img [src]="entry.snapshot.imageUrl" loading="lazy" alt="待复核截图"> }
+                    @if (!entry.missing) { <img [src]="entry.snapshot.imageUrl" loading="lazy" alt="识别截图"> }
                     @else { <app-icon name="image" /> }
                     @if (selectedItemId() === entry.snapshotId) { <span class="selection-marker">当前选中</span> }
                   </span>
                   <span class="image-pan">P {{ entry.snapshot.ptz.raw.Pan | number:'1.1-2' }}°</span>
                   <span class="image-status">{{ entry.missing ? '原图已删除' : entry.ignored ? '已忽略' : '参与计算' }}</span>
                 </button>
-              } @empty { <p class="empty">{{ running() ? '识别结果将显示在这里。' : '暂无可复核截图。' }}</p> }
+              } @empty { <p class="empty">{{ running() ? '识别结果将显示在这里。' : '暂无截图。' }}</p> }
               @if (nextItemOffset() !== null) { <button type="button" class="more" [disabled]="loading() || busy() || generatingPanorama()" (click)="loadMore('items')">更多截图</button> }
             </div>
           </section>
         </section>
-        <section class="result" aria-label="安装参数计算结果">
-          <div class="section-heading"><h2>{{ coarse() ? '粗标定参数' : '安装参数' }}</h2></div>
-          @if (task.result; as result) {
-            <p class="result-message" [class.error]="result.status !== 'estimated'">{{ result.message }}</p>
+        <section class="result" aria-label="姿态拟合结果">
+          <div class="section-heading"><h2>{{ !zeroPoseCandidate() && task.result ? '历史四参数拟合结果' : '零位姿态拟合结果' }}</h2></div>
+          @if (zeroPoseCandidate(); as candidate) {
+            <p class="result-message" [class.error]="candidate.status !== 'estimated'">{{ candidate.message }}</p>
+            @if (candidate.stale) { <p class="error">候选已过期。{{ candidate.staleReasons.join('，') }}</p> }
+            <p class="note">本任务普通拟合 · {{ candidate.model }} · 标注版本 {{ candidate.revision }} · 相机配置 {{ candidate.generatedCamera.updatedAt | date:'yyyy-MM-dd HH:mm:ss' }}</p>
+            <table><tbody>
+              <tr><th scope="row">Yaw（沿用）</th><td>{{ candidate.fixedCalibration.yaw | number:'1.6-6' }}°</td></tr>
+              @if (candidate.zeroPose; as pose) {
+                <tr><th scope="row">Pitch</th><td>{{ pose.pitch | number:'1.6-6' }}°</td></tr>
+                <tr><th scope="row">Roll</th><td>{{ pose.roll | number:'1.6-6' }}°</td></tr>
+              }
+            </tbody></table>
+            <button type="button" class="primary apply-button" [disabled]="!canApplyZeroPose(candidate)" (click)="applyZeroPose()">
+              <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '零位候选已应用' : '应用零位候选到摄像头' }}</button>
+            <dl class="result-metrics">
+              <div><dt>参与原图</dt><dd>{{ candidate.sourceSnapshotIds.length }}<small>张</small></dd></div>
+              <div><dt>P 覆盖</dt><dd>{{ candidate.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
+              <div><dt>P 方向</dt><dd>{{ candidate.distinctPanCount }}<small>个</small></dd></div>
+              @if (candidate.diagnostics; as quality) {
+                <div><dt>像素 RMS</dt><dd>{{ quality.rmsResidualPixels | number:'1.2-2' }}<small>px</small></dd></div>
+                <div><dt>角度 RMS</dt><dd>{{ quality.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div>
+                <div><dt>{{ quality.converged ? '已收敛' : '未收敛' }} · 条件数</dt><dd>{{ quality.conditionNumber === null ? '不可辨识' : (quality.conditionNumber | number:'1.0-2') }}</dd></div>
+              }
+            </dl>
+            @if (previewingZeroPose()) {
+              <button type="button" (click)="stopZeroPosePreview()">关闭零位预览</button>
+            }
+            @if (candidate.diagnostics; as quality) {
+              <details><summary>参与原图与误差</summary>
+                <div class="candidate-table">
+                  <table>
+                    <thead><tr><th scope="col">P / T / Z</th><th scope="col">RMS（px）</th><th scope="col">RMS（°）</th></tr></thead>
+                    <tbody>@for (row of quality.perSnapshot; track row.snapshotId) {
+                      <tr><th scope="row"><button type="button" [disabled]="!canPreviewZeroPose()"
+                        [attr.aria-pressed]="previewingZeroPose() && item()?.snapshotId === row.snapshotId"
+                        (click)="previewZeroPose(row.snapshotId)">{{ row.pan | number:'1.1-2' }}° / {{ row.tilt | number:'1.1-2' }}° / {{ row.zoom }}</button></th>
+                        <td>{{ row.rmsResidualPixels | number:'1.2-2' }}</td><td>{{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td></tr>
+                    }</tbody>
+                  </table>
+                </div>
+              </details>
+            }
+            @if (candidate.excluded.length) {
+              <details><summary>排除 {{ candidate.excluded.length }} 张截图</summary><ul>
+                @for (entry of candidate.excluded; track entry.snapshotId) { <li>{{ entry.snapshotId }} · {{ entry.reason }}</li> }
+              </ul></details>
+            }
+          } @else if (task.result; as result) {
+            @if (result.status !== 'estimated') { <p class="result-message error">{{ result.message }}</p> }
             <dl class="result-metrics">
               <div><dt>有效截图</dt><dd>{{ result.sourceSnapshotIds.length }}<small>张</small></dd></div>
               <div><dt>P 覆盖</dt><dd>{{ result.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
@@ -361,344 +393,24 @@
                 @if (quality.rmsAngularResidualDegrees !== undefined) { <div class="residual"><dt>角度均方根残差</dt><dd>{{ quality.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div> }
               }
             </dl>
-            @if (result.installation; as installation) {
+            @if (historicalFitAngles(); as angles) {
               <table><thead><tr><th scope="col">参数</th><th scope="col">计算前</th><th scope="col">生成值</th></tr></thead><tbody>
-                @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ task.fitCamera?.[field.key] | number:'1.4-4' }}°</td><td>{{ installation[field.key] | number:'1.4-4' }}°</td></tr> }
+                @for (field of zeroPoseFields; track field.key) {
+                  <tr><th scope="row">{{ field.label }}</th><td>{{ angles.before[field.key] | number:'1.6-6' }}°</td>
+                    <td>{{ angles.after[field.key] | number:'1.6-6' }}°</td></tr>
+                }
               </tbody></table>
             }
-            @if (!coarse()) {
-              <button type="button" class="primary apply-button" [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || !sourceGroup() || result.status !== 'estimated' || task.appliedRevision === task.revision"
-                (click)="apply()"><app-icon [name]="task.appliedRevision === task.revision ? 'check' : 'save'" />{{ task.appliedRevision === task.revision ? '已应用' : '应用到摄像头' }}</button>
-            }
+            @if (result.applied) { <p class="note">历史结果曾应用</p> }
             @for (warning of result.warnings || []; track $index) { <p class="note">{{ warning }}</p> }
             @if (result.excluded.length) {
               <details><summary>排除 {{ result.excluded.length }} 张截图</summary><ul>@for (excluded of result.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }</ul></details>
             }
-          } @else {
-            <div class="result-empty"><app-icon name="target" /><p>{{ running() ? '识别完成后可生成安装参数' : '复核标注、忽略异常图片后，点击“生成安装参数”。' }}</p></div>
+          } @else if (!coarse()) {
+            <div class="result-empty"><app-icon name="target" /><p>{{ running() ? '识别完成后可生成零位姿态' : '检查标注后，点击“生成零位姿态”。' }}</p></div>
           }
           @if (coarse()) { <p class="note">历史预扫粗结果仅供查看，不应用到摄像头配置。</p> }
-          @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，仍需逐图复核。</p> }
-          <p class="note">修改标注后需重新生成参数。四参数复核自动更新，零位复核需再次提交。</p>
-          @if (zeroPoseCandidate(); as candidate) {
-            <section class="validation-section" aria-label="零位姿态候选">
-              <div class="section-heading"><h2>零位姿态候选</h2></div>
-              <p class="result-message" [class.error]="candidate.status !== 'estimated'">{{ candidate.message }}</p>
-              @if (candidate.stale) { <p class="error">候选已过期。{{ candidate.staleReasons.join('，') }}</p> }
-              <p class="note">本任务普通拟合 · {{ candidate.model }} · 标注版本 {{ candidate.revision }} · 相机配置 {{ candidate.generatedCamera.updatedAt | date:'yyyy-MM-dd HH:mm:ss' }}</p>
-              <table><tbody>
-                @if (candidate.zeroPose; as pose) {
-                  <tr><th scope="row">零位 Roll</th><td>{{ pose.roll | number:'1.4-4' }}°</td></tr>
-                  <tr><th scope="row">零位 Pitch</th><td>{{ pose.pitch | number:'1.4-4' }}°</td></tr>
-                }
-                <tr><th scope="row">固定 Yaw</th><td>{{ candidate.fixedCalibration.yaw | number:'1.4-4' }}°</td></tr>
-                <tr><th scope="row">固定 T 补偿</th><td>{{ candidate.fixedCalibration.tiltOffset | number:'1.4-4' }}°</td></tr>
-              </tbody></table>
-              <p class="note" [class.error]="!!candidate.validationStaleReason" role="status">{{ zeroPoseValidationStatus(candidate) }}
-                @if (candidate.validation; as evidence) { · {{ evidence.generatedAt | date:'MM-dd HH:mm:ss' }} · {{ evidence.validation.sourceSnapshotIds.length }} 张原图 }
-              </p>
-              <button type="button" class="primary apply-button" [disabled]="!canApplyZeroPose(candidate)" (click)="applyZeroPose(false)">
-                <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '零位候选已应用' : '应用零位候选到摄像头' }}</button>
-              <dl class="result-metrics">
-                <div><dt>参与原图</dt><dd>{{ candidate.sourceSnapshotIds.length }}<small>张</small></dd></div>
-                <div><dt>P 覆盖</dt><dd>{{ candidate.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
-                <div><dt>P 方向</dt><dd>{{ candidate.distinctPanCount }}<small>个</small></dd></div>
-                @if (candidate.diagnostics; as quality) {
-                  <div><dt>像素 RMS</dt><dd>{{ quality.rmsResidualPixels | number:'1.2-2' }}<small>px</small></dd></div>
-                  <div><dt>角度 RMS</dt><dd>{{ quality.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div>
-                  <div><dt>{{ quality.converged ? '已收敛' : '未收敛' }} · 条件数</dt><dd>{{ quality.conditionNumber === null ? '不可辨识' : (quality.conditionNumber | number:'1.0-2') }}</dd></div>
-                }
-              </dl>
-              @if (comparisonMode() === 'zero-pose') {
-                <button type="button" (click)="stopZeroPosePreview()">关闭零位预览</button>
-              }
-              @if (candidate.diagnostics; as quality) {
-                <details><summary>参与原图与误差</summary>
-                  <div class="validation-table">
-                    <table>
-                      <thead><tr><th scope="col">P / T / Z</th><th scope="col">RMS（px）</th><th scope="col">RMS（°）</th></tr></thead>
-                      <tbody>@for (row of quality.perSnapshot; track row.snapshotId) {
-                        <tr><th scope="row"><button type="button" [disabled]="!canPreviewZeroPose()"
-                          [attr.aria-pressed]="comparisonMode() === 'zero-pose' && displayedItem()?.snapshotId === row.snapshotId"
-                          (click)="previewZeroPose(row.snapshotId)">{{ row.pan | number:'1.1-2' }}° / {{ row.tilt | number:'1.1-2' }}° / {{ row.zoom }}</button></th>
-                          <td>{{ row.rmsResidualPixels | number:'1.2-2' }}</td><td>{{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td></tr>
-                      }</tbody>
-                    </table>
-                  </div>
-                </details>
-              }
-              @if (candidate.excluded.length) {
-                <details><summary>排除 {{ candidate.excluded.length }} 张截图</summary><ul>
-                  @for (entry of candidate.excluded; track entry.snapshotId) { <li>{{ entry.snapshotId }} · {{ entry.reason }}</li> }
-                </ul></details>
-              }
-            </section>
-          }
-          <section class="validation-section" aria-label="基础与高倍联合精修">
-            <div class="section-heading"><h2>联合精修</h2></div>
-            <label class="validation-source">基础标定结果
-              <select [ngModel]="refinementBaseKey()" (ngModelChange)="selectRefinementBase($event)"
-                [disabled]="busy() || loading() || running() || generatingPanorama()">
-                <option value="">选择合格基础结果</option>
-                @for (reference of refinementSourceOptions(); track reference.key) {
-                  <option [value]="reference.key">{{ reference.result.model === 'wgs84-horizon-zero-pose-v1' ? '零位候选' : '四参数结果' }} · {{ reference.task.createdAt | date:'MM-dd HH:mm:ss' }} · Z {{ calibrationZoom(reference.result) }} · {{ reference.result.sourceSnapshotIds.length }} 张</option>
-                }
-              </select>
-            </label>
-            <details class="refinement-sources"><summary>补充高倍任务（已选 {{ refinementSupplementalIds().length }}）</summary>
-              @for (source of refinementSupplementalSources(); track source.id) {
-                <label><input type="checkbox" [ngModel]="refinementSupplementalIds().includes(source.id)"
-                  (ngModelChange)="selectRefinementSupplemental(source.id, $event)" [disabled]="busy() || loading() || running() || generatingPanorama()">
-                  {{ source.createdAt | date:'MM-dd HH:mm:ss' }} · {{ source.sampleCount }} 张</label>
-              }
-            </details>
-            @if (nextTaskOffset() !== null) {
-              <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多来源任务</button>
-            }
-            <p class="note">当前任务属于高倍组。基础组与高倍组各占一半权重；高倍任务无需单独拟合。来源选择立即保存。</p>
-            <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || !task.refinementSelection?.base"
-              (click)="refine()">生成联合精修候选</button>
-            @if (task.refinementSelection?.base) {
-              <div class="actions refinement-modes" aria-label="原图参数对照">
-                <button type="button" [attr.aria-pressed]="comparisonMode() === 'before'" (click)="selectComparisonMode('before')"
-                  [disabled]="busy() || loading() || running() || dirty() || generatingPanorama()">基准理论线</button>
-                <button type="button" [attr.aria-pressed]="comparisonMode() === 'after'" (click)="selectComparisonMode('after')"
-                  [disabled]="busy() || loading() || running() || dirty() || generatingPanorama() || !refinement() || refinement()?.stale">候选理论线</button>
-              </div>
-            }
-            @if (refinement(); as candidate) {
-              <p class="result-message" [class.error]="candidate.stale || candidate.status === 'unreliable' || candidate.status === 'insufficient_data'" role="status">
-                {{ candidate.stale ? '精修候选已过期' : candidate.message }}</p>
-              @if (candidate.stale) { <ul class="error">@for (reason of candidate.staleReasons; track $index) { <li>{{ reason }}</li> }</ul> }
-              <table><thead><tr><th scope="col">参数</th><th scope="col">基准值</th><th scope="col">{{ candidate.status === 'unreliable' ? '求解值' : '候选值' }}</th></tr></thead><tbody>
-                @if (candidate.model === 'wgs84-horizon-zero-pose-v1') {
-                  @for (field of refinementZeroPoseFields; track field.key) {
-                    <tr><th scope="row">{{ field.label }}</th><td>{{ candidate.before.zeroPose[field.key] | number:'1.4-4' }}°</td>
-                      <td>{{ candidate.after.zeroPose[field.key] | number:'1.4-4' }}°</td></tr>
-                  }
-                } @else {
-                  @for (field of fields; track field.key) {
-                    <tr><th scope="row">{{ field.label }}</th><td>{{ candidate.before.installation[field.key] | number:'1.4-4' }}°</td>
-                      <td>{{ candidate.after.installation[field.key] | number:'1.4-4' }}°</td></tr>
-                  }
-                }
-              </tbody></table>
-              @if (candidate.model === 'wgs84-horizon-refinement-v1') {
-                <button type="button" class="primary apply-button" (click)="applyRefinement()"
-                  [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || candidate.status !== 'estimated' || candidate.stale || candidate.applied">
-                  <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '精修已应用' : '应用精修到摄像头' }}</button>
-              } @else {
-                <p class="note" [class.error]="!!candidate.validationStaleReason" role="status">{{ zeroPoseValidationStatus(candidate) }}
-                  @if (candidate.validation; as evidence) { · {{ evidence.generatedAt | date:'MM-dd HH:mm:ss' }} · {{ evidence.validation.sourceSnapshotIds.length }} 张原图 }
-                </p>
-                <button type="button" class="primary apply-button" [disabled]="!canApplyZeroPose(candidate)" (click)="applyZeroPose(true)">
-                  <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '零位精修已应用' : '应用零位精修到摄像头' }}</button>
-              }
-              <div class="validation-table" tabindex="0" role="region" aria-label="联合精修分组前后误差">
-                <table><thead><tr><th scope="col">组</th><th scope="col">有效图</th><th scope="col">Z</th><th scope="col">P 覆盖</th>
-                  <th scope="col">RMS 前→后(px)</th><th scope="col">角度 RMS 前→后(°)</th></tr></thead><tbody>
-                  @for (group of refinementGroups; track group.key) {
-                    @let before = candidate.before[group.key]; @let after = candidate.after[group.key];
-                    <tr [class.validation-failed]="after.rmsResidualPixels !== null && after.rmsResidualPixels > candidate.maximumAcceptedRmsPixels">
-                      <th scope="row">{{ group.label }}</th><td>{{ after.sampleCount }}</td><td>{{ after.zoomRange?.min | number:'1.1-1' }}～{{ after.zoomRange?.max | number:'1.1-1' }}</td>
-                      <td>{{ after.panCoverageDegrees | number:'1.1-1' }}°</td>
-                      <td>{{ before.rmsResidualPixels | number:'1.2-2' }} → {{ after.rmsResidualPixels | number:'1.2-2' }}</td>
-                      <td>{{ before.rmsAngularResidualDegrees | number:'1.4-4' }} → {{ after.rmsAngularResidualDegrees | number:'1.4-4' }}</td>
-                    </tr>
-                  }
-                </tbody></table>
-              </div>
-              <p class="note">联合稳健目标：{{ candidate.before.objective | number:'1.6-6' }} → {{ candidate.after.objective | number:'1.6-6' }}；
-                收敛：{{ candidate.diagnostics.converged ? '是' : '否' }}；条件数：{{ candidate.diagnostics.conditionNumber | number:'1.2-2' }}。</p>
-              <details><summary>逐图前后误差（{{ candidate.sourceSnapshotIds.length }} 张）</summary>
-                <div class="validation-table" tabindex="0" role="region" aria-label="联合精修逐图前后误差">
-                  <table><thead><tr><th scope="col">组</th><th scope="col">P/T/Z</th><th scope="col">尺寸</th><th scope="col">RMS 前→后(px)</th>
-                    <th scope="col">角度 RMS 前→后(°)</th><th scope="col">左/中/右偏差 前→后(px)</th><th scope="col">方向差 前→后(°)</th></tr></thead><tbody>
-                    @for (row of candidate.after.perSnapshot; track row.snapshotId; let index = $index) {
-                      @let before = candidate.before.perSnapshot[index];
-                      <tr><th scope="row" [title]="row.taskId">{{ row.group === 'base' ? '基础' : '高倍' }}</th>
-                        <td><button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama() || guideDrawing() !== null || candidate.stale" (click)="openRefinementItem(row.snapshotId, row.taskId)">
-                          {{ row.pan | number:'1.2-2' }}/{{ row.tilt | number:'1.2-2' }}/{{ row.zoom | number:'1.1-1' }}</button></td>
-                        <td>{{ row.width }}×{{ row.height }}</td><td>{{ before.rmsResidualPixels | number:'1.2-2' }} → {{ row.rmsResidualPixels | number:'1.2-2' }}</td>
-                        <td>{{ before.rmsAngularResidualDegrees | number:'1.4-4' }} → {{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td>
-                        <td>@for (residual of row.verticalResiduals; track residual.position; let pointIndex = $index) {
-                          {{ $first ? '' : ' / ' }}{{ signedResidual(before.verticalResiduals[pointIndex].offsetPixels) }} → {{ signedResidual(residual.offsetPixels) }}
-                        }</td><td>{{ signedResidual(before.directionDifferenceDegrees) }} → {{ signedResidual(row.directionDifferenceDegrees) }}</td>
-                      </tr>
-                    }
-                  </tbody></table>
-                </div>
-              </details>
-              @if (candidate.excluded.length) {
-                <details><summary>排除 {{ candidate.excluded.length }} 张截图</summary><ul>
-                  @for (excluded of candidate.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }
-                </ul></details>
-              }
-              <p class="note">{{ candidate.model }} · {{ candidate.generatedAt | date:'MM-dd HH:mm:ss' }}。参与图对照用于比较精修前后，不属于独立复核。画面与姿态严格同步尚未验证。</p>
-            }
-          </section>
-          <section class="validation-section" aria-label="独立复核安装参数">
-            <div class="section-heading"><h2>独立复核</h2></div>
-            <label class="validation-source">独立复核来源
-              <select [ngModel]="validationReferenceId()" (ngModelChange)="selectValidationSource($event)"
-                [disabled]="busy() || loading() || running() || generatingPanorama()">
-                <option value="">选择已生成的合格结果</option>
-                @for (reference of validationSources(); track reference.key) {
-                  <option [value]="reference.key">{{ validationSourceLabels[reference.kind] }} · {{ reference.task.createdAt | date:'MM-dd HH:mm:ss' }} · {{ reference.sourceSnapshotIds.length }} 张</option>
-                }
-              </select>
-            </label>
-            @if (validationSource(); as reference) {
-              @if ('zeroPose' in reference) {
-                <table><thead><tr><th scope="col">固定零位参数</th><th scope="col">值</th></tr></thead><tbody>
-                  <tr><th scope="row">Roll</th><td>{{ reference.zeroPose.roll | number:'1.4-4' }}°</td></tr>
-                  <tr><th scope="row">Pitch</th><td>{{ reference.zeroPose.pitch | number:'1.4-4' }}°</td></tr>
-                  <tr><th scope="row">Yaw</th><td>{{ reference.zeroPose.yaw | number:'1.4-4' }}°</td></tr>
-                  <tr><th scope="row">T 补偿</th><td>{{ reference.zeroPose.tiltOffset | number:'1.4-4' }}°</td></tr>
-                </tbody></table>
-                <fieldset class="validation-criteria" [disabled]="busy() || loading() || measuring() || running() || generatingPanorama()">
-                  <legend>按复拍与重标填写验收门槛</legend>
-                  @for (field of validationCriteriaFields; track field.key) {
-                    <label>{{ field.label }} <input type="number" step="any" [min]="field.min"
-                      [ngModel]="validationCriteriaDraft()[field.key]" (ngModelChange)="setValidationCriterion(field.key, $event)"></label>
-                  }
-                </fieldset>
-              } @else {
-                <p class="result-message">{{ validationSourceLabels[reference.kind] }}有效
-                  · {{ (reference.kind === 'refinement' ? reference.task.refinement?.applied : reference.task.result?.applied) ? '已应用' : '未应用' }}</p>
-                <table><thead><tr><th scope="col">固定参数</th><th scope="col">值</th></tr></thead><tbody>
-                  @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ reference.installation[field.key] | number:'1.4-4' }}°</td></tr> }
-                </tbody></table>
-              }
-              @if (reference.kind === 'refinement' || reference.kind === 'zero-pose-refinement') {
-                <details><summary>精修来源（{{ reference.task.refinement?.sources.length }} 个任务）</summary><ul>
-                  @for (source of reference.task.refinement?.sources; track source.taskId) {
-                    <li>{{ source.role === 'base' ? '基础' : '高倍' }} · {{ source.taskId }} · {{ source.sourceSnapshotIds.length }} 张参与图</li>
-                  }
-                </ul></details>
-              }
-            }
-            @if (nextTaskOffset() !== null) {
-              <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多标定任务</button>
-            }
-            <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || measuring() || !validationSource()
-                || (validationNeedsCriteria() && !validationCriteria())"
-              (click)="validate()">{{ validationNeedsCriteria() ? '提交零位独立复核' : '复核本任务截图' }}</button>
-            @if (zeroPoseComparison(); as assessment) {
-              <p class="result-message" [class.error]="assessment.status !== 'passed'" role="status">{{ assessment.message }}</p>
-              @if (assessment.status === 'passed') {
-                <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadTask(assessment.reference.taskId)">打开已复核候选</button>
-              }
-              <p class="note">低倍 {{ assessment.coverage.lowSnapshotCount }} 张 · 高倍 {{ assessment.coverage.highSnapshotCount }} 张
-                · 高倍可比较 {{ assessment.coverage.comparableHighSnapshotCount }} 张／{{ assessment.coverage.distinctPanCount }} 个 P 方位
-                · P 覆盖 {{ assessment.coverage.panCoverageDegrees | number:'1.2-2' }}°</p>
-              @if (assessment.coverage.reasons.length) {
-                <ul class="result-message">
-                  @for (reason of assessment.coverage.reasons; track reason) { <li>{{ reason }}</li> }
-                </ul>
-              }
-              @if (assessment.perSnapshot.length) {
-                <p class="note">总体 RMS（生效{{ assessment.baseline.model === 'wgs84-horizon-zero-pose-v1' ? '零位' : '四参数' }} → 零位候选）
-                  {{ assessment.baseline.rmsResidualPixels | number:'1.2-2' }} → {{ assessment.candidate.rmsResidualPixels | number:'1.2-2' }} px</p>
-                <div class="actions validation-models" role="group" aria-label="原图理论海天线">
-                  <button type="button" [attr.aria-pressed]="comparisonMode() === 'validation' && validationModel() === 'baseline'"
-                    (click)="selectValidationModel('baseline')">生效模型理论线</button>
-                  <button type="button" [attr.aria-pressed]="comparisonMode() === 'validation' && validationModel() === 'candidate'"
-                    (click)="selectValidationModel('candidate')">候选理论线</button>
-                </div>
-                <div class="validation-table" tabindex="0" role="region" aria-label="逐图新旧模型误差对照">
-                  <table><thead><tr><th scope="col">P/T/Z</th><th scope="col">尺寸</th><th scope="col">RMS 旧→新 (px)</th>
-                    <th scope="col">左／中／右垂直偏差 旧→新 (px，下为正)</th><th scope="col">方向差 旧→新 (°，顺时针为正)</th>
-                    <th scope="col">逐图判定</th></tr></thead><tbody>
-                    @for (row of assessment.perSnapshot; track row.snapshotId) {
-                      <tr [class.validation-failed]="row.failures.length || !row.candidateComparable">
-                        <th scope="row"><button type="button" [disabled]="busy() || loading() || generatingPanorama()"
-                          (click)="openValidationItem(row.snapshotId)" [title]="row.snapshotId">
-                          {{ row.pan | number:'1.2-2' }}/{{ row.tilt | number:'1.2-2' }}/{{ row.zoom | number:'1.1-1' }}
-                        </button><small>{{ row.zoomGroup === 'high' ? '高倍' : '低倍' }}</small></th>
-                        <td>{{ row.candidate.width }}×{{ row.candidate.height }}</td>
-                        <td>{{ row.baseline.rmsResidualPixels | number:'1.2-2' }} → {{ row.candidate.rmsResidualPixels | number:'1.2-2' }}</td>
-                        <td>@for (residual of row.candidate.verticalResiduals; track residual.position; let index = $index) {
-                          {{ $first ? '' : ' / ' }}{{ signedResidual(row.baseline.verticalResiduals[index].offsetPixels) }} → {{ signedResidual(residual.offsetPixels) }}
-                        }</td>
-                        <td>{{ signedResidual(row.baseline.directionDifferenceDegrees, 4) }} → {{ signedResidual(row.candidate.directionDifferenceDegrees, 4) }}</td>
-                        <td>
-                          @if (row.failures.length) { <div>超差 · {{ row.failures.join('、') }}</div> }
-                          @if (row.regressions.length) { <div>较旧版退化 · {{ row.regressions.join('、') }}</div> }
-                          @if (!row.baselineComparable) { <div>旧版有不可比较项</div> }
-                          @if (!row.candidateComparable) { <div>新版有不可比较项</div> }
-                          @if (!row.failures.length && row.baselineComparable && row.candidateComparable) { 通过 }
-                        </td>
-                      </tr>
-                    }
-                  </tbody></table>
-                </div>
-              }
-              @if (assessment.excluded.length) {
-                <details><summary>排除 {{ assessment.excluded.length }} 张截图</summary><ul>
-                  @for (excluded of assessment.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }} · {{ excluded.reason }}</li> }
-                </ul></details>
-              }
-              <details>
-                <summary>复核证据 · {{ assessment.generatedAt | date:'MM-dd HH:mm:ss' }}</summary>
-                @let baseline = assessment.baseline;
-                <table><thead><tr><th scope="col">生效参数</th><th scope="col">值</th></tr></thead><tbody>
-                  @if (baseline.model === 'wgs84-horizon-zero-pose-v1') {
-                    @for (field of refinementZeroPoseFields; track field.key) {
-                      <tr><th scope="row">{{ field.label }}</th><td>{{ baseline.zeroPose[field.key] | number:'1.4-4' }}°</td></tr>
-                    }
-                  } @else {
-                    @for (field of fields; track field.key) {
-                      <tr><th scope="row">{{ field.label }}</th><td>{{ baseline.installation[field.key] | number:'1.4-4' }}°</td></tr>
-                    }
-                  }
-                </tbody></table>
-                <ul>
-                  <li>证据 v{{ assessment.evidence.version }} · {{ assessment.evidence.id }}</li>
-                  <li>{{ assessment.baseline.model }} · 相机配置 {{ assessment.evidence.camera.updatedAt }}</li>
-                  @for (source of assessment.evidence.baseline.sources; track source.resultId) {
-                    <li>生效标定来源 · {{ source.resultId }} · 标注版本 {{ source.revision }} · {{ source.sourceSnapshotIds.length }} 张参与图</li>
-                  } @empty { <li>生效标定来源未记录</li> }
-                  <li>{{ assessment.candidate.model }} · 候选 {{ assessment.evidence.source.resultId }} · 标注版本 {{ assessment.evidence.source.revision }}</li>
-                  <li>复核任务 {{ assessment.taskId }} · 标注版本 {{ assessment.revision }} · {{ assessment.sourceSnapshotIds.length }} 张原图</li>
-                </ul>
-              </details>
-            }
-            @if (validation(); as assessment) {
-              <p class="result-message" [class.error]="assessment.status !== 'passed'" role="status">{{ assessment.message }}</p>
-              <dl class="result-metrics">
-                <div><dt>独立截图</dt><dd>{{ assessment.sourceSnapshotIds.length }}<small>张</small></dd></div>
-                <div><dt>超出门槛</dt><dd>{{ assessment.failedSnapshotIds.length }}<small>张</small></dd></div>
-                @if (assessment.rmsResidualPixels !== null) {
-                  <div class="residual"><dt>复核 RMS</dt><dd>{{ assessment.rmsResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div>
-                  <div class="residual"><dt>最大逐图 RMS</dt><dd>{{ assessment.maximumResidualPixels | number:'1.2-2' }}<small>像素</small></dd></div>
-                  <div class="residual"><dt>角度 RMS</dt><dd>{{ assessment.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div>
-                }
-              </dl>
-              <details><summary>本次固定参数</summary><table><tbody>
-                @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ assessment.installation[field.key] | number:'1.4-4' }}°</td></tr> }
-              </tbody></table></details>
-              <div class="validation-table" tabindex="0" role="region" aria-label="逐图独立复核误差">
-                <table><thead><tr><th scope="col">P</th><th scope="col">T</th><th scope="col">Z</th><th scope="col">尺寸</th>
-                  <th scope="col">RMS(px)</th><th scope="col">左/中/右垂直偏差(px，下为正)</th><th scope="col">角度 RMS(°)</th><th scope="col">方向差(°)</th></tr></thead><tbody>
-                  @for (row of assessment.perSnapshot; track row.snapshotId) {
-                    <tr [class.validation-failed]="row.rmsResidualPixels > assessment.maximumAcceptedRmsPixels">
-                      <th scope="row"><button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="openValidationItem(row.snapshotId)"
-                        [attr.aria-label]="'打开 P ' + row.pan + ' 度的截图'">{{ row.pan | number:'1.2-2' }}°</button></th>
-                      <td>{{ row.tilt | number:'1.2-2' }}°</td><td>{{ row.zoom | number:'1.1-1' }}</td><td>{{ row.width }}×{{ row.height }}</td>
-                      <td>{{ row.rmsResidualPixels | number:'1.2-2' }}</td><td>@for (residual of row.verticalResiduals; track residual.position) { {{ $first ? '' : ' / ' }}{{ signedResidual(residual.offsetPixels) }} }</td>
-                      <td>{{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td><td>{{ signedResidual(row.directionDifferenceDegrees) }}</td>
-                    </tr>
-                  }
-                </tbody></table>
-              </div>
-              @if (assessment.excluded.length) {
-                <details><summary>排除 {{ assessment.excluded.length }} 张截图</summary><ul>
-                  @for (excluded of assessment.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }}：{{ excluded.reason }}</li> }
-                </ul></details>
-              }
-            }
-          </section>
+          @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，请逐图核对标注。</p> }
         </section>
       </div>
     } @else { <div class="detail-empty"><app-icon name="horizon" /><h2>{{ loading() ? '正在加载识别任务…' : '选择识别任务' }}</h2></div> }

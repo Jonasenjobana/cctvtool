@@ -2,8 +2,7 @@ import {
   Cartesian2, Cartesian3, Ellipsoid, EllipsoidalOccluder, IntersectionTests, Math as CesiumMath, Matrix3, Matrix4, Ray, Transforms,
 } from 'cesium';
 import type { CameraDraft, PreciseTarget, RawPtz } from './models';
-import { createLocalRigRotation } from '#camera-rotation';
-import { activeZeroPoseOf, createZeroPoseRigRotation } from '#zero-pose';
+import { activeZeroPoseOf, createZeroPoseRigRotation, legacyZeroPose } from '#zero-pose';
 import type { ZeroPose } from '#zero-pose';
 
 export interface CameraBasis {
@@ -55,15 +54,16 @@ function cameraBasis(position: Cartesian3, rig: { mount: Matrix3; camera: Matrix
 
 const validFov = (value: number | null | undefined): value is number => typeof value === 'number' && value > 0 && value < 180;
 
-function cameraRig(camera: CameraDraft, ptz: Pick<RawPtz, 'Pan' | 'Tilt'>) {
+function cameraRig(camera: CameraDraft, ptz: Pick<RawPtz, 'Pan' | 'Tilt'>, { includeLegacyRoll = true } = {}) {
   const zeroPose = activeZeroPoseOf(camera);
   if (zeroPose) return { ...createZeroPoseRigRotation(zeroPose, ptz), tiltOffset: zeroPose.tiltOffset };
-  const installation = {
+  const imageRoll = finite(camera.imageRoll, '画面 Roll 修正');
+  const pose = legacyZeroPose({
     panOffset: finite(camera.panOffset, '默认朝向'),
     pAxisPitch: finite(camera.pAxisPitch, 'P 轴前后倾'), pAxisRoll: finite(camera.pAxisRoll, 'P 轴左右倾'),
-    tiltOffset: finite(camera.tiltOffset, 'T 偏移'), imageRoll: finite(camera.imageRoll, '画面 Roll 修正'),
-  };
-  return { ...createLocalRigRotation(installation, ptz), tiltOffset: installation.tiltOffset };
+    tiltOffset: finite(camera.tiltOffset, 'T 偏移'), imageRoll: includeLegacyRoll ? imageRoll : 0,
+  });
+  return { ...createZeroPoseRigRotation(pose, ptz), tiltOffset: pose.tiltOffset };
 }
 
 export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
@@ -79,8 +79,10 @@ export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
   return { ...cameraBasis(position, rig), horizontalFov, verticalFov };
 }
 
-export function createZeroPosePreview(camera: CameraLocation, zeroPose: ZeroPose, ptz: RawPtz | null) {
-  const basis = cameraBasis(cameraPosition(camera), createZeroPoseRigRotation(zeroPose, ptz ?? { Pan: 0, Tilt: 0 }));
+export function createZeroPosePreview(camera: CameraDraft, zeroPose: ZeroPose | null, ptz: RawPtz | null) {
+  const angles = ptz ?? { Pan: 0, Tilt: 0 };
+  const rig = zeroPose ? createZeroPoseRigRotation(zeroPose, angles) : cameraRig(camera, angles);
+  const basis = cameraBasis(cameraPosition(camera), rig);
   const horizontalFov = ptz?.HorizontalFieldAngle, verticalFov = ptz?.VerticalFieldAngle;
   const pose: CameraPose | null = validFov(horizontalFov) && validFov(verticalFov)
     ? { ...basis, horizontalFov, verticalFov } : null;
@@ -98,7 +100,8 @@ export function pointTargetPtz(
   const pan = finite(ptz.Pan, '云台 P'), tilt = finite(ptz.Tilt, '云台 T'), zoom = finite(ptz.Zoom, '当前倍率');
   if (zoom < 1) throw new Error('当前倍率必须大于或等于 1');
   if (tilt < -90 || tilt > 90) throw new Error('当前 T 必须位于 -90～90°');
-  const { mount, tiltOffset } = cameraRig(camera, { Pan: 0, Tilt: 0 });
+  // 反算只使用机械轴，旧模型可直接省去末端画面 Roll 在分解和重建中的抵消。
+  const { mount, tiltOffset } = cameraRig(camera, { Pan: 0, Tilt: 0 }, { includeLegacyRoll: false });
   const targetHeight = finite(target.height ?? 0, '目标高度');
   if (targetHeight < 0) throw new Error('目标高度不能小于 0');
   const destination = Cartesian3.fromDegrees(target.longitude, target.latitude, targetHeight);

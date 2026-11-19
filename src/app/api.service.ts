@@ -3,8 +3,8 @@ import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import { ZERO_POSE_MODEL } from '#zero-pose';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
-import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage, InstallationValidation,
-  RefinementSelection, RefinementMeasurement, ZeroPoseCandidate, ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
+import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage,
+  ZeroPoseCandidate, ZeroPoseMeasurement } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
 import type { PanoramaGuide, PanoramaGuideState } from '../../shared/panorama-guide';
@@ -50,10 +50,11 @@ export class ApiService {
 
   playback(cameraId: string) { return this.http.get<PlaybackSource>('/api/playback', { params: { cameraId } }).pipe(timeout(10000)); }
 
-  saveCamera(id: string, camera: CameraInput) {
+  saveCamera(id: string, camera: CameraInput, applyZeroPose = false) {
+    const input = applyZeroPose ? { ...camera, applyZeroPose } : camera;
     const request = id
-      ? this.http.put<Camera>(`/api/cameras/${id}`, camera)
-      : this.http.post<Camera>('/api/cameras', camera);
+      ? this.http.put<Camera>(`/api/cameras/${id}`, input)
+      : this.http.post<Camera>('/api/cameras', input);
     return firstValueFrom(request.pipe(timeout(10000)));
   }
 
@@ -148,30 +149,9 @@ export class ApiService {
     return firstValueFrom(this.http.post<ZeroPoseMeasurement>(`/api/recognition-tasks/${id}/zero-pose-measure`,
       { revision, resultId, snapshotId }).pipe(timeout(10000)));
   }
-  saveRefinementSources(id: string, revision: number, selection: RefinementSelection) {
-    return firstValueFrom(this.http.put<RecognitionTask>(`/api/recognition-tasks/${id}/refinement-sources`,
-      { revision, selectionRevision: selection.revision, base: selection.base, supplemental: selection.supplemental }).pipe(timeout(10000)));
-  }
-  refineInstallation(id: string, revision: number, selectionRevision: number) {
-    return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/refine`, { revision, selectionRevision }).pipe(timeout(95000)));
-  }
-  measureRefinement(id: string, revision: number, selectionRevision: number, mode: 'before' | 'after', resultId?: string) {
-    return firstValueFrom(this.http.post<RefinementMeasurement>(`/api/recognition-tasks/${id}/refinement-measure`,
-      { revision, selectionRevision, mode, ...(resultId ? { resultId } : {}) }).pipe(timeout(95000)));
-  }
-  validateInstallation(id: string, revision: number, referenceTaskId: string, referenceResultId: string,
-    referenceKind: InstallationValidation['reference']['kind'] | ZeroPoseValidation['reference']['kind'] = 'ordinary',
-    criteria?: ZeroPoseValidationCriteria) {
-    return firstValueFrom(this.http.post<InstallationValidation | ZeroPoseValidation>(`/api/recognition-tasks/${id}/validate`,
-      { revision, referenceTaskId, referenceResultId, referenceKind, ...(criteria ? { criteria } : {}) }).pipe(timeout(95000)));
-  }
-  applyRefinement(id: string, revision: number, resultId: string, validationId?: string) {
-    return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/refinement-apply`,
-      { revision, resultId, ...(validationId ? { model: ZERO_POSE_MODEL, validationId } : {}) }).pipe(timeout(validationId ? 95000 : 10000)));
-  }
-  applyInstallation(id: string, revision: number, resultId: string, validationId?: string) {
+  applyZeroPose(id: string, revision: number, resultId: string) {
     return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/apply`,
-      { revision, resultId, ...(validationId ? { model: ZERO_POSE_MODEL, validationId } : {}) }).pipe(timeout(validationId ? 95000 : 10000)));
+      { revision, resultId, model: ZERO_POSE_MODEL }).pipe(timeout(10000)));
   }
   cancelRecognition(id: string) {
     return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/cancel`, {}).pipe(timeout(10000)));

@@ -1,6 +1,5 @@
 import { Cartesian3, Matrix3 } from 'cesium';
-import { createLocalRigRotation } from '#camera-rotation';
-import { activeZeroPoseOf, createZeroPoseRigRotation } from '#zero-pose';
+import { activeZeroPoseOf, calibratedZeroPose, createZeroPoseRigRotation } from '#zero-pose';
 import type { HorizonPoint, Snapshot } from './models';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
 
@@ -40,7 +39,6 @@ const unwrap = (angle: number, near: number) => angle + Math.round((near - angle
 export function createPanoramaFrame(snapshot: Snapshot, referenceHeading?: number): PanoramaFrame {
   const raw = snapshot.ptz.raw;
   const calibration = snapshot.calibration;
-  const zeroPose = activeZeroPoseOf(calibration);
   if (![raw.Pan, raw.Tilt, snapshot.width, snapshot.height, calibration.pAxisPitch, calibration.pAxisRoll,
     calibration.panOffset, calibration.tiltOffset, calibration.imageRoll]
     .every(Number.isFinite) || snapshot.width <= 0 || snapshot.height <= 0
@@ -48,7 +46,7 @@ export function createPanoramaFrame(snapshot: Snapshot, referenceHeading?: numbe
     || !(raw.HorizontalFieldAngle > 0 && raw.HorizontalFieldAngle < 180 && raw.VerticalFieldAngle > 0 && raw.VerticalFieldAngle < 180)) {
     throw new Error('截图的 PTZ、视场角或图片尺寸无效，无法生成全景图');
   }
-  const rotation = zeroPose ? createZeroPoseRigRotation(zeroPose, raw).camera : createLocalRigRotation(calibration, raw).camera;
+  const rotation = createZeroPoseRigRotation(calibratedZeroPose(calibration), raw).camera;
   const right = Matrix3.getColumn(rotation, 0, new Cartesian3());
   const direction = Matrix3.getColumn(rotation, 1, new Cartesian3());
   const up = Matrix3.getColumn(rotation, 2, new Cartesian3());
@@ -59,7 +57,7 @@ export function createPanoramaFrame(snapshot: Snapshot, referenceHeading?: numbe
     throw new Error('画面包含竖直方向，无法生成水平全景图');
   }
   const heading = unwrap(Math.atan2(direction.x, direction.y), referenceHeading
-    ?? radians((zeroPose?.yaw ?? calibration.panOffset) + (snapshot.scanTarget?.pan ?? raw.Pan)));
+    ?? radians((activeZeroPoseOf(calibration)?.yaw ?? calibration.panOffset) + (snapshot.scanTarget?.pan ?? raw.Pan)));
   const frame = { snapshot, right, direction, up, tanH, tanV, heading,
     minHeading: Infinity, maxHeading: -Infinity, minY: Infinity, maxY: -Infinity,
     density: Math.min(snapshot.width / (2 * tanH), snapshot.height / (2 * tanV)) };

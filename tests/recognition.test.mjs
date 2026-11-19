@@ -8,7 +8,7 @@ import { CameraStore } from '../server/store.mjs';
 import { createApp } from '../server/app.mjs';
 import { fixtureCamera, syntheticSnapshots } from './calibration-fixtures.mjs';
 
-async function fixture(t, customRecognizer, { savedZeroPose, transformSnapshot = (snapshot) => snapshot, ...sampleOptions } = {}) {
+async function fixture(t, customRecognizer, { savedZeroPose, writeImages = false, transformSnapshot = (snapshot) => snapshot, ...sampleOptions } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-recognition-test-'));
   const store = new CameraStore(dataDir);
   const input = Object.fromEntries(['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'].map((key) => [key, fixtureCamera[key]]));
@@ -22,7 +22,7 @@ async function fixture(t, customRecognizer, { savedZeroPose, transformSnapshot =
   snapshots.forEach((snapshot, scanIndex) => store.addSnapshot({ ...snapshot, groupId: 'source-task', scanIndex,
     fileName: `${snapshot.id}.jpg`, imageUrl: `/api/snapshots/${snapshot.id}/image`, contentType: 'image/jpeg' }));
   store.close();
-  if (sampleOptions.zeroPose) {
+  if (writeImages || sampleOptions.zeroPose) {
     await Promise.all(snapshots.map((snapshot) => writeFile(join(dataDir, 'snapshots', `${snapshot.id}.jpg`), 'fixture')));
   }
   const recognizer = customRecognizer || { async run(images, { onResult }) {
@@ -48,6 +48,43 @@ const postZeroPose = (f, id, revision = 0) => f.app.inject({ method: 'POST', url
   payload: { revision, model: zeroPoseModel } });
 const measureZeroPose = (f, id, candidate, snapshotId) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${id}/zero-pose-measure`,
   payload: { revision: candidate.revision, resultId: candidate.resultId, snapshotId } });
+
+test('先前应用过旧标定的任务在当前草稿缺少机械修正时恢复历史关系', async (t) => {
+  const zeroPose = { yaw: fixtureCamera.panOffset + 0.2, pitch: 0, roll: 0, tiltOffset: 0 };
+  const f = await fixture(t, undefined, { savedZeroPose: zeroPose, writeImages: true });
+  const task = await createAndWait(f);
+  const initial = await postZeroPose(f, task.id);
+  assert.equal(initial.statusCode, 200, initial.body);
+  assert.equal(initial.json().zeroPoseCandidate.status, 'estimated');
+  assert.ok(initial.json().zeroPoseCandidate.diagnostics.rmsResidualPixels > 5);
+  const fitCamera = { ...f.input, zeroPose: undefined, tiltOffset: 1.1, imageRoll: -0.8 };
+  const store = new CameraStore(f.dataDir);
+  try {
+    store.updateRecognitionTask(task.id, { fitCamera, appliedAt: task.createdAt, resultRevision: 0, revision: 1 });
+  } finally { store.close(); }
+  const response = await postZeroPose(f, task.id, 1);
+  assert.equal(response.statusCode, 200, response.body);
+  const candidate = response.json().zeroPoseCandidate;
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.equal(candidate.zeroPose.yaw, zeroPose.yaw);
+  assert.equal(candidate.zeroPose.tiltOffset, fitCamera.tiltOffset);
+  assert.equal(candidate.zeroPose.imageRoll, fitCamera.imageRoll);
+  assert.equal(candidate.diagnostics.maximumAcceptedRmsPixels, 5);
+  assert.ok(candidate.diagnostics.rmsResidualPixels < 0.01);
+  assert.deepEqual(candidate.sourceSnapshotIds, f.snapshots.map(({ id }) => id));
+  assert.deepEqual((await f.app.inject('/api/cameras')).json(), [f.camera]);
+  const preview = await measureZeroPose(f, task.id, candidate, f.snapshots[0].id);
+  assert.equal(preview.statusCode, 200, preview.body);
+
+  const write = await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`,
+    payload: { ...f.input, zeroPose, applyZeroPose: true } });
+  assert.equal(write.statusCode, 200, write.body);
+  const next = await postZeroPose(f, task.id, 1);
+  assert.equal(next.statusCode, 200, next.body);
+  assert.equal(next.json().zeroPoseCandidate.status, 'estimated');
+  assert.ok(next.json().zeroPoseCandidate.diagnostics.rmsResidualPixels > 5);
+  assert.equal(next.json().zeroPoseCandidate.fixedCalibration.imageRoll, 0);
+});
 
 test('识别任务按实际 P/T/FOV 生成零位候选，冻结 Yaw 和补偿并保留旧结果', async (t) => {
   const f = await fixture(t, undefined, { savedZeroPose, zeroPose: trueZeroPose, pans: [355, 20, 100, 190, 275] });
@@ -162,9 +199,13 @@ test('零位候选版本核对配置、正式标注和生成编号', async (t) =
   const preview = await measureZeroPose(f, task.id, third, 'synthetic-1');
   assert.equal(preview.statusCode, 409, preview.body);
   assert.match(preview.json().message, /相机配置版本已变化/);
+  const apply = await f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${task.id}/apply`,
+    payload: { revision: third.revision, resultId: third.resultId, model: zeroPoseModel } });
+  assert.equal(apply.statusCode, 409, apply.body);
+  assert.match(apply.json().message, /相机配置版本已变化/);
 });
 
-test('零位拟合报告无有效观测和矛盾标注，拒绝按失败候选预览', async (t) => {
+test('零位拟合超出 RMS 参考值时仍可预览和手动应用，无有效观测时返回空姿态', async (t) => {
   const f = await fixture(t, undefined, { savedZeroPose, zeroPose: trueZeroPose, pans: [25, 25],
     ptzOverrides: { Tilt: 2.2, Zoom: 3, HorizontalFieldAngle: 24, VerticalFieldAngle: 14 } });
   const task = await createAndWait(f);
@@ -173,11 +214,22 @@ test('零位拟合报告无有效观测和矛盾标注，拒绝按失败候选�
   const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${task.id}/items/synthetic-1`,
     payload: { revision: 0, points } });
   assert.equal(edited.statusCode, 200, edited.body);
-  const failed = (await postZeroPose(f, task.id, 1)).json().zeroPoseCandidate;
-  assert.equal(failed.status, 'unreliable', failed.message);
-  assert.equal(failed.zeroPose, null);
-  assert.ok(failed.diagnostics.rmsResidualPixels > 5);
-  assert.equal((await measureZeroPose(f, task.id, failed, 'synthetic-0')).statusCode, 409);
+  const candidate = (await postZeroPose(f, task.id, 1)).json().zeroPoseCandidate;
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.ok(candidate.zeroPose);
+  assert.ok(candidate.diagnostics.rmsResidualPixels > 5);
+  assert.match(candidate.message, /超过 5 像素参考值/);
+  const preview = await measureZeroPose(f, task.id, candidate, 'synthetic-0');
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json().zeroPose, candidate.zeroPose);
+
+  const apply = () => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${task.id}/apply`,
+    payload: { revision: candidate.revision, resultId: candidate.resultId, model: zeroPoseModel } });
+  const applied = await apply();
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.deepEqual(applied.json().camera.activeZeroPose, candidate.zeroPose);
+  assert.equal(applied.json().task.zeroPoseCandidate.applied, true);
+  assert.equal((await apply()).statusCode, 409);
 
   await f.app.close();
   const store = new CameraStore(f.dataDir);
@@ -343,6 +395,38 @@ test('零位独立复核用同批原图测量已保存四参数和冻结候选�
   assert.equal(stricter.statusCode, 200, stricter.body);
   assert.deepEqual(stricter.json().failedSnapshotIds, ['validation-0']);
   assert.deepEqual(stricter.json().perSnapshot[0].failures, ['左端垂直偏差', '中点垂直偏差', '右端垂直偏差']);
+});
+
+test('拟合超出 RMS 参考值的普通零位候选，可用独立原图复核并按证据应用', async (t) => {
+  const f = await zeroPoseValidationFixture(t);
+  const { snapshotId, points } = f.observations[1];
+  const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${f.reference.id}/items/${snapshotId}`,
+    payload: { revision: f.reference.revision, points: [points[0], points.at(-1)].map((point) =>
+      ({ ...point, y: point.y + 0.04 })) } });
+  assert.equal(edited.statusCode, 200, edited.body);
+  const generated = await postZeroPose(f, f.reference.id, edited.json().task.revision);
+  assert.equal(generated.statusCode, 200, generated.body);
+  f.reference = generated.json();
+  f.candidate = f.reference.zeroPoseCandidate;
+  assert.equal(f.candidate.status, 'estimated', f.candidate.message);
+  assert.ok(f.candidate.diagnostics.rmsResidualPixels > 5);
+  const apply = (validationId) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.reference.id}/apply`,
+    payload: { revision: f.reference.revision, resultId: f.candidate.resultId, model: zeroPoseModel, validationId } });
+  assert.equal((await apply('unverified')).statusCode, 409);
+  const failed = await f.validateZeroPose({
+    criteria: { ...validationCriteria, maximumVerticalOffsetPixels: 0.000001 },
+  });
+  assert.equal(failed.statusCode, 200, failed.body);
+  assert.equal(failed.json().status, 'failed');
+  assert.equal((await apply(failed.json().evidence.id)).statusCode, 409);
+  const passed = await f.validateZeroPose({
+    criteria: { ...validationCriteria, maximumVerticalOffsetPixels: 100, maximumRmsPixels: 100, maximumDirectionDifferenceDegrees: 10 },
+  });
+  assert.equal(passed.statusCode, 200, passed.body);
+  assert.equal(passed.json().status, 'passed', passed.body);
+  const applied = await apply(passed.json().evidence.id);
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.deepEqual(applied.json().camera.activeZeroPose, f.candidate.zeroPose);
 });
 
 test('通过独立复核的普通零位候选只应用一次，保存草稿仍独立于生效模型', async (t) => {

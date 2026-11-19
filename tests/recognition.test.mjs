@@ -1,24 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { CameraStore } from '../server/store.mjs';
 import { createApp } from '../server/app.mjs';
 import { fixtureCamera, syntheticSnapshots } from './calibration-fixtures.mjs';
 
-async function fixture(t, customRecognizer, sampleOptions = {}) {
+async function fixture(t, customRecognizer, { savedZeroPose, transformSnapshot = (snapshot) => snapshot, ...sampleOptions } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-recognition-test-'));
   const store = new CameraStore(dataDir);
   const input = Object.fromEntries(['name', 'serial', 'code', 'longitude', 'latitude', 'height', 'pAxisPitch', 'pAxisRoll', 'panOffset', 'tiltOffset', 'imageRoll'].map((key) => [key, fixtureCamera[key]]));
+  if (savedZeroPose) input.zeroPose = savedZeroPose;
   const camera = store.saveCamera(input);
   const actual = { ...camera, tiltOffset: 1.1, imageRoll: -0.8 };
-  const { snapshots, observations } = syntheticSnapshots({ camera: actual, ...sampleOptions });
+  const { snapshots: inputs, observations } = syntheticSnapshots({ camera: actual, ...sampleOptions });
+  const snapshots = inputs.map(transformSnapshot);
   store.addSnapshotGroup({ id: 'source-task', cameraId: camera.id, cameraName: camera.name, kind: 'scan', status: 'completed',
     createdAt: snapshots[0].createdAt, sampleCount: snapshots.length, completedCount: 0 });
   snapshots.forEach((snapshot, scanIndex) => store.addSnapshot({ ...snapshot, groupId: 'source-task', scanIndex,
     fileName: `${snapshot.id}.jpg`, imageUrl: `/api/snapshots/${snapshot.id}/image`, contentType: 'image/jpeg' }));
   store.close();
+  if (sampleOptions.zeroPose) {
+    await Promise.all(snapshots.map((snapshot) => writeFile(join(dataDir, 'snapshots', `${snapshot.id}.jpg`), 'fixture')));
+  }
   const recognizer = customRecognizer || { async run(images, { onResult }) {
     for (const image of images) {
       onResult({ snapshotId: image.snapshotId, points: observations.find((item) => item.snapshotId === image.snapshotId).points.filter((_, index) => index !== 1) });
@@ -34,6 +39,149 @@ async function fixture(t, customRecognizer, sampleOptions = {}) {
   });
   return f;
 }
+
+const zeroPoseModel = 'wgs84-horizon-zero-pose-v1';
+const trueZeroPose = { roll: -4.25, pitch: 2.75, yaw: 128.5, tiltOffset: 1.85 };
+const savedZeroPose = { ...trueZeroPose, roll: 0, pitch: 0 };
+const postZeroPose = (f, id, revision = 0) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${id}/generate`,
+  payload: { revision, model: zeroPoseModel } });
+const measureZeroPose = (f, id, candidate, snapshotId) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${id}/zero-pose-measure`,
+  payload: { revision: candidate.revision, resultId: candidate.resultId, snapshotId } });
+
+test('识别任务按实际 P/T/FOV 生成零位候选，冻结 Yaw 和补偿并保留旧结果', async (t) => {
+  const f = await fixture(t, undefined, { savedZeroPose, zeroPose: trueZeroPose, pans: [355, 20, 100, 190, 275] });
+  const task = await createAndWait(f);
+  const legacy = await post(f, task.id, 'generate', 0);
+  assert.equal(legacy.statusCode, 200, legacy.body);
+  const before = (await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json().items;
+  const generated = await postZeroPose(f, task.id);
+  assert.equal(generated.statusCode, 200, generated.body);
+  const { zeroPoseCandidate: candidate, resultId, result } = generated.json();
+  assert.equal(candidate.model, zeroPoseModel);
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.equal(candidate.stale, false);
+  assert.notEqual(candidate.resultId, resultId);
+  assert.equal(candidate.revision, task.revision);
+  assert.deepEqual(candidate.generatedCamera, f.camera);
+  assert.equal(candidate.zeroPose.yaw, trueZeroPose.yaw);
+  assert.equal(candidate.zeroPose.tiltOffset, trueZeroPose.tiltOffset);
+  assert.ok(Math.abs(candidate.zeroPose.roll - trueZeroPose.roll) < 1e-5, JSON.stringify(candidate.zeroPose));
+  assert.ok(Math.abs(candidate.zeroPose.pitch - trueZeroPose.pitch) < 1e-5, JSON.stringify(candidate.zeroPose));
+  assert.equal(candidate.fixedCalibration.imageRoll, 0);
+  assert.equal(candidate.distinctPanCount, 5);
+  assert.equal(candidate.panCoverageDegrees, 270);
+  assert.deepEqual(candidate.sourceSnapshotIds, f.snapshots.map((snapshot) => snapshot.id));
+  assert.ok(candidate.diagnostics.perSnapshot.every((row) => row.rmsResidualPixels < 0.01));
+  assert.equal(resultId, legacy.json().resultId);
+  assert.deepEqual(result, legacy.json().result);
+  const preview = await measureZeroPose(f, task.id, candidate, 'synthetic-0');
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.equal(preview.json().resultId, candidate.resultId);
+  assert.deepEqual(preview.json().zeroPose, candidate.zeroPose);
+  const [row] = preview.json().perSnapshot;
+  assert.equal(row.snapshotId, 'synthetic-0');
+  assert.equal(row.pan, 355);
+  assert.ok(row.theoreticalHorizon.length > 0);
+  assert.ok(row.verticalResiduals.filter((entry) => entry.position !== 'center')
+    .every(({ offsetPixels }) => offsetPixels !== null && Math.abs(offsetPixels) < 0.01));
+  assert.deepEqual((await f.app.inject('/api/cameras')).json()[0], f.camera);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  const reopened = (await f.app.inject(`/api/recognition-tasks/${task.id}/items`)).json();
+  assert.deepEqual(reopened.items, before);
+  assert.deepEqual(reopened.task.zeroPoseCandidate, candidate);
+});
+
+test('零位候选排除异常样本，参与原图丢失后原候选只保留诊断', async (t) => {
+  const f = await fixture(t, undefined, { zeroPose: { roll: -2.2, pitch: 1.5, yaw: fixtureCamera.panOffset, tiltOffset: fixtureCamera.tiltOffset },
+    pans: [355, 20, 100, 190, 275, 290, 320, 40, 65, 120], transformSnapshot(snapshot, index) {
+      if (index === 1) return { ...snapshot, poseChanged: true };
+      if (index === 2) return { ...snapshot, ptz: { ...snapshot.ptz, raw: { ...snapshot.ptz.raw, HorizontalFieldAngle: null } } };
+      if (index === 3) return { ...snapshot, code: 'wrong-channel' };
+      if (index === 4) return { ...snapshot, width: 0 };
+      return snapshot;
+    } });
+  const task = await createAndWait(f);
+  const ignored = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${task.id}/items/synthetic-0`,
+    payload: { revision: 0, ignored: true } });
+  assert.equal(ignored.statusCode, 200, ignored.body);
+  const deleted = await f.app.inject({ method: 'DELETE', url: '/api/snapshots/synthetic-5' });
+  assert.equal(deleted.statusCode, 204, deleted.body);
+  await unlink(join(f.dataDir, 'snapshots', 'synthetic-6.jpg'));
+  const generated = await postZeroPose(f, task.id, 1);
+  assert.equal(generated.statusCode, 200, generated.body);
+  const candidate = generated.json().zeroPoseCandidate;
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  assert.ok(Math.abs(candidate.zeroPose.yaw - f.camera.panOffset) < 1e-10);
+  assert.equal(candidate.zeroPose.tiltOffset, f.camera.tiltOffset);
+  assert.deepEqual(candidate.sourceSnapshotIds, ['synthetic-7', 'synthetic-8', 'synthetic-9']);
+  const exclusions = Object.fromEntries(candidate.excluded.map(({ snapshotId, reason }) => [snapshotId, reason]));
+  assert.match(exclusions['synthetic-0'], /人工忽略/);
+  assert.match(exclusions['synthetic-1'], /姿态发生变化/);
+  assert.match(exclusions['synthetic-2'], /视场角无效/);
+  assert.match(exclusions['synthetic-3'], /设备通道/);
+  assert.match(exclusions['synthetic-4'], /图片尺寸无效/);
+  assert.match(exclusions['synthetic-5'], /源截图已删除/);
+  assert.match(exclusions['synthetic-6'], /截图文件缺失/);
+  assert.equal((await measureZeroPose(f, task.id, candidate, 'synthetic-6')).statusCode, 409);
+  await unlink(join(f.dataDir, 'snapshots', 'synthetic-7.jpg'));
+  const reopened = (await f.app.inject(`/api/recognition-tasks/${task.id}`)).json().zeroPoseCandidate;
+  assert.equal(reopened.resultId, candidate.resultId);
+  assert.equal(reopened.stale, true);
+  assert.match(reopened.staleReasons.join(' '), /参与原图已删除或缺失/);
+  assert.equal((await measureZeroPose(f, task.id, candidate, 'synthetic-8')).statusCode, 409);
+});
+
+test('零位候选版本核对配置、正式标注和生成编号', async (t) => {
+  const f = await fixture(t, undefined, { savedZeroPose, zeroPose: trueZeroPose });
+  const task = await createAndWait(f);
+  const first = (await postZeroPose(f, task.id)).json().zeroPoseCandidate;
+  const second = (await postZeroPose(f, task.id)).json().zeroPoseCandidate;
+  assert.notEqual(second.resultId, first.resultId);
+  assert.equal((await measureZeroPose(f, task.id, first, 'synthetic-0')).statusCode, 409);
+  const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${task.id}/items/synthetic-0`,
+    payload: { revision: 0, ignored: true } });
+  assert.equal(edited.statusCode, 200, edited.body);
+  assert.match(edited.json().task.zeroPoseCandidate.staleReasons.join(' '), /正式标注版本/);
+  assert.equal((await measureZeroPose(f, task.id, second, 'synthetic-1')).statusCode, 409);
+  const third = (await postZeroPose(f, task.id, 1)).json().zeroPoseCandidate;
+  assert.equal(third.stale, false);
+  const camera = await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`,
+    payload: { ...f.input, zeroPose: { ...savedZeroPose, yaw: savedZeroPose.yaw + 1 } } });
+  assert.equal(camera.statusCode, 200, camera.body);
+  const preview = await measureZeroPose(f, task.id, third, 'synthetic-1');
+  assert.equal(preview.statusCode, 409, preview.body);
+  assert.match(preview.json().message, /相机配置版本已变化/);
+});
+
+test('零位拟合报告无有效观测和矛盾标注，拒绝按失败候选预览', async (t) => {
+  const f = await fixture(t, undefined, { savedZeroPose, zeroPose: trueZeroPose, pans: [25, 25],
+    ptzOverrides: { Tilt: 2.2, Zoom: 3, HorizontalFieldAngle: 24, VerticalFieldAngle: 14 } });
+  const task = await createAndWait(f);
+  const points = f.observations[1].points.filter((_, index) => index !== 1)
+    .map((point) => ({ ...point, y: point.y + 0.1 }));
+  const edited = await f.app.inject({ method: 'PUT', url: `/api/recognition-tasks/${task.id}/items/synthetic-1`,
+    payload: { revision: 0, points } });
+  assert.equal(edited.statusCode, 200, edited.body);
+  const failed = (await postZeroPose(f, task.id, 1)).json().zeroPoseCandidate;
+  assert.equal(failed.status, 'unreliable', failed.message);
+  assert.equal(failed.zeroPose, null);
+  assert.ok(failed.diagnostics.rmsResidualPixels > 5);
+  assert.equal((await measureZeroPose(f, task.id, failed, 'synthetic-0')).statusCode, 409);
+
+  await f.app.close();
+  const store = new CameraStore(f.dataDir);
+  try {
+    store.addRecognitionTask({ ...task, id: 'empty-task', sampleCount: 0, completedCount: 0 }, []);
+  } finally { store.close(); }
+  f.app = await createApp(f.options);
+  const generated = await postZeroPose(f, 'empty-task');
+  assert.equal(generated.statusCode, 200, generated.body);
+  const empty = generated.json().zeroPoseCandidate;
+  assert.equal(empty.status, 'insufficient_data', empty.message);
+  assert.equal(empty.zeroPose, null);
+  assert.deepEqual(empty.sourceSnapshotIds, []);
+});
 
 async function createAndWait(f) {
   const response = await f.app.inject({ method: 'POST', url: '/api/recognition-tasks', payload: { sourceTaskId: 'source-task' } });

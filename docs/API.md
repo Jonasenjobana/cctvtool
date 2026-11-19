@@ -49,7 +49,8 @@
 | `GET /api/recognition-tasks/:id/panorama-guide` | 获取全景参考线及独立版本 `{ guide, revision }` |
 | `PUT /api/recognition-tasks/:id/panorama-guide` | 保存或删除 `{ guide, revision }`，返回独立版本递增后的参考线状态 |
 | `POST /api/recognition-tasks/:id/cancel` | 取消排队或运行中的本地模型识别，保留已有结果 |
-| `POST /api/recognition-tasks/:id/generate` | `{ revision }` 按本任务生成四项安装修正，返回任务及普通结果，不写设备配置 |
+| `POST /api/recognition-tasks/:id/generate` | `{ revision, model? }` 按本任务生成普通结果，指定 `wgs84-horizon-zero-pose-v1` 得到零位候选，缺省为历史四参数模型 |
+| `POST /api/recognition-tasks/:id/zero-pose-measure` | `{ revision, resultId, snapshotId }` 只读测量新版普通候选在指定参与图上的理论海天线及偏差 |
 | `PUT /api/recognition-tasks/:id/refinement-sources` | 保存联合精修的基础来源、补充任务及选择版本；返回任务，不计算或写设备配置 |
 | `POST /api/recognition-tasks/:id/refine` | `{ revision, selectionRevision }` 从已保存基础结果联合生成独立精修候选，返回任务 |
 | `POST /api/recognition-tasks/:id/refinement-measure` | `{ revision, selectionRevision, mode, resultId? }` 只读计算参与图的基准或候选理论线与偏差，不作为独立复核 |
@@ -233,7 +234,7 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 
 已有普通及两阶段海天线任务仍按原存储字段读取和恢复。旧普通任务保留区间中心采样，旧预扫／正式任务保留冻结目标；正式阶段继续检查实际 FOV、原角度余量及 min(0.15°,0.05×VFOV) 的 T 容差。历史海天线任务完成后的自动识别关联保留；页面对历史预扫粗结果保留只查看限制。新任务采用多点请求并手动创建识别；新建请求只接受本节字段。
 
-### 本地识别任务与四参数标定
+### 本地识别任务与标定
 
 本地任务不需要 MCP，操作入口和模型环境见 [README](../README.md#本地模型识别与安装参数)。创建时冻结源任务现存截图集合，原始截图和 PTZ 保持不变；运行中的截图任务或空任务不可创建。Python 与 ESSLD 路径分别由 `ESSLD_PYTHON/ESSLD_UPSTREAM` 指定，缺失时返回 503。
 
@@ -260,6 +261,12 @@ Invoke-RestMethod "$baseUrl/api/snapshot-tasks/$($task.id)/start" -Method Post
 `generate` 使用当前设备经纬度、高度及默认朝向，以及未忽略截图的真实 PTZ/FOV。模型 `wgs84-horizon-installation-v1` 联合求解 `pAxisPitch/pAxisRoll/tiltOffset/imageRoll`，复用共用旋转链、WGS84 残差和稳健损失。`result.status` 为 `estimated/insufficient_data/unreliable`，只有 `estimated` 包含 `installation` 四项数值。有效样本参与拟合后，必须收敛、未加阻尼的四参数矩阵条件数小于 `1e8`，各图等权的 RMS 不超过 5 像素；否则返回 `unreliable`。没有有效样本时返回 `insufficient_data`。张数、不同 P 方向数和覆盖范围用于查看分布，样本较少或方向集中时对标注及固定参数误差更敏感。`diagnostics.perSnapshot` 给出逐图像素残差，`diagnostics.rmsAngularResidualDegrees` 给出参与样本真实射线的角度均方根残差，排除项列在 `excluded`。低倍率的像素门槛不直接保证高倍率精度。
 
 `generate` 的失败消息区分未收敛、不可辨识和 RMS 超限；已收敛但残差超限会明确显示实际 RMS 与 5 像素门槛。每次生成新的 `resultId` 并清除当前结果的应用状态。
+
+`generate` 指定 `model=wgs84-horizon-zero-pose-v1` 时，按现存原图的正式海天线、原始 P/T、实测 FOV 和尺寸拟合零位 Roll、Pitch。固定位置及已保存 `zeroPose` 的 Yaw、T 补偿，独立光轴旋转为零。旧摄像头用已保存 P 朝向和 T 补偿，并从旧模型在设备零位的姿态初始化 Roll、Pitch。求解采用同一 WGS84 切线残差和各图等权的 4 像素 Huber 损失。模型收敛、未加阻尼的二参数矩阵条件数小于 `1e8`，且各图等权 RMS 不超过 5 原图像素时返回 `status=estimated` 和 `zeroPose={roll,pitch,yaw,tiltOffset}`。无有效图返回 `insufficient_data`，数值检查未通过返回 `unreliable`，两种状态的 `zeroPose` 均为 `null`。
+
+新版普通候选保存在 `task.zeroPoseCandidate`，含 `model/resultId/revision/generatedAt/generatedCamera/fixedCalibration/sourceSnapshotIds`。每次生成分配新编号，`revision` 对应正式标注和忽略状态版本，`generatedCamera` 是生成时完整配置，`fixedCalibration` 记录位置、Yaw、T 补偿、独立光轴旋转和配置更新时间。`diagnostics` 记录收敛、条件数、像素和角度 RMS 及每张参与原图的误差，`distinctPanCount/panCoverageDegrees` 记录 P 覆盖，`excluded` 记录忽略、正式标注、设备通道、采样姿态、视场角、尺寸和源图缺失等检查的排除项。读取任务时返回 `stale/staleReasons`，相机配置或正式标注版本变更、模型版本变化或任一参与原图删除或缺失时显示过期诊断。旧普通结果和历史预扫粗结果继续使用四参数字段。
+
+`zero-pose-measure` 返回冻结候选在指定参与图上的 `perSnapshot`，包含理论海天线和左、中、右垂直像素差，使用与独立复核相同的原图坐标及符号约定。请求版本、结果编号、来源或质量状态不符时返回 409。生成及原图预览均属于识别任务内的软件计算，独立复核和设备配置应用使用各自入口。
 
 `refinement-sources` 的请求结构如下，客户端仅提交标识和期望版本，不提交角度、PTZ、FOV 或替代标注：
 

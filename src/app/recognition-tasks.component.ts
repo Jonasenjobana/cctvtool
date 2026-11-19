@@ -4,7 +4,8 @@ import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
-import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement, SnapshotGroup } from './models';
+import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement, SnapshotGroup,
+  ZeroPoseMeasurement } from './models';
 import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
   panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
@@ -77,7 +78,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly validationReferenceId = signal('');
   readonly measuring = signal(false);
   private readonly validationResult = signal<InstallationValidation | null>(null);
-  readonly comparisonMode = signal<'validation' | 'before' | 'after'>('validation');
+  readonly comparisonMode = signal<'validation' | 'before' | 'after' | 'zero-pose'>('validation');
+  private readonly zeroPoseMeasurementResult = signal<ZeroPoseMeasurement | null>(null);
+  readonly zeroPoseCandidate = computed(() => this.selected()?.zeroPoseCandidate);
+  readonly canPreviewZeroPose = computed(() => this.zeroPoseCandidate()?.status === 'estimated' && !this.zeroPoseCandidate()?.stale
+    && !this.busy() && !this.loading() && !this.dirty() && !this.running() && !this.generatingPanorama() && !this.guideDrawing());
   private readonly refinementMeasurementResult = signal<RefinementMeasurement | null>(null);
   readonly refinement = computed(() => this.selected()?.refinement);
   readonly refinementBaseId = signal('');
@@ -116,14 +121,22 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       && result.selectionRevision === task.refinementSelection?.revision && result.mode === this.comparisonMode()
       && (result.mode === 'before' || (!task.refinement?.stale && result.resultId === task.refinement?.resultId)) ? result : null;
   });
-  readonly measurement = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
+  private readonly zeroPoseMeasurement = computed(() => {
+    const result = this.zeroPoseMeasurementResult(), task = this.selected(), candidate = this.zeroPoseCandidate();
+    return result && task && candidate && !this.dirty() && !candidate.stale && result.taskId === task.id
+      && result.revision === task.revision && result.resultId === candidate.resultId ? result : null;
+  });
+  private readonly comparison = computed(() => this.comparisonMode() === 'validation' ? this.validation()
+    : this.comparisonMode() === 'zero-pose' ? this.zeroPoseMeasurement() : this.refinementMeasurement());
+  readonly measurement = computed(() => this.comparison()
     ?.perSnapshot.find((row) => row.snapshotId === this.displayedItem()?.snapshotId && !this.singleImageError()));
-  readonly measurementExclusion = computed(() => (this.comparisonMode() === 'validation' ? this.validation() : this.refinementMeasurement())
-    ?.excluded.find((row) => row.snapshotId === this.displayedItem()?.snapshotId)?.reason);
-  readonly theoreticalLabel = computed(() => this.comparisonMode() === 'validation'
+  readonly measurementExclusion = computed(() =>
+    (this.comparisonMode() === 'zero-pose' && !this.dirty() && !this.zeroPoseCandidate()?.stale ? this.zeroPoseCandidate() : this.comparison())
+      ?.excluded.find((row) => row.snapshotId === this.displayedItem()?.snapshotId)?.reason);
+  readonly theoreticalLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选理论海天线' : this.comparisonMode() === 'validation'
     ? this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
     : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
-  readonly measurementLabel = computed(() => this.comparisonMode() === 'validation'
+  readonly measurementLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选原图预览' : this.comparisonMode() === 'validation'
     ? this.validationSource()?.kind === 'refinement' ? '精修候选独立复核' : '普通结果独立复核'
     : this.comparisonMode() === 'after' ? '候选海天线对照' : '基准海天线对照');
   readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
@@ -310,6 +323,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.measuring.set(false);
     this.validationResult.set(null);
     this.refinementMeasurementResult.set(null);
+    this.zeroPoseMeasurementResult.set(null);
     this.closeSourceImage();
     this.clearPanorama();
     const revision = ++this.revision;
@@ -397,6 +411,9 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (previous?.sourceTaskId !== task.sourceTaskId) this.sourceGroup.set(null);
     if (this.comparisonMode() === 'after' && (!task.refinement || task.refinement.stale)) {
       this.comparisonMode.set(task.refinementSelection?.base ? 'before' : 'validation');
+    }
+    if (this.comparisonMode() === 'zero-pose' && (!task.zeroPoseCandidate?.zeroPose || task.zeroPoseCandidate.stale)) {
+      this.comparisonMode.set('validation');
     }
     this.selected.set(task);
     this.refinementBaseId.set(task.refinementSelection?.base?.taskId || '');
@@ -1057,16 +1074,48 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   saveGuide() { return this.save(false); }
 
-  async generate() {
+  async generate(zeroPose = false) {
     if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
     const task = this.selected();
     if (!task) return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
     try {
-      const result = await this.api.generateInstallation(task.id, task.revision);
+      const result = await this.api.generateInstallation(task.id, task.revision, zeroPose ? 'wgs84-horizon-zero-pose-v1' : undefined);
       if (!this.destroyed) this.setTask(result);
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
+    if (zeroPose && this.comparisonMode() === 'zero-pose') void this.measureZeroPose();
+  }
+  previewZeroPose(snapshotId: string) {
+    if (!this.canPreviewZeroPose()) return;
+    const item = this.items().find((entry) => entry.snapshotId === snapshotId);
+    if (!item || item.missing) {
+      this.problem.set('参与原图已删除或尚未加载，请刷新识别任务');
+      return;
+    }
+    this.problem.set('');
+    this.comparisonMode.set('zero-pose');
+    this.selectItem(item);
+    this.focusAnnotationCanvas();
+    void this.measureZeroPose();
+  }
+  stopZeroPosePreview() {
+    this.comparisonMode.set('validation');
+    void this.measure();
+  }
+  private async measureZeroPose() {
+    const task = this.selected(), candidate = this.zeroPoseCandidate(), item = this.item();
+    const request = ++this.validationRequest;
+    this.zeroPoseMeasurementResult.set(null);
+    this.measuring.set(false);
+    if (this.destroyed || !task || !candidate?.zeroPose || candidate.stale || !item || item.missing || this.dirty()
+      || !candidate.sourceSnapshotIds.includes(item.snapshotId)) return;
+    this.measuring.set(true);
+    try {
+      const result = await this.api.measureZeroPose(task.id, task.revision, candidate.resultId, item.snapshotId);
+      if (!this.destroyed && request === this.validationRequest) this.zeroPoseMeasurementResult.set(result);
+    } catch (error) { if (!this.destroyed && request === this.validationRequest) this.problem.set(errorMessage(error)); }
+    finally { if (request === this.validationRequest) this.measuring.set(false); }
   }
   async validate() {
     if (this.busy() || this.loading() || this.running() || this.generatingPanorama() || !await this.save()) return;
@@ -1083,6 +1132,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     void this.measure();
   }
   private async measure() {
+    if (this.comparisonMode() === 'zero-pose') return this.measureZeroPose();
     if (this.comparisonMode() !== 'validation') return this.measureRefinement();
     if (this.destroyed) return;
     const request = ++this.validationRequest;
@@ -1111,7 +1161,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.refinementMeasurementResult.set(null);
     this.validationResult.set(null);
     this.measuring.set(false);
-    if (!task?.refinementSelection?.base || this.dirty() || this.running() || mode === 'validation'
+    if (!task?.refinementSelection?.base || this.dirty() || this.running() || (mode !== 'before' && mode !== 'after')
       || (mode === 'after' && (!task.refinement || task.refinement.stale))) return;
     const revision = this.revision, selectionRevision = task.refinementSelection.revision;
     this.measuring.set(true);

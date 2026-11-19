@@ -191,6 +191,26 @@ export interface HorizonMeasurement {
   directionDifferenceDegrees: number | null;
   rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null;
 }
+export interface ZeroPoseCandidate {
+  model: 'wgs84-horizon-zero-pose-v1';
+  resultId: string; revision: number; generatedAt: string; startTime: string; endTime: string;
+  status: InstallationEstimate['status']; zeroPose: ZeroPose | null;
+  generatedCamera: Camera;
+  fixedCalibration: Pick<Calibration, 'longitude' | 'latitude' | 'height'> & Pick<ZeroPose, 'yaw' | 'tiltOffset'>
+    & { imageRoll: 0; cameraUpdatedAt: string };
+  sourceSnapshotIds: string[]; excluded: InstallationEstimate['excluded'];
+  distinctPanCount: number; panCoverageDegrees: number;
+  diagnostics?: { converged: boolean; iterations: number; conditionNumber: number | null;
+    rmsResidualPixels: number; rmsAngularResidualDegrees: number; maximumAcceptedRmsPixels: number;
+    perSnapshot: Omit<HorizonMeasurement, 'theoreticalHorizon' | 'verticalResiduals' | 'directionDifferenceDegrees' | 'verticalOffsetPixels'>[] };
+  message: string; stale: boolean; staleReasons: string[];
+  applied: boolean; appliedAt: string | null;
+}
+export interface ZeroPoseMeasurement {
+  taskId: string; revision: number; resultId: string;
+  model: ZeroPoseCandidate['model']; zeroPose: ZeroPose;
+  perSnapshot: HorizonMeasurement[]; excluded: InstallationEstimate['excluded'];
+}
 export interface RefinementSelection {
   revision: number;
   base: { taskId: string; revision: number; resultId: string } | null;
@@ -231,6 +251,7 @@ export interface RecognitionTask {
   resultId: string | null;
   resultRevision?: number;
   fitCamera?: Calibration;
+  zeroPoseCandidate?: ZeroPoseCandidate;
   refinementSelection?: RefinementSelection;
   refinement?: InstallationRefinement;
 }

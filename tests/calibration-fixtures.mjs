@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { Cartesian3, Ellipsoid, IntersectionTests, Ray } from 'cesium';
+import { Cartesian3, Ellipsoid, IntersectionTests, Matrix3, Matrix4, Ray, Transforms } from 'cesium';
 import { createCameraPose } from '../src/app/camera-math.ts';
 
 export const fixtureCamera = {
@@ -10,13 +10,15 @@ export const fixtureCamera = {
 };
 export const fixtureRange = { startTime: '2026-11-09T00:00:00Z', endTime: '2026-11-09T01:00:00Z' };
 
-export function syntheticSnapshots({ camera = fixtureCamera, pitch = 1.25, roll = -2.1, pans = [0, 60, 120, 180, 240, 300], ptzOverrides = {} } = {}) {
+export function syntheticSnapshots({ camera = fixtureCamera, zeroPose, pitch = 1.25, roll = -2.1,
+  pans = [0, 60, 120, 180, 240, 300], ptzOverrides = {} } = {}) {
   const snapshots = [];
   const observations = [];
   pans.forEach((pan, index) => {
     const raw = { Pan: pan, Tilt: 2 + index * 0.1, Zoom: 3 + index,
       HorizontalFieldAngle: 24 - index, VerticalFieldAngle: 13.5 - index * 0.4, ...ptzOverrides };
-    const pose = createCameraPose({ ...camera, pAxisPitch: pitch, pAxisRoll: roll }, raw);
+    const pose = zeroPose ? syntheticZeroPose(camera, zeroPose, raw)
+      : createCameraPose({ ...camera, pAxisPitch: pitch, pAxisRoll: roll }, raw);
     // 用 Cesium 射线命中/未命中的分界生成海天线，与拟合器的切线角残差独立。
     const hitsSea = (x, y) => {
       const direction = Cartesian3.add(pose.direction, Cartesian3.add(
@@ -48,4 +50,20 @@ export function syntheticSnapshots({ camera = fixtureCamera, pitch = 1.25, roll 
     observations.push({ snapshotId: snapshot.id, points });
   });
   return { snapshots, observations };
+}
+
+function syntheticZeroPose(camera, pose, { Pan, Tilt }) {
+  const rad = Math.PI / 180;
+  const position = Cartesian3.fromDegrees(camera.longitude, camera.latitude, camera.height);
+  const enu = Matrix4.getMatrix3(Transforms.eastNorthUpToFixedFrame(position), new Matrix3());
+  const relative = (axis) => {
+    const vector = Matrix3.multiplyByVector(Matrix3.fromRotationX((pose.tiltOffset - Tilt) * rad), axis, new Cartesian3());
+    Matrix3.multiplyByVector(Matrix3.fromRotationZ(-Pan * rad), vector, vector);
+    Matrix3.multiplyByVector(Matrix3.fromRotationX(-pose.tiltOffset * rad), vector, vector);
+    Matrix3.multiplyByVector(Matrix3.fromRotationY(pose.roll * rad), vector, vector);
+    Matrix3.multiplyByVector(Matrix3.fromRotationX(pose.pitch * rad), vector, vector);
+    Matrix3.multiplyByVector(Matrix3.fromRotationZ(-pose.yaw * rad), vector, vector);
+    return Matrix3.multiplyByVector(enu, vector, vector);
+  };
+  return { position, right: relative(Cartesian3.UNIT_X), direction: relative(Cartesian3.UNIT_Y), up: relative(Cartesian3.UNIT_Z) };
 }

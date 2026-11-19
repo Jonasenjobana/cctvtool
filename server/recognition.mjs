@@ -6,14 +6,15 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { httpError } from './errors.mjs';
 import { calibrationKeys, calibrationOf } from './store.mjs';
-import { estimateInstallation, evaluateInstallation, refineInstallation } from './tilt-calibration.mjs';
+import { estimateInstallation, estimateZeroPose, evaluateInstallation, refineInstallation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
 import { refinementInputs, refinementStaleReasons, withRefinementState } from './installation-refinement.mjs';
+import { requireZeroPoseCandidate, zeroPoseCandidateStaleReasons } from './zero-pose-candidate.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
 const fittedKeys = ['pAxisPitch', 'pAxisRoll', 'tiltOffset', 'imageRoll'];
 const validPoints = (points) => Array.isArray(points) && points.length === 2
-  && points.every((point) => [point.x, point.y].every((value) => Number.isFinite(value) && value >= 0 && value <= 1))
+  && points.every((point) => [point?.x, point?.y].every((value) => Number.isFinite(value) && value >= 0 && value <= 1))
   && Math.abs(points[0].x - points[1].x) >= 0.1;
 const median = (values) => {
   const sorted = [...values].sort((a, b) => a - b);
@@ -105,6 +106,14 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   const queued = [];
   let current = null, closing = false;
 
+  function withRecognitionState(task) {
+    if (task.zeroPoseCandidate) {
+      const staleReasons = zeroPoseCandidateStaleReasons(store, task);
+      task = { ...task, zeroPoseCandidate: { ...task.zeroPoseCandidate, stale: staleReasons.length > 0, staleReasons } };
+    }
+    return withRefinementState(store, task);
+  }
+
   function editable(id, revision) {
     const task = store.getRecognitionTask(id);
     if (activeStatuses.includes(task.status)) throw httpError(409, '请等待识别结束或取消后再编辑');
@@ -125,6 +134,29 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       reason: item.missing ? '源截图已删除' : item.ignoreReason })));
     return { result, resultId: randomUUID(), resultRevision: task.revision, appliedAt: null, appliedRevision: null,
       fitCamera: { ...calibrationOf(camera), serial: camera.serial, code: camera.code, updatedAt: camera.updatedAt } };
+  }
+
+  function zeroPoseChanges(task) {
+    if (store.getSnapshotGroup(task.sourceTaskId).horizon?.phase === 'coarse') {
+      throw httpError(409, '历史预扫粗结果仅供查看，请从正式截图任务生成零位候选');
+    }
+    const camera = store.getCamera(task.cameraId);
+    const selected = [], excluded = [];
+    for (const item of store.recognitionItems(task.id)) {
+      let reason;
+      if (item.missing) reason = '源截图已删除';
+      else if (item.snapshot.cameraId !== task.cameraId) reason = '截图不属于该摄像头';
+      else if (item.ignored) reason = item.ignoreReason || '已忽略';
+      else if (!validPoints(item.points)) reason = '海天线正式标注无效';
+      else if (!store.hasSnapshotImage(item.snapshot)) reason = '源截图文件缺失';
+      if (reason) excluded.push({ snapshotId: item.snapshotId, reason }); else selected.push(item);
+    }
+    const dates = selected.length ? selected.map((item) => +new Date(item.snapshot.createdAt)) : [+new Date(task.createdAt)];
+    const result = estimateZeroPose(camera, selected.map((item) => item.snapshot), selected.map(({ snapshotId, points }) => ({ snapshotId, points })), {
+      startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
+    });
+    return { zeroPoseCandidate: { ...result, excluded: [...excluded, ...result.excluded], resultId: randomUUID(),
+      revision: task.revision, generatedCamera: camera, applied: false, appliedAt: null } };
   }
 
   function createTask(sourceTaskId, { autoGenerate = false } = {}) {
@@ -229,9 +261,9 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   });
   app.get('/api/recognition-tasks', { schema: { querystring: paging } }, async (request) => {
     const page = store.listRecognitionTasks(pageOptions(request.query));
-    return { ...page, tasks: page.tasks.map((task) => withRefinementState(store, task)) };
+    return { ...page, tasks: page.tasks.map(withRecognitionState) };
   });
-  app.get('/api/recognition-tasks/:id', async (request) => withRefinementState(store, store.getRecognitionTask(request.params.id)));
+  app.get('/api/recognition-tasks/:id', async (request) => withRecognitionState(store.getRecognitionTask(request.params.id)));
   app.get('/api/recognition-tasks/:id/panorama-guide', async (request) => store.getRecognitionPanoramaGuide(request.params.id));
   app.put('/api/recognition-tasks/:id/panorama-guide', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'guide'], properties: {
@@ -257,7 +289,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const task = store.getRecognitionTask(request.params.id);
     const options = pageOptions(request.query);
     const items = store.recognitionItems(task.id, options);
-    return { task: withRefinementState(store, task), items, total: task.sampleCount, offset: options.offset,
+    return { task: withRecognitionState(task), items, total: task.sampleCount, offset: options.offset,
       nextOffset: options.offset + items.length < task.sampleCount ? options.offset + items.length : null };
   });
   app.post('/api/recognition-tasks/:id/cancel', async (request) => {
@@ -284,12 +316,33 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       const item = store.updateRecognitionItem(task.id, previous.snapshotId, { points, ignored,
         ...(request.body.points ? { source: 'manual' } : {}), ignoreReason: ignored ? '已人工忽略' : '' });
       const updated = store.updateRecognitionTask(task.id, { revision: task.revision + 1, result: null, resultId: null });
-      return { task: withRefinementState(store, updated), item };
+      return { task: withRecognitionState(updated), item };
     });
   });
-  app.post('/api/recognition-tasks/:id/generate', { schema: { body: bodyWithRevision } }, async (request) => {
-    const task = editable(request.params.id, request.body.revision);
-    return withRefinementState(store, store.updateRecognitionTask(task.id, installationChanges(task)));
+  app.post('/api/recognition-tasks/:id/generate', { schema: { body: {
+    ...bodyWithRevision, properties: { ...bodyWithRevision.properties,
+      model: { type: 'string', enum: ['wgs84-horizon-installation-v1', ZERO_POSE_MODEL] } },
+  } } }, async (request) => {
+    const { revision, model } = request.body;
+    if (model === ZERO_POSE_MODEL) return store.transaction(() => {
+      const task = editable(request.params.id, revision);
+      return withRecognitionState(store.updateRecognitionTask(task.id, zeroPoseChanges(task)));
+    });
+    const task = editable(request.params.id, revision);
+    return withRecognitionState(store.updateRecognitionTask(task.id, installationChanges(task)));
+  });
+  app.post('/api/recognition-tasks/:id/zero-pose-measure', { schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'resultId', 'snapshotId'],
+    properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 }, snapshotId: { type: 'string', minLength: 1 } },
+  } } }, async (request) => {
+    const { revision, resultId, snapshotId } = request.body;
+    const task = editable(request.params.id, revision);
+    const candidate = requireZeroPoseCandidate(store, task, resultId, revision);
+    if (!candidate.sourceSnapshotIds.includes(snapshotId)) throw httpError(409, '该原图未参与零位候选拟合');
+    const { snapshot, points } = store.getRecognitionItem(task.id, snapshotId);
+    const { model, zeroPose, perSnapshot, excluded } = evaluateInstallation({ ...candidate.generatedCamera, zeroPose: candidate.zeroPose },
+      [snapshot], [{ snapshotId, points }], candidate, ZERO_POSE_MODEL);
+    return { taskId: task.id, revision, resultId, model, zeroPose, perSnapshot, excluded };
   });
   const sourceVersion = { type: 'object', additionalProperties: false, required: ['taskId', 'revision'], properties: {
     taskId: { type: 'string', minLength: 1 }, revision: revisionSchema,
@@ -308,7 +361,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     }
     const { base, supplemental, selectionRevision } = request.body;
     if (base) refinementInputs(store, task, { base, supplemental });
-    return withRefinementState(store, store.updateRecognitionTask(task.id, { refinementSelection: { revision: selectionRevision + 1, base, supplemental } }));
+    return withRecognitionState(store.updateRecognitionTask(task.id, { refinementSelection: { revision: selectionRevision + 1, base, supplemental } }));
   }));
   app.post('/api/recognition-tasks/:id/refine', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'selectionRevision'], properties: {
@@ -338,7 +391,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       }
       const changed = refinementStaleReasons(store, { ...currentTask, refinement });
       if (changed.length) throw httpError(409, changed.join('；'));
-      return store.updateRecognitionTask(task.id, { refinement });
+      return withRecognitionState(store.updateRecognitionTask(task.id, { refinement }));
     });
   });
   app.post('/api/recognition-tasks/:id/refinement-measure', { schema: { body: {
@@ -441,7 +494,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const installation = Object.fromEntries(fittedKeys.map((key) => [key, candidate.installation[key]]));
     const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id);
     const updated = store.updateRecognitionTask(task.id, { refinement: { ...candidate, applied: true, appliedAt: new Date().toISOString() } });
-    return { task: withRefinementState(store, updated), camera: updatedCamera };
+    return { task: withRecognitionState(updated), camera: updatedCamera };
   }));
   app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },
@@ -463,7 +516,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id);
       const updated = store.updateRecognitionTask(task.id, { appliedAt: new Date().toISOString(), appliedRevision: task.revision,
         result: { ...task.result, applied: true } });
-      return { task: updated, camera: updatedCamera };
+      return { task: withRecognitionState(updated), camera: updatedCamera };
     });
   });
   return { createTask,

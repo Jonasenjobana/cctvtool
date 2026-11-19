@@ -28,7 +28,11 @@
           @if (running()) { <button type="button" [disabled]="busy() || loading()" (click)="cancel()">取消识别</button> }
           @else {
             <button type="button" [disabled]="busy() || loading() || dirty() || generatingPanorama()" (click)="recreate()">创建新一轮识别</button>
-            <button type="button" class="primary" [disabled]="busy() || loading() || generatingPanorama()" (click)="generate()">{{ busy() ? '处理中…' : '生成安装参数' }}</button>
+            <button type="button" [class.primary]="coarse()" [disabled]="busy() || loading() || generatingPanorama()" (click)="generate()">生成安装参数</button>
+            @if (!coarse()) {
+              <button type="button" class="primary" [disabled]="busy() || loading() || generatingPanorama() || !sourceGroup()"
+                (click)="generate(true)">{{ busy() ? '处理中…' : '生成零位候选' }}</button>
+            }
           }
         </div>
       </div>
@@ -376,6 +380,55 @@
           @if (coarse()) { <p class="note">历史预扫粗结果仅供查看，不应用到摄像头配置。</p> }
           @if (sourceGroup()?.horizon?.phase === 'fine') { <p class="note">本任务逐点 T 不同。突变过滤仅比较同一 T/Z/FOV 的样本，仍需逐图复核。</p> }
           <p class="note">修改标注后需重新生成安装参数；已选基准的独立复核自动更新。</p>
+          @if (zeroPoseCandidate(); as candidate) {
+            <section class="validation-section" aria-label="零位姿态候选">
+              <div class="section-heading"><h2>零位姿态候选</h2></div>
+              <p class="result-message" [class.error]="candidate.status !== 'estimated'">{{ candidate.message }}</p>
+              @if (candidate.stale) { <p class="error">候选已过期。{{ candidate.staleReasons.join('，') }}</p> }
+              <p class="note">{{ candidate.model }} · 标注版本 {{ candidate.revision }} · 相机配置 {{ candidate.generatedCamera.updatedAt | date:'yyyy-MM-dd HH:mm:ss' }}</p>
+              <table><tbody>
+                @if (candidate.zeroPose; as pose) {
+                  <tr><th scope="row">零位 Roll</th><td>{{ pose.roll | number:'1.4-4' }}°</td></tr>
+                  <tr><th scope="row">零位 Pitch</th><td>{{ pose.pitch | number:'1.4-4' }}°</td></tr>
+                }
+                <tr><th scope="row">固定 Yaw</th><td>{{ candidate.fixedCalibration.yaw | number:'1.4-4' }}°</td></tr>
+                <tr><th scope="row">固定 T 补偿</th><td>{{ candidate.fixedCalibration.tiltOffset | number:'1.4-4' }}°</td></tr>
+              </tbody></table>
+              <dl class="result-metrics">
+                <div><dt>参与原图</dt><dd>{{ candidate.sourceSnapshotIds.length }}<small>张</small></dd></div>
+                <div><dt>P 覆盖</dt><dd>{{ candidate.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
+                <div><dt>P 方向</dt><dd>{{ candidate.distinctPanCount }}<small>个</small></dd></div>
+                @if (candidate.diagnostics; as quality) {
+                  <div><dt>像素 RMS</dt><dd>{{ quality.rmsResidualPixels | number:'1.2-2' }}<small>px</small></dd></div>
+                  <div><dt>角度 RMS</dt><dd>{{ quality.rmsAngularResidualDegrees | number:'1.4-4' }}<small>°</small></dd></div>
+                  <div><dt>{{ quality.converged ? '已收敛' : '未收敛' }} · 条件数</dt><dd>{{ quality.conditionNumber === null ? '不可辨识' : (quality.conditionNumber | number:'1.0-2') }}</dd></div>
+                }
+              </dl>
+              @if (comparisonMode() === 'zero-pose') {
+                <button type="button" (click)="stopZeroPosePreview()">关闭零位预览</button>
+              }
+              @if (candidate.diagnostics; as quality) {
+                <details><summary>参与原图与误差</summary>
+                  <div class="validation-table">
+                    <table>
+                      <thead><tr><th scope="col">P / T / Z</th><th scope="col">RMS（px）</th><th scope="col">RMS（°）</th></tr></thead>
+                      <tbody>@for (row of quality.perSnapshot; track row.snapshotId) {
+                        <tr><th scope="row"><button type="button" [disabled]="!canPreviewZeroPose()"
+                          [attr.aria-pressed]="comparisonMode() === 'zero-pose' && displayedItem()?.snapshotId === row.snapshotId"
+                          (click)="previewZeroPose(row.snapshotId)">{{ row.pan | number:'1.1-2' }}° / {{ row.tilt | number:'1.1-2' }}° / {{ row.zoom }}</button></th>
+                          <td>{{ row.rmsResidualPixels | number:'1.2-2' }}</td><td>{{ row.rmsAngularResidualDegrees | number:'1.4-4' }}</td></tr>
+                      }</tbody>
+                    </table>
+                  </div>
+                </details>
+              }
+              @if (candidate.excluded.length) {
+                <details><summary>排除 {{ candidate.excluded.length }} 张截图</summary><ul>
+                  @for (entry of candidate.excluded; track entry.snapshotId) { <li>{{ entry.snapshotId }} · {{ entry.reason }}</li> }
+                </ul></details>
+              }
+            </section>
+          }
           <section class="validation-section" aria-label="基础与高倍联合精修">
             <div class="section-heading"><h2>联合精修</h2></div>
             <label class="validation-source">基础标定结果

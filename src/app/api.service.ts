@@ -3,7 +3,7 @@ import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
 import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage, InstallationValidation,
-  RefinementSelection, RefinementMeasurement } from './models';
+  RefinementSelection, RefinementMeasurement, ZeroPoseCandidate, ZeroPoseMeasurement } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
 import type { PanoramaGuide, PanoramaGuideState } from '../../shared/panorama-guide';
@@ -138,8 +138,12 @@ export class ApiService {
     return firstValueFrom(this.http.put<{ task: RecognitionTask; item: RecognitionItem }>(`/api/recognition-tasks/${id}/items/${snapshotId}`,
       { revision, ignored, ...(points?.length ? { points } : {}) }).pipe(timeout(10000)));
   }
-  generateInstallation(id: string, revision: number) {
-    return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/generate`, { revision }).pipe(timeout(95000)));
+  generateInstallation(id: string, revision: number, model?: ZeroPoseCandidate['model']) {
+    return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/generate`, { revision, model }).pipe(timeout(95000)));
+  }
+  measureZeroPose(id: string, revision: number, resultId: string, snapshotId: string) {
+    return firstValueFrom(this.http.post<ZeroPoseMeasurement>(`/api/recognition-tasks/${id}/zero-pose-measure`,
+      { revision, resultId, snapshotId }).pipe(timeout(10000)));
   }
   saveRefinementSources(id: string, revision: number, selection: RefinementSelection) {
     return firstValueFrom(this.http.put<RecognitionTask>(`/api/recognition-tasks/${id}/refinement-sources`,

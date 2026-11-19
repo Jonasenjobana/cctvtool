@@ -1,5 +1,5 @@
-import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { httpError } from './errors.mjs';
@@ -27,7 +27,8 @@ export function calibrationOf(camera) {
 
 export class CameraStore {
   constructor(dataDir, { readOnly = false } = {}) {
-    if (!readOnly) mkdirSync(join(dataDir, 'snapshots'), { recursive: true });
+    this.snapshotDirectory = resolve(dataDir, 'snapshots');
+    if (!readOnly) mkdirSync(this.snapshotDirectory, { recursive: true });
     this.db = new DatabaseSync(join(dataDir, 'cctv.sqlite'), { readOnly });
     if (!readOnly) {
       this.db.exec(`
@@ -251,6 +252,12 @@ export class CameraStore {
     const row = this.db.prepare('SELECT metadata FROM snapshots WHERE id = ?').get(id);
     if (!row) throw httpError(404, '截图不存在');
     return snapshotRecord(row);
+  }
+
+  hasSnapshotImage(snapshot) {
+    if (!snapshot.fileName) return false;
+    const path = resolve(this.snapshotDirectory, snapshot.fileName);
+    return dirname(path) === this.snapshotDirectory && !!statSync(path, { throwIfNoEntry: false })?.isFile();
   }
 
   deleteSnapshot(id) {

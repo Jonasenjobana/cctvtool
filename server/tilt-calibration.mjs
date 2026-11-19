@@ -1,9 +1,12 @@
 import { Cartesian3, Ellipsoid, Matrix3, Matrix4, Transforms } from 'cesium';
 import { createLocalRigRotation } from '#camera-rotation';
+import { createZeroPoseRigRotation, resolveZeroPose } from '#zero-pose';
 import { httpError } from './errors.mjs';
 
 const rad = Math.PI / 180;
 const maximumRmsPixels = 5;
+const installationModel = 'wgs84-horizon-installation-v1';
+export const ZERO_POSE_MODEL = 'wgs84-horizon-zero-pose-v1';
 
 export function calibrationRange(startTime, endTime) {
   const withZone = /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/i;
@@ -84,16 +87,23 @@ function prepareSamples(camera, snapshots, observations, range) {
   return { samples, excluded };
 }
 
-function residuals(parameters, camera, geometry, samples) {
+function legacyRotation(camera, parameters, ptz) {
+  return createLocalRigRotation({ pAxisPitch: parameters[0], pAxisRoll: parameters[1],
+    panOffset: camera.panOffset, tiltOffset: parameters[2] ?? camera.tiltOffset,
+    imageRoll: parameters[3] ?? camera.imageRoll }, ptz).camera;
+}
+
+function rayColumns(rotation, geometry) {
+  const world = Matrix3.multiply(geometry.enu, rotation, new Matrix3());
+  return [0, 1, 2].map((index) => Cartesian3.multiplyComponents(
+    Matrix3.getColumn(world, index, new Cartesian3()), geometry.inverseRadii, new Cartesian3(),
+  ));
+}
+
+function residuals(parameters, camera, geometry, samples, rotation = (values, ptz) => legacyRotation(camera, values, ptz)) {
   const result = [];
   for (const sample of samples) {
-    const rig = createLocalRigRotation({ pAxisPitch: parameters[0], pAxisRoll: parameters[1],
-      panOffset: camera.panOffset, tiltOffset: parameters[2] ?? camera.tiltOffset,
-      imageRoll: parameters[3] ?? camera.imageRoll }, sample.ptz);
-    const world = Matrix3.multiply(geometry.enu, rig.camera, new Matrix3());
-    const columns = [0, 1, 2].map((index) => Cartesian3.multiplyComponents(
-      Matrix3.getColumn(world, index, new Cartesian3()), geometry.inverseRadii, new Cartesian3(),
-    ));
+    const columns = rayColumns(rotation(parameters, sample.ptz), geometry);
     for (const point of sample.points) {
       const ray = Cartesian3.add(columns[1], Cartesian3.add(
         Cartesian3.multiplyByScalar(columns[0], point.nx, new Cartesian3()),
@@ -266,21 +276,21 @@ function solveLinear(matrix, vector) {
 }
 
 function installationConditionNumber(matrix) {
-  const inverseColumns = [0, 1, 2, 3].map((index) => solveLinear(matrix, [0, 1, 2, 3].map((column) => Number(column === index))));
+  const inverseColumns = matrix.map((_, index) => solveLinear(matrix, matrix.map((_, column) => Number(column === index))));
   if (!inverseColumns.every(Boolean)) return null;
   const norm = Math.max(...matrix.map((row) => row.reduce((sum, value) => sum + Math.abs(value), 0)));
-  const inverseNorm = Math.max(...[0, 1, 2, 3].map((row) => inverseColumns.reduce((sum, column) => sum + Math.abs(column[row]), 0)));
+  const inverseNorm = Math.max(...matrix.map((_, row) => inverseColumns.reduce((sum, column) => sum + Math.abs(column[row]), 0)));
   return Number.isFinite(norm * inverseNorm) ? norm * inverseNorm : null;
 }
 
-function linearizeInstallation(parameters, camera, geometry, samples) {
-  const values = residuals(parameters, camera, geometry, samples);
+function linearizeInstallation(parameters, calculateResiduals) {
+  const values = calculateResiduals(parameters);
   const derivatives = parameters.map((_, axis) => {
     const above = [...parameters], below = [...parameters];
     above[axis] += 0.0001;
     below[axis] -= 0.0001;
-    const plus = residuals(above, camera, geometry, samples);
-    const minus = residuals(below, camera, geometry, samples);
+    const plus = calculateResiduals(above);
+    const minus = calculateResiduals(below);
     return plus.map((value, index) => (value.pixels - minus[index].pixels) / 0.0002);
   });
   const matrix = parameters.map(() => parameters.map(() => 0));
@@ -295,20 +305,36 @@ function linearizeInstallation(parameters, camera, geometry, samples) {
   return { values, matrix, gradient };
 }
 
-function optimizeInstallation(initial, camera, geometry, samples) {
+const legacyLimits = [89, 89, 180, 180];
+
+function installationFitModel(camera, geometry, samples, model = installationModel) {
+  const zeroPose = model === ZERO_POSE_MODEL ? resolveZeroPose(camera) : null;
+  const initial = zeroPose ? [zeroPose.roll, zeroPose.pitch] : [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
+  // Roll 的周期为 360°，优化沿连续角度进行，在生成参数时归一化。
+  const limits = zeroPose ? [Infinity, 90] : legacyLimits;
+  const calibrationOf = zeroPose ? ([roll, pitch]) => ({ zeroPose: {
+    ...zeroPose, pitch, roll: ((roll % 360 + 540) % 360) - 180,
+  } }) : ([pAxisPitch, pAxisRoll, tiltOffset, imageRoll]) => ({ installation: { pAxisPitch, pAxisRoll, tiltOffset, imageRoll } });
+  const rotation = zeroPose ? (parameters, ptz) => createZeroPoseRigRotation(calibrationOf(parameters).zeroPose, ptz).camera
+    : (parameters, ptz) => legacyRotation(camera, parameters, ptz);
+  return { initial, limits, calibrationOf, rotation,
+    residuals: (parameters) => residuals(parameters, camera, geometry, samples, rotation) };
+}
+
+function optimizeInstallation(initial, calculateResiduals, limits) {
   let parameters = [...initial], damping = 0.001;
-  let cost = loss(residuals(parameters, camera, geometry, samples));
+  let cost = loss(calculateResiduals(parameters));
   let converged = false, iterations = 0;
   for (; iterations < 100; iterations++) {
-    const normal = linearizeInstallation(parameters, camera, geometry, samples);
+    const normal = linearizeInstallation(parameters, calculateResiduals);
     const matrix = normal.matrix.map((row, index) => row.map((value, column) => value
       + (index === column ? damping * Math.max(value, 1e-6) : 0)));
     const step = solveLinear(matrix, normal.gradient.map((value) => -value));
     if (!step) break;
     const scale = Math.min(1, 15 / Math.max(...step.map(Math.abs), 1e-12));
     const next = parameters.map((value, index) => value + step[index] * scale);
-    if (next.some((value, index) => Math.abs(value) >= (index < 2 ? 89 : 180))) { damping *= 10; continue; }
-    const nextCost = loss(residuals(next, camera, geometry, samples));
+    if (next.some((value, index) => Math.abs(value) >= limits[index])) { damping *= 10; continue; }
+    const nextCost = loss(calculateResiduals(next));
     if (nextCost <= cost) {
       const change = cost - nextCost;
       parameters = next;
@@ -323,15 +349,10 @@ function optimizeInstallation(initial, camera, geometry, samples) {
   return { parameters, cost, converged, iterations: iterations + 1 };
 }
 
-function horizonMeasurements(parameters, camera, geometry, sample) {
+function horizonMeasurements(rotation, geometry, sample) {
   const { width, height } = sample.snapshot;
   const tanH = width / (2 * sample.fx), tanV = height / (2 * sample.fy);
-  const rig = createLocalRigRotation({ pAxisPitch: parameters[0], pAxisRoll: parameters[1],
-    panOffset: camera.panOffset, tiltOffset: parameters[2], imageRoll: parameters[3] }, sample.ptz);
-  const world = Matrix3.multiply(geometry.enu, rig.camera, new Matrix3());
-  const columns = [0, 1, 2].map((index) => Cartesian3.multiplyComponents(
-    Matrix3.getColumn(world, index, new Cartesian3()), geometry.inverseRadii, new Cartesian3(),
-  ));
+  const columns = rayColumns(rotation, geometry);
   const theoreticalY = (x) => {
     const horizontal = Cartesian3.add(columns[1], Cartesian3.multiplyByScalar(columns[0], (2 * x - 1) * tanH, new Cartesian3()), new Cartesian3());
     const angleAt = (y) => {
@@ -377,38 +398,53 @@ function horizonMeasurements(parameters, camera, geometry, sample) {
     verticalOffsetPixels: verticalResiduals[1].offsetPixels };
 }
 
-export function evaluateInstallation(camera, snapshots, observations, requestedRange) {
-  const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
-  const parameters = [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
-  if (!parameters.every((value, index) => Number.isFinite(value) && Math.abs(value) < (index < 2 ? 89 : 180))) {
-    throw httpError(400, '独立复核需要完整有效的固定安装参数');
+function zeroPoseGeometry(camera, pose) {
+  if (!pose || ![pose.roll, pose.pitch, pose.yaw, pose.tiltOffset].every(Number.isFinite)
+    || Math.abs(pose.roll) > 180 || Math.abs(pose.pitch) > 90 || pose.yaw < 0 || pose.yaw >= 360) {
+    throw httpError(400, '请先为该摄像头保存有效的零位姿态');
   }
-  const geometry = cameraGeometry(camera);
-  const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
-  const base = { model: 'wgs84-horizon-installation-v1', generatedAt: new Date().toISOString(), ...range,
-    installation: { pAxisPitch: parameters[0], pAxisRoll: parameters[1], tiltOffset: parameters[2], imageRoll: parameters[3] },
-    sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded,
-    ...panCoverage(samples.map((sample) => sample.ptz.Pan)), maximumAcceptedRmsPixels: maximumRmsPixels };
-  if (!samples.length) return { ...base, status: 'insufficient_data', perSnapshot: [], failedSnapshotIds: [],
-    rmsResidualPixels: null, rmsAngularResidualDegrees: null, maximumResidualPixels: null,
-    message: '没有有效的停稳截图和海天线标注，无法独立复核' };
-  // 复核只计算固定参数的残差，不调用优化器，也不按复核结果修改参数。
+  return cameraGeometry({ ...camera, panOffset: pose.yaw, tiltOffset: pose.tiltOffset, imageRoll: 0 });
+}
+
+function summarizeResiduals(samples, residualValues) {
   const byId = new Map();
-  for (const value of residuals(parameters, camera, geometry, samples)) {
+  for (const value of residualValues) {
     const values = byId.get(value.snapshotId) || [];
     values.push(value);
     byId.set(value.snapshotId, values);
   }
-  const perSnapshot = samples.map((sample) => {
+  return samples.map((sample) => {
     const values = byId.get(sample.snapshot.id);
     return { snapshotId: sample.snapshot.id, pan: sample.ptz.Pan, tilt: sample.ptz.Tilt, zoom: sample.ptz.Zoom,
       width: sample.snapshot.width, height: sample.snapshot.height,
       horizontalFieldAngle: sample.ptz.HorizontalFieldAngle, verticalFieldAngle: sample.ptz.VerticalFieldAngle,
       timeAlignment: sample.snapshot.timeAlignment || 'unverified',
       rmsResidualPixels: Math.sqrt(values.reduce((sum, value) => sum + value.pixels ** 2, 0) / values.length),
-      rmsAngularResidualDegrees: Math.sqrt(values.reduce((sum, value) => sum + value.angle ** 2, 0) / values.length) / rad,
-      ...horizonMeasurements(parameters, camera, geometry, sample) };
+      rmsAngularResidualDegrees: Math.sqrt(values.reduce((sum, value) => sum + value.angle ** 2, 0) / values.length) / rad };
   });
+}
+
+export function evaluateInstallation(camera, snapshots, observations, requestedRange, model = installationModel) {
+  const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
+  if (model !== installationModel && model !== ZERO_POSE_MODEL) throw httpError(400, '不支持该海天线标定模型');
+  const zeroPose = model === ZERO_POSE_MODEL;
+  const geometry = zeroPose ? zeroPoseGeometry(camera, camera.zeroPose) : cameraGeometry(camera);
+  const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
+  const fit = installationFitModel(camera, geometry, samples, model);
+  if (!zeroPose && !fit.initial.every((value, index) => Number.isFinite(value) && Math.abs(value) < fit.limits[index])) {
+    throw httpError(400, '独立复核需要完整有效的固定安装参数');
+  }
+  const base = { model, generatedAt: new Date().toISOString(), ...range,
+    ...(zeroPose ? { zeroPose: camera.zeroPose } : fit.calibrationOf(fit.initial)),
+    sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded,
+    ...panCoverage(samples.map((sample) => sample.ptz.Pan)), maximumAcceptedRmsPixels: maximumRmsPixels };
+  if (!samples.length) return { ...base, status: 'insufficient_data', perSnapshot: [], failedSnapshotIds: [],
+    rmsResidualPixels: null, rmsAngularResidualDegrees: null, maximumResidualPixels: null,
+    message: '没有有效的停稳截图和海天线标注，无法独立复核' };
+  // 复核只计算固定参数的残差，不调用优化器，也不按复核结果修改参数。
+  const perSnapshot = summarizeResiduals(samples, fit.residuals(fit.initial)).map((row, index) => ({
+    ...row, ...horizonMeasurements(fit.rotation(fit.initial, samples[index].ptz), geometry, samples[index]),
+  }));
   const rms = (key) => Math.sqrt(perSnapshot.reduce((sum, item) => sum + item[key] ** 2, 0) / perSnapshot.length);
   const failedSnapshotIds = perSnapshot.filter((item) => !Number.isFinite(item.rmsResidualPixels)
     || item.rmsResidualPixels > maximumRmsPixels).map((item) => item.snapshotId);
@@ -425,7 +461,7 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
   const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
   const coverage = panCoverage(samples.map((sample) => sample.ptz.Pan));
   const base = {
-    model: 'wgs84-horizon-installation-v1', generatedAt: new Date().toISOString(),
+    model: installationModel, generatedAt: new Date().toISOString(),
     cameraId: camera.id, cameraName: camera.name, ...range, applied: false,
     sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded, ...coverage,
     fixedCalibration: { longitude: camera.longitude, latitude: camera.latitude, height: camera.height,
@@ -435,11 +471,11 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
     return { ...base, status: 'insufficient_data', installation: null,
       message: '没有有效的停稳截图和海天线标注，无法进行拟合' };
   }
-  const current = [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
+  const fit = installationFitModel(camera, geometry, samples);
   const starts = [[0, 0, 0, 0]];
-  if (current.every((value, index) => Number.isFinite(value) && Math.abs(value) < (index < 2 ? 89 : 180))) starts.push(current);
-  const solution = starts.map((initial) => optimizeInstallation(initial, camera, geometry, samples)).sort((a, b) => a.cost - b.cost)[0];
-  const normal = linearizeInstallation(solution.parameters, camera, geometry, samples);
+  if (fit.initial.every((value, index) => Number.isFinite(value) && Math.abs(value) < fit.limits[index])) starts.push(fit.initial);
+  const solution = starts.map((initial) => optimizeInstallation(initial, fit.residuals, fit.limits)).sort((a, b) => a.cost - b.cost)[0];
+  const normal = linearizeInstallation(solution.parameters, fit.residuals);
   // 用未加阻尼的矩阵检查可辨识性；阻尼本身不能证明样本提供了足够约束。
   const conditionNumber = installationConditionNumber(normal.matrix);
   const perSnapshot = samples.map((sample) => {
@@ -470,6 +506,44 @@ export function estimateInstallation(camera, snapshots, observations, requestedR
   };
 }
 
+export function estimateZeroPose(camera, snapshots, observations, requestedRange) {
+  const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
+  const zeroPose = resolveZeroPose(camera);
+  const geometry = zeroPoseGeometry(camera, zeroPose);
+  const { samples, excluded } = prepareSamples(camera, snapshots, observations, range);
+  const fit = installationFitModel({ ...camera, zeroPose }, geometry, samples, ZERO_POSE_MODEL);
+  const base = {
+    model: ZERO_POSE_MODEL, generatedAt: new Date().toISOString(), ...range,
+    fixedCalibration: { longitude: camera.longitude, latitude: camera.latitude, height: camera.height,
+      yaw: zeroPose.yaw, tiltOffset: zeroPose.tiltOffset, imageRoll: 0, cameraUpdatedAt: camera.updatedAt },
+    sourceSnapshotIds: samples.map((sample) => sample.snapshot.id), excluded,
+    ...panCoverage(samples.map((sample) => sample.ptz.Pan)),
+  };
+  if (!samples.length) return { ...base, status: 'insufficient_data', zeroPose: null,
+    message: '没有有效的停稳截图和正式海天线标注，无法拟合零位 Roll 和 Pitch' };
+  const starts = [fit.initial];
+  if (fit.initial.some((value) => value !== 0)) starts.push([0, 0]);
+  const solution = starts.map((initial) => optimizeInstallation(initial, fit.residuals, fit.limits)).sort((a, b) => a.cost - b.cost)[0];
+  const normal = linearizeInstallation(solution.parameters, fit.residuals);
+  const conditionNumber = installationConditionNumber(normal.matrix);
+  const perSnapshot = summarizeResiduals(samples, normal.values);
+  const rms = (key) => Math.sqrt(perSnapshot.reduce((sum, row) => sum + row[key] ** 2, 0) / perSnapshot.length);
+  const rmsResidualPixels = rms('rmsResidualPixels');
+  const failures = [];
+  if (!solution.converged) failures.push('拟合未收敛');
+  if (conditionNumber === null || conditionNumber >= 1e8) failures.push('零位 Roll 和 Pitch 不可可靠辨识');
+  if (!Number.isFinite(rmsResidualPixels) || rmsResidualPixels > maximumRmsPixels) {
+    failures.push(`均方根残差 ${rmsResidualPixels.toFixed(2)} 像素超过 ${maximumRmsPixels} 像素门槛`);
+  }
+  return { ...base, status: failures.length ? 'unreliable' : 'estimated',
+    zeroPose: failures.length ? null : fit.calibrationOf(solution.parameters).zeroPose,
+    diagnostics: { converged: solution.converged, iterations: solution.iterations, conditionNumber,
+      rmsResidualPixels, rmsAngularResidualDegrees: rms('rmsAngularResidualDegrees'),
+      maximumAcceptedRmsPixels: maximumRmsPixels, perSnapshot },
+    message: failures.join('，') || '已生成零位姿态候选，请对照原图核查',
+  };
+}
+
 export function refineInstallation(camera, snapshots, observations, requestedRange, baseSnapshotIds) {
   const range = calibrationRange(requestedRange.startTime, requestedRange.endTime);
   const geometry = cameraGeometry(camera);
@@ -477,7 +551,8 @@ export function refineInstallation(camera, snapshots, observations, requestedRan
   const baseIds = new Set(baseSnapshotIds);
   const baseSamples = samples.filter((sample) => baseIds.has(sample.snapshot.id));
   const highSamples = samples.filter((sample) => !baseIds.has(sample.snapshot.id));
-  const initial = [camera.pAxisPitch, camera.pAxisRoll, camera.tiltOffset, camera.imageRoll];
+  const fit = installationFitModel(camera, geometry, samples);
+  const initial = fit.initial;
   const installationOf = (parameters) => Object.fromEntries(['pAxisPitch', 'pAxisRoll', 'tiltOffset', 'imageRoll']
     .map((key, index) => [key, parameters[index]]));
   // 两组先按实际有效图片平均，任务拆分和图数不改变基础组与高倍组的总权重。
@@ -514,8 +589,8 @@ export function refineInstallation(camera, snapshots, observations, requestedRan
       message: '高倍组至少需要一张有效截图的倍率高于基础组最大参与倍率' };
   }
   // 精修只从冻结的基础结果开始；当前相机的四项修正不参与初值选择。
-  const solution = optimizeInstallation(initial, camera, geometry, samples);
-  const normal = linearizeInstallation(solution.parameters, camera, geometry, samples);
+  const solution = optimizeInstallation(initial, fit.residuals, fit.limits);
+  const normal = linearizeInstallation(solution.parameters, fit.residuals);
   const conditionNumber = installationConditionNumber(normal.matrix);
   const attempted = compare(solution.parameters);
   const withinRms = (comparison) => ['overall', 'base', 'high'].every((key) => Number.isFinite(comparison[key].rmsResidualPixels)

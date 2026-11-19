@@ -524,16 +524,32 @@
                 [disabled]="busy() || loading() || running() || generatingPanorama()">
                 <option value="">选择已生成的合格结果</option>
                 @for (reference of validationSources(); track reference.key) {
-                  <option [value]="reference.key">{{ reference.kind === 'refinement' ? '精修候选' : '普通结果' }} · {{ reference.task.createdAt | date:'MM-dd HH:mm:ss' }} · {{ reference.sourceSnapshotIds.length }} 张</option>
+                  <option [value]="reference.key">{{ validationSourceLabels[reference.kind] }} · {{ reference.task.createdAt | date:'MM-dd HH:mm:ss' }} · {{ reference.sourceSnapshotIds.length }} 张</option>
                 }
               </select>
             </label>
             @if (validationSource(); as reference) {
-              <p class="result-message">{{ reference.kind === 'refinement' ? '精修候选' : '普通结果' }}有效
-                · {{ (reference.kind === 'refinement' ? reference.task.refinement?.applied : reference.task.result?.applied) ? '已应用' : '未应用' }}</p>
-              <table><thead><tr><th scope="col">固定参数</th><th scope="col">值</th></tr></thead><tbody>
-                @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ reference.installation[field.key] | number:'1.4-4' }}°</td></tr> }
-              </tbody></table>
+              @if ('zeroPose' in reference) {
+                <table><thead><tr><th scope="col">固定零位参数</th><th scope="col">值</th></tr></thead><tbody>
+                  <tr><th scope="row">Roll</th><td>{{ reference.zeroPose.roll | number:'1.4-4' }}°</td></tr>
+                  <tr><th scope="row">Pitch</th><td>{{ reference.zeroPose.pitch | number:'1.4-4' }}°</td></tr>
+                  <tr><th scope="row">Yaw</th><td>{{ reference.zeroPose.yaw | number:'1.4-4' }}°</td></tr>
+                  <tr><th scope="row">T 补偿</th><td>{{ reference.zeroPose.tiltOffset | number:'1.4-4' }}°</td></tr>
+                </tbody></table>
+                <fieldset class="validation-criteria" [disabled]="busy() || loading() || measuring() || running() || generatingPanorama()">
+                  <legend>按复拍与重标填写验收门槛</legend>
+                  @for (field of validationCriteriaFields; track field.key) {
+                    <label>{{ field.label }} <input type="number" step="any" [min]="field.min"
+                      [ngModel]="validationCriteriaDraft()[field.key]" (ngModelChange)="setValidationCriterion(field.key, $event)"></label>
+                  }
+                </fieldset>
+              } @else {
+                <p class="result-message">{{ validationSourceLabels[reference.kind] }}有效
+                  · {{ (reference.kind === 'refinement' ? reference.task.refinement?.applied : reference.task.result?.applied) ? '已应用' : '未应用' }}</p>
+                <table><thead><tr><th scope="col">固定参数</th><th scope="col">值</th></tr></thead><tbody>
+                  @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ reference.installation[field.key] | number:'1.4-4' }}°</td></tr> }
+                </tbody></table>
+              }
               @if (reference.kind === 'refinement') {
                 <details><summary>精修来源（{{ reference.task.refinement?.sources.length }} 个任务）</summary><ul>
                   @for (source of reference.task.refinement?.sources; track source.taskId) {
@@ -545,8 +561,76 @@
             @if (nextTaskOffset() !== null) {
               <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多标定任务</button>
             }
-            <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || measuring() || !validationSource()"
+            <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || measuring() || !validationSource()
+                || (validationSource()?.kind === 'zero-pose' && !validationCriteria())"
               (click)="validate()">复核本任务截图</button>
+            @if (zeroPoseComparison(); as assessment) {
+              <p class="result-message" [class.error]="assessment.status !== 'passed'" role="status">{{ assessment.message }}</p>
+              <p class="note">低倍 {{ assessment.coverage.lowSnapshotCount }} 张 · 高倍 {{ assessment.coverage.highSnapshotCount }} 张
+                · 高倍可比较 {{ assessment.coverage.comparableHighSnapshotCount }} 张／{{ assessment.coverage.highPoseCount }} 组 P/T
+                · P 覆盖 {{ assessment.coverage.panCoverageDegrees | number:'1.2-2' }}°</p>
+              @if (assessment.coverage.reasons.length) {
+                <ul class="result-message">
+                  @for (reason of assessment.coverage.reasons; track reason) { <li>{{ reason }}</li> }
+                </ul>
+              }
+              @if (assessment.perSnapshot.length) {
+                <p class="note">总体 RMS（旧版 → 新版） {{ assessment.baseline.rmsResidualPixels | number:'1.2-2' }} → {{ assessment.candidate.rmsResidualPixels | number:'1.2-2' }} px</p>
+                <div class="actions validation-models" role="group" aria-label="原图理论海天线">
+                  <button type="button" [attr.aria-pressed]="comparisonMode() === 'validation' && validationModel() === 'baseline'"
+                    (click)="selectValidationModel('baseline')">旧版理论线</button>
+                  <button type="button" [attr.aria-pressed]="comparisonMode() === 'validation' && validationModel() === 'candidate'"
+                    (click)="selectValidationModel('candidate')">新版理论线</button>
+                </div>
+                <div class="validation-table" tabindex="0" role="region" aria-label="逐图新旧模型误差对照">
+                  <table><thead><tr><th scope="col">P/T/Z</th><th scope="col">尺寸</th><th scope="col">RMS 旧→新 (px)</th>
+                    <th scope="col">左／中／右垂直偏差 旧→新 (px，下为正)</th><th scope="col">方向差 旧→新 (°，顺时针为正)</th>
+                    <th scope="col">逐图判定</th></tr></thead><tbody>
+                    @for (row of assessment.perSnapshot; track row.snapshotId) {
+                      <tr [class.validation-failed]="row.failures.length || !row.candidateComparable">
+                        <th scope="row"><button type="button" [disabled]="busy() || loading() || generatingPanorama()"
+                          (click)="openValidationItem(row.snapshotId)" [title]="row.snapshotId">
+                          {{ row.pan | number:'1.2-2' }}/{{ row.tilt | number:'1.2-2' }}/{{ row.zoom | number:'1.1-1' }}
+                        </button><small>{{ row.zoomGroup === 'high' ? '高倍' : '低倍' }}</small></th>
+                        <td>{{ row.candidate.width }}×{{ row.candidate.height }}</td>
+                        <td>{{ row.baseline.rmsResidualPixels | number:'1.2-2' }} → {{ row.candidate.rmsResidualPixels | number:'1.2-2' }}</td>
+                        <td>@for (residual of row.candidate.verticalResiduals; track residual.position; let index = $index) {
+                          {{ $first ? '' : ' / ' }}{{ signedResidual(row.baseline.verticalResiduals[index].offsetPixels) }} → {{ signedResidual(residual.offsetPixels) }}
+                        }</td>
+                        <td>{{ signedResidual(row.baseline.directionDifferenceDegrees, 4) }} → {{ signedResidual(row.candidate.directionDifferenceDegrees, 4) }}</td>
+                        <td>
+                          @if (row.failures.length) { <div>超差 · {{ row.failures.join('、') }}</div> }
+                          @if (row.regressions.length) { <div>较旧版退化 · {{ row.regressions.join('、') }}</div> }
+                          @if (!row.baselineComparable) { <div>旧版有不可比较项</div> }
+                          @if (!row.candidateComparable) { <div>新版有不可比较项</div> }
+                          @if (!row.failures.length && row.baselineComparable && row.candidateComparable) { 通过 }
+                        </td>
+                      </tr>
+                    }
+                  </tbody></table>
+                </div>
+              }
+              @if (assessment.excluded.length) {
+                <details><summary>排除 {{ assessment.excluded.length }} 张截图</summary><ul>
+                  @for (excluded of assessment.excluded; track excluded.snapshotId) { <li>{{ excluded.snapshotId }} · {{ excluded.reason }}</li> }
+                </ul></details>
+              }
+              <details>
+                <summary>复核证据 · {{ assessment.generatedAt | date:'MM-dd HH:mm:ss' }}</summary>
+                <table><thead><tr><th scope="col">已保存四参数</th><th scope="col">值</th></tr></thead><tbody>
+                  @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ assessment.baseline.installation[field.key] | number:'1.4-4' }}°</td></tr> }
+                </tbody></table>
+                <ul>
+                  <li>证据 v{{ assessment.evidence.version }} · {{ assessment.evidence.id }}</li>
+                  <li>{{ assessment.baseline.model }} · 相机配置 {{ assessment.evidence.camera.updatedAt }}</li>
+                  @for (source of assessment.evidence.baseline.sources; track source.resultId) {
+                    <li>旧基准拟合 · {{ source.resultId }} · 标注版本 {{ source.revision }} · {{ source.sourceSnapshotIds.length }} 张参与图</li>
+                  } @empty { <li>旧基准来自保存的相机配置</li> }
+                  <li>{{ assessment.candidate.model }} · 候选 {{ assessment.evidence.source.resultId }} · 标注版本 {{ assessment.evidence.source.revision }}</li>
+                  <li>复核任务 {{ assessment.taskId }} · 标注版本 {{ assessment.revision }} · {{ assessment.sourceSnapshotIds.length }} 张原图</li>
+                </ul>
+              </details>
+            }
             @if (validation(); as assessment) {
               <p class="result-message" [class.error]="assessment.status !== 'passed'" role="status">{{ assessment.message }}</p>
               <dl class="result-metrics">

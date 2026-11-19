@@ -397,6 +397,12 @@ export class CameraStore {
     return { total, tasks, offset, nextOffset: offset + tasks.length < total ? offset + tasks.length : null };
   }
 
+  listAppliedRecognitionTasks(cameraId) {
+    return this.db.prepare(`SELECT metadata FROM recognition_tasks WHERE cameraId = ? AND
+      (json_extract(metadata, '$.result.applied') = 1 OR json_extract(metadata, '$.refinement.applied') = 1)
+      ORDER BY createdAt DESC, id DESC`).all(cameraId).map(({ metadata }) => JSON.parse(metadata));
+  }
+
   recognitionItems(id, { limit = -1, offset = 0 } = {}) {
     return this.db.prepare(`SELECT r.metadata, s.id AS sourceId FROM recognition_items r
       LEFT JOIN snapshots s ON s.id = r.snapshotId WHERE r.taskId = ? ORDER BY r.position LIMIT ? OFFSET ?`)

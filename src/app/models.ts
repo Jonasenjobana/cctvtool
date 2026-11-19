@@ -191,6 +191,36 @@ export interface HorizonMeasurement {
   directionDifferenceDegrees: number | null;
   rmsResidualPixels: number; rmsAngularResidualDegrees: number; verticalOffsetPixels: number | null;
 }
+export interface ZeroPoseValidationCriteria {
+  minimumHighZoom: number; maximumVerticalOffsetPixels: number; maximumDirectionDifferenceDegrees: number; maximumRmsPixels: number;
+}
+export interface ZeroPoseValidationEvidence {
+  version: 1; id: string; generatedAt: string; status: ZeroPoseValidation['status'];
+  source: { kind: 'zero-pose'; model: ZeroPoseCandidate['model']; taskId: string; revision: number; resultId: string; sourceSnapshotIds: string[] };
+  validation: { taskId: string; revision: number; sourceSnapshotIds: string[] };
+  camera: { id: string; updatedAt: string };
+  baseline: { model: string; calibration: Calibration; sources: {
+    kind: InstallationValidation['reference']['kind']; model: string; taskId: string; resultId: string; revision: number;
+    sourceSnapshotIds: string[]; selectionRevision?: number;
+  }[] };
+  criteria: ZeroPoseValidationCriteria;
+}
+export interface ZeroPoseValidation {
+  taskId: string; revision: number; generatedAt: string;
+  status: InstallationValidation['status'] | 'insufficient_coverage'; message: string;
+  reference: Pick<ZeroPoseValidationEvidence['source'], 'kind' | 'model' | 'taskId' | 'revision' | 'resultId'> & { createdAt: string };
+  evidence: ZeroPoseValidationEvidence;
+  coverage: { lowSnapshotCount: number; highSnapshotCount: number; comparableHighSnapshotCount: number;
+    highPoseCount: number; distinctPanCount: number; panCoverageDegrees: number; reasons: string[] };
+  sourceSnapshotIds: string[]; failedSnapshotIds: string[]; excluded: InstallationValidation['excluded'];
+  baseline: { model: string; installation: InstallationValidation['installation']; rmsResidualPixels: number | null };
+  candidate: { model: ZeroPoseCandidate['model']; zeroPose: ZeroPose; rmsResidualPixels: number | null };
+  perSnapshot: {
+    snapshotId: string; pan: number; tilt: number; zoom: number; zoomGroup: 'low' | 'high';
+    baseline: HorizonMeasurement; candidate: HorizonMeasurement; baselineComparable: boolean; candidateComparable: boolean;
+    failures: string[]; regressions: string[];
+  }[];
+}
 export interface ZeroPoseCandidate {
   model: 'wgs84-horizon-zero-pose-v1';
   resultId: string; revision: number; generatedAt: string; startTime: string; endTime: string;
@@ -205,6 +235,7 @@ export interface ZeroPoseCandidate {
     perSnapshot: Omit<HorizonMeasurement, 'theoreticalHorizon' | 'verticalResiduals' | 'directionDifferenceDegrees' | 'verticalOffsetPixels'>[] };
   message: string; stale: boolean; staleReasons: string[];
   applied: boolean; appliedAt: string | null;
+  validation?: ZeroPoseValidationEvidence;
 }
 export interface ZeroPoseMeasurement {
   taskId: string; revision: number; resultId: string;

@@ -5,7 +5,8 @@ import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
 import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement, SnapshotGroup,
-  ZeroPoseMeasurement } from './models';
+  ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
+import type { ZeroPose } from '#zero-pose';
 import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
   panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
@@ -16,10 +17,10 @@ import type { HorizonAdjustment, HorizonView } from './horizon-precision';
 import { renderTaskPanorama, renderTaskPanoramaFrame } from './task-panorama';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
 
-interface ValidationSource {
-  key: string; kind: 'ordinary' | 'refinement'; task: RecognitionTask; resultId: string;
-  installation: InstallationValidation['installation']; sourceSnapshotIds: string[];
-}
+type ValidationSource = { key: string; task: RecognitionTask; resultId: string; sourceSnapshotIds: string[] } & (
+  { kind: InstallationValidation['reference']['kind']; installation: InstallationValidation['installation'] }
+  | { kind: ZeroPoseValidation['reference']['kind']; zeroPose: ZeroPose }
+);
 
 @Component({
   selector: 'app-recognition-tasks', standalone: true,
@@ -77,7 +78,26 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly nextItemOffset = signal<number | null>(null);
   readonly validationReferenceId = signal('');
   readonly measuring = signal(false);
-  private readonly validationResult = signal<InstallationValidation | null>(null);
+  private readonly validationResult = signal<InstallationValidation | ZeroPoseValidation | null>(null);
+  readonly validationModel = signal<'baseline' | 'candidate'>('candidate');
+  readonly validationCriteriaDraft = signal<Partial<Record<keyof ZeroPoseValidationCriteria, number | null>>>({});
+  readonly validationCriteriaFields = [
+    { key: 'minimumHighZoom', label: '高倍起始 Z', min: 1 },
+    { key: 'maximumVerticalOffsetPixels', label: '最大垂直偏差 (px)', min: 0 },
+    { key: 'maximumDirectionDifferenceDegrees', label: '最大方向差 (°)', min: 0 },
+    { key: 'maximumRmsPixels', label: '最大逐图 RMS (px)', min: 0 },
+  ] as const;
+  readonly validationCriteria = computed<ZeroPoseValidationCriteria | undefined>(() => {
+    const { minimumHighZoom, maximumVerticalOffsetPixels, maximumDirectionDifferenceDegrees, maximumRmsPixels } = this.validationCriteriaDraft();
+    if (minimumHighZoom == null || maximumVerticalOffsetPixels == null
+      || maximumDirectionDifferenceDegrees == null || maximumRmsPixels == null) return;
+    if (minimumHighZoom >= 1 && maximumVerticalOffsetPixels > 0 && maximumDirectionDifferenceDegrees > 0
+      && maximumDirectionDifferenceDegrees <= 180 && maximumRmsPixels > 0) {
+      return { minimumHighZoom, maximumVerticalOffsetPixels, maximumDirectionDifferenceDegrees, maximumRmsPixels };
+    }
+    return undefined;
+  });
+  readonly validationSourceLabels = { ordinary: '普通结果', refinement: '精修候选', 'zero-pose': '零位普通候选' };
   readonly comparisonMode = signal<'validation' | 'before' | 'after' | 'zero-pose'>('validation');
   private readonly zeroPoseMeasurementResult = signal<ZeroPoseMeasurement | null>(null);
   readonly zeroPoseCandidate = computed(() => this.selected()?.zeroPoseCandidate);
@@ -95,25 +115,39 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     && task.cameraId === this.selected()?.cameraId && task.result?.status === 'estimated'
     && task.result.model === 'wgs84-horizon-installation-v1' && task.resultRevision === task.revision
     && !['queued', 'running'].includes(task.status)));
-  readonly validationSources = computed<ValidationSource[]>(() => [
-    ...this.refinementBaseSources().flatMap((task) => task.resultId && task.result?.installation ? [{
-      key: `ordinary:${task.id}`, kind: 'ordinary' as const, task, resultId: task.resultId,
-      installation: task.result.installation, sourceSnapshotIds: task.result.sourceSnapshotIds,
-    }] : []),
-    ...this.tasks().flatMap((task) => task.id !== this.selected()?.id && task.cameraId === this.selected()?.cameraId
-      && !['queued', 'running'].includes(task.status) && task.refinement?.status === 'estimated' && !task.refinement.stale
-      && task.refinement.model === 'wgs84-horizon-refinement-v1' && task.refinement.installation ? [{
-        key: `refinement:${task.id}`, kind: 'refinement' as const, task, resultId: task.refinement.resultId,
-        installation: task.refinement.installation, sourceSnapshotIds: task.refinement.sourceSnapshotIds,
-      }] : []),
-  ]);
+  readonly validationSources = computed<ValidationSource[]>(() => this.tasks().flatMap((task): ValidationSource[] => {
+    if (task.id === this.selected()?.id || task.cameraId !== this.selected()?.cameraId || ['queued', 'running'].includes(task.status)) return [];
+    const entries: ValidationSource[] = [];
+    if (task.result?.status === 'estimated' && task.result.model === 'wgs84-horizon-installation-v1'
+      && task.resultRevision === task.revision && task.resultId && task.result.installation) {
+      entries.push({ key: `ordinary:${task.id}`, kind: 'ordinary', task, resultId: task.resultId,
+        installation: task.result.installation, sourceSnapshotIds: task.result.sourceSnapshotIds });
+    }
+    const { refinement, zeroPoseCandidate: candidate } = task;
+    if (refinement?.status === 'estimated' && !refinement.stale && refinement.model === 'wgs84-horizon-refinement-v1' && refinement.installation) {
+      entries.push({ key: `refinement:${task.id}`, kind: 'refinement', task, resultId: refinement.resultId,
+        installation: refinement.installation, sourceSnapshotIds: refinement.sourceSnapshotIds });
+    }
+    if (candidate?.status === 'estimated' && !candidate.stale && candidate.zeroPose) {
+      entries.push({ key: `zero-pose:${task.id}`, kind: 'zero-pose', task, resultId: candidate.resultId,
+        zeroPose: candidate.zeroPose, sourceSnapshotIds: candidate.sourceSnapshotIds });
+    }
+    return entries;
+  }));
   readonly validationSource = computed(() => this.validationSources().find((entry) => entry.key === this.validationReferenceId()));
-  readonly validation = computed(() => {
-    const result = this.validationResult(), task = this.selected();
-    const reference = this.validationSource();
+  private readonly currentValidation = computed(() => {
+    const result = this.validationResult(), task = this.selected(), reference = this.validationSource();
     return result && task && reference && !this.dirty() && result.taskId === task.id && result.revision === task.revision
       && result.reference.kind === reference.kind && result.reference.taskId === reference.task.id
       && result.reference.resultId === reference.resultId ? result : null;
+  });
+  readonly validation = computed(() => {
+    const result = this.currentValidation();
+    return result && !('evidence' in result) ? result : null;
+  });
+  readonly zeroPoseComparison = computed(() => {
+    const result = this.currentValidation();
+    return result && 'evidence' in result ? result : null;
   });
   readonly refinementMeasurement = computed(() => {
     const result = this.refinementMeasurementResult(), task = this.selected();
@@ -126,18 +160,24 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     return result && task && candidate && !this.dirty() && !candidate.stale && result.taskId === task.id
       && result.revision === task.revision && result.resultId === candidate.resultId ? result : null;
   });
-  private readonly comparison = computed(() => this.comparisonMode() === 'validation' ? this.validation()
-    : this.comparisonMode() === 'zero-pose' ? this.zeroPoseMeasurement() : this.refinementMeasurement());
+  private readonly comparison = computed(() => {
+    if (this.comparisonMode() === 'zero-pose') return this.zeroPoseMeasurement();
+    if (this.comparisonMode() !== 'validation') return this.refinementMeasurement();
+    const result = this.zeroPoseComparison();
+    return result ? { excluded: result.excluded, perSnapshot: result.perSnapshot.map((row) => row[this.validationModel()]) } : this.validation();
+  });
   readonly measurement = computed(() => this.comparison()
     ?.perSnapshot.find((row) => row.snapshotId === this.displayedItem()?.snapshotId && !this.singleImageError()));
   readonly measurementExclusion = computed(() =>
     (this.comparisonMode() === 'zero-pose' && !this.dirty() && !this.zeroPoseCandidate()?.stale ? this.zeroPoseCandidate() : this.comparison())
       ?.excluded.find((row) => row.snapshotId === this.displayedItem()?.snapshotId)?.reason);
   readonly theoreticalLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选理论海天线' : this.comparisonMode() === 'validation'
-    ? this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
+    ? this.zeroPoseComparison() ? `${this.validationModel() === 'baseline' ? '已保存四参数' : '零位候选'}理论海天线`
+      : this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
     : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
   readonly measurementLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选原图预览' : this.comparisonMode() === 'validation'
-    ? this.validationSource()?.kind === 'refinement' ? '精修候选独立复核' : '普通结果独立复核'
+    ? this.validationSource()?.kind === 'zero-pose' ? '零位候选独立复核'
+      : this.validationSource()?.kind === 'refinement' ? '精修候选独立复核' : '普通结果独立复核'
     : this.comparisonMode() === 'after' ? '候选海天线对照' : '基准海天线对照');
   readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
@@ -400,6 +440,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.precisionMode.set(false);
       this.comparisonMode.set(task.refinementSelection?.base ? task.refinement && !task.refinement.stale ? 'after' : 'before' : 'validation');
       this.validationReferenceId.set('');
+      this.validationCriteriaDraft.set({});
+      this.validationModel.set('candidate');
       this.clearPanorama();
       this.guide.set(null);
       this.savedGuide = null;
@@ -1122,28 +1164,43 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.closeSourceImage();
     this.comparisonMode.set('validation');
     this.problem.set('');
-    await this.measure();
+    await this.measure(true);
   }
   selectValidationSource(id: string) {
     this.problem.set('');
     this.closeSourceImage();
     this.comparisonMode.set('validation');
+    this.validationRequest++;
+    this.measuring.set(false);
+    this.validationResult.set(null);
+    this.validationModel.set('candidate');
     this.validationReferenceId.set(id);
     void this.measure();
   }
-  private async measure() {
+  setValidationCriterion(key: keyof ZeroPoseValidationCriteria, value: number | null) {
+    this.validationCriteriaDraft.update((criteria) => ({ ...criteria, [key]: value }));
+    this.validationResult.set(null);
+  }
+  selectValidationModel(model: 'baseline' | 'candidate') {
+    this.comparisonMode.set('validation');
+    this.validationModel.set(model);
+  }
+  private async measure(submitValidation = false) {
     if (this.comparisonMode() === 'zero-pose') return this.measureZeroPose();
     if (this.comparisonMode() !== 'validation') return this.measureRefinement();
     if (this.destroyed) return;
+    const task = this.selected(), reference = this.validationSource();
+    const criteria = reference?.kind === 'zero-pose' ? this.validationCriteria() : undefined;
+    // 新版仅在显式提交时保存复核证据，打开另一张图只切换当前对照。
+    if (reference?.kind === 'zero-pose' && (!submitValidation || !criteria)) return;
     const request = ++this.validationRequest;
     this.validationResult.set(null);
     this.measuring.set(false);
-    const task = this.selected(), reference = this.validationSource();
     if (!task || !reference?.resultId || this.dirty() || this.running()) return;
     const revision = this.revision;
     this.measuring.set(true);
     try {
-      const result = await this.api.validateInstallation(task.id, task.revision, reference.task.id, reference.resultId, reference.kind);
+      const result = await this.api.validateInstallation(task.id, task.revision, reference.task.id, reference.resultId, reference.kind, criteria);
       if (!this.destroyed && request === this.validationRequest && revision === this.revision && !this.dirty()
         && task.revision === this.selected()?.revision && reference.key === this.validationSource()?.key
         && reference.resultId === this.validationSource()?.resultId) this.validationResult.set(result);
@@ -1292,7 +1349,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     const min = Math.min(...values), max = Math.max(...values);
     return min === max ? min.toFixed(1) : `${min.toFixed(1)}～${max.toFixed(1)}`;
   }
-  signedResidual(value: number | null) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(2)}`; }
+  signedResidual(value: number | null, digits = 2) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(digits)}`; }
   async applyRefinement() {
     const task = this.selected(), candidate = task?.refinement;
     if (!task || !candidate || candidate.status !== 'estimated' || candidate.stale || candidate.applied

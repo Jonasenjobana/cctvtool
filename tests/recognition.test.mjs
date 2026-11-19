@@ -229,6 +229,165 @@ async function independentValidationFixture(t, { transformSnapshot = (snapshot) 
   return f;
 }
 
+const comparisonZeroPose = { roll: 0.07, pitch: 0.03, yaw: fixtureCamera.panOffset, tiltOffset: 0.13 };
+const validationCriteria = {
+  minimumHighZoom: 30, maximumVerticalOffsetPixels: 5, maximumDirectionDifferenceDegrees: 0.1, maximumRmsPixels: 5,
+};
+
+async function zeroPoseValidationFixture(t, { transformItem = (item) => item, baselineSnapshotId } = {}) {
+  const f = await fixture(t, undefined, { savedZeroPose: { ...comparisonZeroPose, roll: 0, pitch: 0 },
+    zeroPose: comparisonZeroPose, pans: [355, 20, 100, 190, 275] });
+  const source = await createAndWait(f);
+  const generated = await postZeroPose(f, source.id);
+  assert.equal(generated.statusCode, 200, generated.body);
+  f.reference = generated.json();
+  f.candidate = f.reference.zeroPoseCandidate;
+  assert.equal(f.candidate.status, 'estimated', f.candidate.message);
+  await f.app.close();
+  const store = new CameraStore(f.dataDir);
+  try {
+    const task = { ...source, id: 'zero-pose-validation', sourceTaskId: 'zero-pose-validation-source', sampleCount: 3 };
+    store.addSnapshotGroup({ id: task.sourceTaskId, cameraId: f.camera.id, cameraName: f.camera.name, kind: 'scan',
+      status: 'completed', createdAt: source.createdAt, sampleCount: task.sampleCount, completedCount: task.sampleCount });
+    const samples = [
+      { snapshot: f.snapshots[0], points: f.observations[0].points },
+      ...[355, 100].map((pan) => {
+        const { snapshots, observations } = syntheticSnapshots({ camera: f.camera, zeroPose: comparisonZeroPose, pans: [pan],
+          ptzOverrides: { Tilt: 0.13, Zoom: 30, HorizontalFieldAngle: 3, VerticalFieldAngle: 2 } });
+        return { snapshot: snapshots[0], points: observations[0].points };
+      }),
+    ];
+    const items = [];
+    for (const [index, { snapshot, points }] of samples.entries()) {
+      const id = `validation-${index}`;
+      const copy = { ...snapshot, id, groupId: task.sourceTaskId, fileName: `${id}.jpg` };
+      store.addSnapshot(copy);
+      await writeFile(join(f.dataDir, 'snapshots', copy.fileName), 'fixture');
+      const saved = points.filter((_, column) => column !== 1).map((point) => ({ ...point,
+        y: point.y + (index === 0 ? 3 / snapshot.height : 0) }));
+      items.push(transformItem({ snapshotId: id, snapshot: copy, detectedPoints: saved, points: saved, ignored: false,
+        source: 'manual', ignoreReason: '' }, index, f));
+    }
+    store.addRecognitionTask(task, items);
+    if (baselineSnapshotId) {
+      store.addRecognitionTask({ ...source, id: 'old-applied-recognition', resultId: 'old-applied-result', resultRevision: 0,
+        appliedRevision: 0, appliedAt: f.camera.updatedAt, fitCamera: f.camera, result: {
+          model: 'wgs84-horizon-installation-v1', status: 'estimated', applied: true,
+          installation: { pAxisPitch: 0, pAxisRoll: 0, tiltOffset: 0, imageRoll: 0 }, sourceSnapshotIds: [baselineSnapshotId],
+        } }, []);
+    }
+    f.validationTask = task;
+  } finally { store.close(); }
+  f.app = await createApp(f.options);
+  f.validateZeroPose = (changes = {}) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.validationTask.id}/validate`,
+    payload: { revision: 0, referenceTaskId: f.reference.id, referenceResultId: f.candidate.resultId,
+      referenceKind: 'zero-pose', criteria: validationCriteria, ...changes } });
+  return f;
+}
+
+test('零位独立复核用同批原图测量已保存四参数和冻结候选并保存版本证据', async (t) => {
+  const f = await zeroPoseValidationFixture(t);
+  const response = await f.validateZeroPose();
+  assert.equal(response.statusCode, 200, response.body);
+  const result = response.json();
+  const { baseline, candidate, perSnapshot, evidence } = result;
+  assert.equal(result.status, 'passed', result.message);
+  assert.equal(baseline.model, 'wgs84-horizon-installation-v1');
+  assert.equal(candidate.model, zeroPoseModel);
+  assert.deepEqual(candidate.zeroPose, f.candidate.zeroPose);
+  assert.deepEqual(perSnapshot.map(({ snapshotId }) => snapshotId), ['validation-0', 'validation-1', 'validation-2']);
+  const [repeat, high] = perSnapshot;
+  assert.deepEqual([repeat.pan, repeat.tilt, repeat.zoom], [355, 2, 3]);
+  assert.deepEqual([high.pan, high.tilt, high.zoom], [355, 0.13, 30]);
+  assert.ok(repeat.candidate.verticalResiduals.every(({ offsetPixels }) => Math.abs(offsetPixels - 3) < 0.05));
+  assert.ok(Math.abs(high.candidate.directionDifferenceDegrees) < 1e-4);
+  assert.ok(high.candidate.rmsResidualPixels < 0.01);
+  assert.ok(high.baseline.rmsResidualPixels > 5);
+  assert.equal(evidence.version, 1);
+  assert.equal(evidence.source.resultId, f.candidate.resultId);
+  assert.deepEqual(evidence.source.sourceSnapshotIds, f.candidate.sourceSnapshotIds);
+  assert.deepEqual(evidence.camera, { id: f.camera.id, updatedAt: f.camera.updatedAt });
+  assert.deepEqual(evidence.validation, { taskId: f.validationTask.id, revision: 0,
+    sourceSnapshotIds: ['validation-0', 'validation-1', 'validation-2'] });
+  assert.deepEqual(evidence.criteria, validationCriteria);
+  const reference = (await f.app.inject(`/api/recognition-tasks/${f.reference.id}`)).json();
+  assert.deepEqual(reference.zeroPoseCandidate.validation, evidence);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json()[0], f.camera);
+
+  const stricter = await f.validateZeroPose({ criteria: { ...validationCriteria, maximumVerticalOffsetPixels: 2 } });
+  assert.equal(stricter.statusCode, 200, stricter.body);
+  assert.deepEqual(stricter.json().failedSnapshotIds, ['validation-0']);
+  assert.deepEqual(stricter.json().perSnapshot[0].failures, ['左端垂直偏差', '中点垂直偏差', '右端垂直偏差']);
+});
+
+test('零位独立复核报告逐图超差及相对旧基准的退化', async (t) => {
+  const f = await zeroPoseValidationFixture(t, {
+    transformItem(item, index, fixture) {
+      if (index !== 1) return item;
+      const { observations } = syntheticSnapshots({ camera: fixture.camera, pitch: 0, roll: 0, pans: [355],
+        ptzOverrides: item.snapshot.ptz.raw });
+      const points = observations[0].points.filter((_, column) => column !== 1);
+      return { ...item, points, detectedPoints: points };
+    },
+  });
+  const response = await f.validateZeroPose();
+  assert.equal(response.statusCode, 200, response.body);
+  const result = response.json();
+  assert.equal(result.status, 'failed', result.message);
+  assert.equal(result.evidence.status, 'failed');
+  assert.deepEqual(result.failedSnapshotIds, ['validation-1']);
+  const row = result.perSnapshot.find(({ snapshotId }) => snapshotId === 'validation-1');
+  assert.ok(row.baseline.rmsResidualPixels < 0.01);
+  assert.ok(row.failures.includes('像素 RMS'));
+  assert.ok(row.regressions.includes('像素 RMS'));
+});
+
+test('零位独立复核标明高倍覆盖不足及缺失原图', async (t) => {
+  const f = await zeroPoseValidationFixture(t);
+  await unlink(join(f.dataDir, 'snapshots', 'validation-2.jpg'));
+  const response = await f.validateZeroPose();
+  assert.equal(response.statusCode, 200, response.body);
+  const result = response.json();
+  assert.equal(result.status, 'insufficient_coverage', result.message);
+  assert.equal(result.coverage.highPoseCount, 1);
+  assert.equal(result.coverage.lowSnapshotCount, 1);
+  assert.deepEqual(result.excluded, [{ snapshotId: 'validation-2', reason: '源截图文件缺失' }]);
+  assert.deepEqual(result.evidence.validation.sourceSnapshotIds, ['validation-0', 'validation-1']);
+});
+
+test('零位独立复核拒绝其他任务引用的原始拟合图片及过期版本', async (t) => {
+  const f = await zeroPoseValidationFixture(t, {
+    transformItem(item, index, fixture) {
+      if (index !== 0) return item;
+      const snapshot = { ...fixture.snapshots[0], fileName: 'synthetic-0.jpg' };
+      return { ...item, snapshot, snapshotId: snapshot.id };
+    },
+  });
+  const overlap = await f.validateZeroPose();
+  assert.equal(overlap.statusCode, 409, overlap.body);
+  assert.match(overlap.json().message, /拟合图片存在重叠/);
+  const staleResult = await f.validateZeroPose({ referenceResultId: 'old-id' });
+  assert.equal(staleResult.statusCode, 409, staleResult.body);
+  assert.match(staleResult.json().message, /候选编号/);
+  const staleMarking = await f.validateZeroPose({ revision: 1 });
+  assert.equal(staleMarking.statusCode, 409, staleMarking.body);
+  assert.match(staleMarking.json().message, /识别任务已被修改/);
+  const noCriteria = await f.validateZeroPose({ criteria: undefined });
+  assert.equal(noCriteria.statusCode, 400, noCriteria.body);
+  const updated = await f.app.inject({ method: 'PUT', url: `/api/cameras/${f.camera.id}`, payload: { ...f.input, name: '相机新名称' } });
+  assert.equal(updated.statusCode, 200, updated.body);
+  const staleCamera = await f.validateZeroPose();
+  assert.equal(staleCamera.statusCode, 409, staleCamera.body);
+  assert.match(staleCamera.json().message, /相机配置版本已变化/);
+});
+
+test('零位独立复核同时排除已生效旧基准实际使用的原图', async (t) => {
+  const f = await zeroPoseValidationFixture(t, { baselineSnapshotId: 'validation-0' });
+  const response = await f.validateZeroPose();
+  assert.equal(response.statusCode, 409, response.body);
+  assert.match(response.json().message, /旧基准的拟合图片存在重叠/);
+});
+
 test('独立复核使用另一任务的固定结果，不改变设备、标注、拟合或应用状态', async (t) => {
   const f = await independentValidationFixture(t);
   const camerasBefore = (await f.app.inject('/api/cameras')).json();

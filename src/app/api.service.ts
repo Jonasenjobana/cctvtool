@@ -3,7 +3,7 @@ import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
 import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage, InstallationValidation,
-  RefinementSelection, RefinementMeasurement, ZeroPoseCandidate, ZeroPoseMeasurement } from './models';
+  RefinementSelection, RefinementMeasurement, ZeroPoseCandidate, ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
 import type { VesselSnapshot, VesselSourceCatalog } from './ais.models';
 import type { PanoramaGuide, PanoramaGuideState } from '../../shared/panorama-guide';
@@ -156,9 +156,11 @@ export class ApiService {
     return firstValueFrom(this.http.post<RefinementMeasurement>(`/api/recognition-tasks/${id}/refinement-measure`,
       { revision, selectionRevision, mode, ...(resultId ? { resultId } : {}) }).pipe(timeout(95000)));
   }
-  validateInstallation(id: string, revision: number, referenceTaskId: string, referenceResultId: string, referenceKind: 'ordinary' | 'refinement' = 'ordinary') {
-    return firstValueFrom(this.http.post<InstallationValidation>(`/api/recognition-tasks/${id}/validate`,
-      { revision, referenceTaskId, referenceResultId, referenceKind }).pipe(timeout(95000)));
+  validateInstallation(id: string, revision: number, referenceTaskId: string, referenceResultId: string,
+    referenceKind: InstallationValidation['reference']['kind'] | ZeroPoseValidation['reference']['kind'] = 'ordinary',
+    criteria?: ZeroPoseValidationCriteria) {
+    return firstValueFrom(this.http.post<InstallationValidation | ZeroPoseValidation>(`/api/recognition-tasks/${id}/validate`,
+      { revision, referenceTaskId, referenceResultId, referenceKind, ...(criteria ? { criteria } : {}) }).pipe(timeout(95000)));
   }
   applyRefinement(id: string, revision: number, resultId: string) {
     return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/refinement-apply`,

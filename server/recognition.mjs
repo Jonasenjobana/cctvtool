@@ -10,13 +10,11 @@ import { calibrationKeys, calibrationOf } from './store.mjs';
 import { estimateInstallation, estimateZeroPose, evaluateInstallation, refineInstallation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
 import { refinementInputs, refinementStaleReasons, withRefinementState } from './installation-refinement.mjs';
 import { requireZeroPoseCandidate, zeroPoseCandidateStaleReasons } from './zero-pose-candidate.mjs';
+import { evaluateZeroPoseValidation, validPoints, zeroPoseValidationCriteriaSchema } from './zero-pose-validation.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
 const fittedKeys = ['pAxisPitch', 'pAxisRoll', 'tiltOffset', 'imageRoll'];
-const validPoints = (points) => Array.isArray(points) && points.length === 2
-  && points.every((point) => [point?.x, point?.y].every((value) => Number.isFinite(value) && value >= 0 && value <= 1))
-  && Math.abs(points[0].x - points[1].x) >= 0.1;
 const median = (values) => {
   const sorted = [...values].sort((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
@@ -431,15 +429,26 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {
       ...bodyWithRevision.properties, referenceTaskId: { type: 'string', minLength: 1 }, referenceResultId: { type: 'string', minLength: 1 },
-      referenceKind: { type: 'string', enum: ['ordinary', 'refinement'] },
+      referenceKind: { type: 'string', enum: ['ordinary', 'refinement', 'zero-pose'] },
+      criteria: zeroPoseValidationCriteriaSchema,
     },
   } } }, async (request) => {
-    const task = editable(request.params.id, request.body.revision);
-    const reference = store.getRecognitionTask(request.body.referenceTaskId);
+    const { revision, referenceTaskId, referenceResultId, criteria } = request.body;
+    const kind = request.body.referenceKind || 'ordinary';
+    if (kind === 'zero-pose') return store.transaction(() => {
+      const task = editable(request.params.id, revision);
+      const reference = store.getRecognitionTask(referenceTaskId);
+      const candidate = requireZeroPoseCandidate(store, reference, referenceResultId);
+      const result = evaluateZeroPoseValidation(store, task, reference, candidate, kind, criteria);
+      store.updateRecognitionTask(reference.id, { zeroPoseCandidate: { ...candidate, validation: result.evidence } });
+      return result;
+    });
+    if (criteria) throw httpError(400, '验收门槛仅用于零位候选的独立复核');
+    const task = editable(request.params.id, revision);
+    const reference = store.getRecognitionTask(referenceTaskId);
     if (reference.id === task.id || reference.cameraId !== task.cameraId) {
       throw httpError(409, '请选择同一摄像头的另一识别任务作为标定来源');
     }
-    const kind = request.body.referenceKind || 'ordinary';
     let fittedResult = reference.result, fitCamera = reference.fitCamera, resultId = reference.resultId;
     if (kind === 'refinement') {
       fittedResult = reference.refinement;

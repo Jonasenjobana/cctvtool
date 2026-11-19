@@ -752,7 +752,7 @@ export class AppComponent implements OnDestroy {
       if (request.seconds === null) throw new Error('请填写预判秒数');
       predictVesselPosition(ship, request.seconds);
       this.ais.startPrediction(request.seconds);
-    } catch (error) { this.operationError.set(errorMessage(error)); }
+    } catch (error) { this.operationError.set(errorMessage(error, { showLocalMessage: true })); }
   }
 
   private async locateAis(mmsi: string, id: string, sourceId: string, valid: () => boolean,
@@ -783,7 +783,7 @@ export class AppComponent implements OnDestroy {
       const point = geometry ? { ...geometry.point, height: geometry.vessel.height / 2 } : subject;
       const zoom = this.ais.trackingZoom() ?? reading.raw.Zoom;
       if (!this.inRange(zoom, 1, this.pointZoomMax())) throw new Error(`跟踪倍率须位于 1～${this.pointZoomMax()}`);
-      const target = { ...pointTargetPtz(camera, reading.raw, point), zoom };
+      const target = { ...pointTargetPtz(camera, reading.raw, point, { allowBeyondHorizon: true }), zoom };
       return { target, message: `AIS ${mmsi} ${prediction ? '预判' : '定位'}指令已发送，位置以回读为准`, sent: () => {
         located = ship!;
         if (prediction) this.ais.predictedPosition.set(prediction);
@@ -816,7 +816,7 @@ export class AppComponent implements OnDestroy {
       prepared.sent?.();
       this.controlTarget.set(result.target);
       this.operationMessage.set(prepared.message);
-    } catch (error) { if (current()) this.operationError.set(errorMessage(error)); }
+    } catch (error) { if (current()) this.operationError.set(errorMessage(error, { showLocalMessage: true })); }
     finally { if (revision === this.preciseRevision && this.operating() === 'precise') this.operating.set(null); }
   }
 

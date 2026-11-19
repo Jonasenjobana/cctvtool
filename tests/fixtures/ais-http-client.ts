@@ -4,8 +4,10 @@ import { Injector, runInInjectionContext } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { from } from 'rxjs';
 import { AisState } from '../../src/app/ais-state.service';
-import { ApiService } from '../../src/app/api.service';
+import { ApiService, errorMessage } from '../../src/app/api.service';
 import { predictVesselPosition } from '../../src/app/ais-prediction';
+import { pointTargetPtz } from '../../src/app/camera-math';
+import { emptyCamera } from '../../src/app/models';
 
 const origin = process.env.AIS_TEST_ORIGIN!;
 const NativeEventSource = globalThis.EventSource;
@@ -48,6 +50,15 @@ try {
   assert.equal(state.status(), 'connected', state.problem());
   assert.deepEqual(state.targets().map(target => target.mmsi), ['123456789']);
   state.selectTarget('123456789');
+  const ship = state.selectedTarget()!;
+  const camera = { ...emptyCamera(), longitude: ship.longitude, latitude: ship.latitude - 0.125, height: 11.7 };
+  const ptz = { Pan: 0, Tilt: 0, Zoom: 32 };
+  assert.throws(() => pointTargetPtz(camera, ptz, ship), (error: unknown) => {
+    assert.equal(errorMessage(error, { showLocalMessage: true }), '目标点被地平线遮挡，超出当前摄像头可视范围');
+    return true;
+  });
+  assert.equal(pointTargetPtz(camera, ptz, { ...ship, height: 5 }).zoom, ptz.Zoom);
+
   assert.equal(state.useBodyGeometry(), false);
   assert.equal(state.trackingZoom(), null);
   const beforeModeChange = state.bodyRevision();

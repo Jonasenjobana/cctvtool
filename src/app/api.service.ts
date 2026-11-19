@@ -168,13 +168,15 @@ export class ApiService {
   }
 }
 
-export function errorMessage(error: unknown): string {
+export function errorMessage(error: unknown, { showLocalMessage = false } = {}): string {
   if (error instanceof HttpErrorResponse) {
     return typeof error.error?.message === 'string'
       ? error.error.message
       : error.status === 0 ? '无法连接调试服务，请检查后端是否启动' : `请求失败（HTTP ${error.status}）`;
   }
-  return error instanceof Error && error.name === 'TimeoutError'
-    ? '请求超时，请稍后重试'
-    : '操作失败，请稍后重试';
+  if (error instanceof Error) {
+    if (error.name === 'TimeoutError') return '请求超时，请稍后重试';
+    if (showLocalMessage && error.message) return error.message;
+  }
+  return '操作失败，请稍后重试';
 }

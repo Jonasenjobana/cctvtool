@@ -60,6 +60,7 @@ export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
 export function pointTargetPtz(
   camera: CameraDraft, ptz: Pick<RawPtz, 'Pan' | 'Tilt' | 'Zoom'>,
   target: { longitude: number; latitude: number; height?: number },
+  { allowBeyondHorizon = false } = {},
 ): PreciseTarget {
   const longitude = finite(camera.longitude, '经度'), latitude = finite(camera.latitude, '纬度');
   const height = finite(camera.height, '高度');
@@ -80,8 +81,8 @@ export function pointTargetPtz(
   const destination = Cartesian3.fromDegrees(target.longitude, target.latitude, targetHeight);
   const direction = Cartesian3.subtract(destination, position, new Cartesian3());
   if (Cartesian3.magnitudeSquared(direction) < 1e-12) throw new Error('临时点与摄像头位置重合，无法计算方向');
-  if (!new EllipsoidalOccluder(Ellipsoid.WGS84, position).isPointVisible(destination)) {
-    throw new Error('临时点超出椭球海面可视范围');
+  if (!allowBeyondHorizon && !new EllipsoidalOccluder(Ellipsoid.WGS84, position).isPointVisible(destination)) {
+    throw new Error('目标点被地平线遮挡，超出当前摄像头可视范围');
   }
   Cartesian3.normalize(direction, direction);
   const enu = Matrix4.getMatrix3(Transforms.eastNorthUpToFixedFrame(position), new Matrix3());

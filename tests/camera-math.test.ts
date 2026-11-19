@@ -229,6 +229,20 @@ test('临时点反算明确拒绝缺少安装参数、非法读数、重合及�
   assert.throws(() => pointTargetPtz({ ...camera, tiltOffset: 90 }, ptz, target), /不可达/);
 });
 
+test('AIS 定位能计算海平面视距外的目标指向', () => {
+  const setup = { ...camera, longitude: 117, latitude: 39, height: 11.7 };
+  const target = { longitude: 117, latitude: 39.125 };
+  assert.throws(() => pointTargetPtz(setup, ptz, target), /可视范围/);
+
+  const aim = pointTargetPtz(setup, ptz, target, { allowBeyondHorizon: true });
+  const pose = createCameraPose(setup, { ...ptz, Pan: aim.pan, Tilt: aim.tilt });
+  const desired = Cartesian3.normalize(Cartesian3.subtract(
+    Cartesian3.fromDegrees(target.longitude, target.latitude, 0), pose.position, new Cartesian3(),
+  ), new Cartesian3());
+  near(Cartesian3.distance(pose.direction, desired), 0);
+  assert.equal(aim.zoom, ptz.Zoom);
+});
+
 test('临时点追踪保留上抬负 T，不包装成 300 多度', () => {
   const setup = { ...camera, longitude: 0, latitude: 0, height: 6.6, tiltOffset: -1 };
   const result = pointTargetPtz(setup, { Pan: 0, Tilt: 2, Zoom: 8 }, { longitude: 0, latitude: 0.01 });

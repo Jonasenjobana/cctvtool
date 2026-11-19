@@ -139,6 +139,36 @@ test('设备参数与截图在重启后恢复，图片地址可读取且原始 P
   assert.equal((await f.app.inject(snapshot.imageUrl)).statusCode, 200);
 });
 
+test('零位草稿可保存和重载，旧保存请求及历史截图保留各自的姿态', async (t) => {
+  const f = await fixture(t);
+  const url = `/api/cameras/${f.camera.id}`;
+  assert.equal(f.camera.zeroPose, undefined);
+  const original = await f.app.inject({ method: 'POST', url: `${url}/snapshots`, payload: {} });
+  assert.equal(original.statusCode, 201, original.body);
+  const zeroPose = { roll: -8.2, pitch: 5.4, yaw: 81.6, tiltOffset: -4.6 };
+  const saved = await f.app.inject({ method: 'PUT', url, payload: { ...input, zeroPose } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.deepEqual(saved.json().zeroPose, zeroPose);
+  const rename = await f.app.inject({ method: 'PUT', url, payload: { ...input, name: '测试摄像头' } });
+  assert.equal(rename.statusCode, 200, rename.body);
+  assert.deepEqual(rename.json().zeroPose, zeroPose);
+  const rejected = await f.app.inject({
+    method: 'PUT', url, payload: { ...input, tiltOffset: 10, zeroPose: { ...zeroPose, yaw: 360 } },
+  });
+  assert.equal(rejected.statusCode, 400, rejected.body);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  const [camera] = (await f.app.inject('/api/cameras')).json();
+  assert.deepEqual(camera.zeroPose, zeroPose);
+  for (const key of ['panOffset', 'tiltOffset', 'pAxisPitch', 'pAxisRoll', 'imageRoll']) assert.equal(camera[key], input[key]);
+  assert.deepEqual((await f.app.inject(`${url}/snapshots`)).json(), [original.json()]);
+  const current = await f.app.inject({ method: 'POST', url: `${url}/snapshots`, payload: {} });
+  assert.equal(current.statusCode, 201, current.body);
+  assert.deepEqual(current.json().calibration, original.json().calibration);
+  assert.equal(current.json().ptz.raw.Pan, original.json().ptz.raw.Pan);
+  assert.deepEqual(f.state.ptzCommands, []);
+});
+
 test('并发回读只登录一次，token 被拒绝后合并重新登录且不向前端泄露认证数据', async (t) => {
   const f = await fixture(t);
   const url = `/api/cameras/${f.camera.id}/ptz`;

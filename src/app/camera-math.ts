@@ -3,13 +3,18 @@ import {
 } from 'cesium';
 import type { CameraDraft, PreciseTarget, RawPtz } from './models';
 import { createLocalRigRotation } from '#camera-rotation';
+import { createZeroPoseRigRotation } from '#zero-pose';
+import type { ZeroPose } from '#zero-pose';
 
-export interface CameraPose {
+export interface CameraBasis {
   position: Cartesian3;
   direction: Cartesian3;
   right: Cartesian3;
   up: Cartesian3;
   panAxis: Cartesian3;
+}
+
+export interface CameraPose extends CameraBasis {
   horizontalFov: number;
   verticalFov: number;
 }
@@ -26,14 +31,35 @@ function finite(value: number | null, label: string): number {
   return value;
 }
 
-export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
+type CameraLocation = Pick<CameraDraft, 'longitude' | 'latitude' | 'height'>;
+
+function cameraPosition(camera: CameraLocation): Cartesian3 {
   const longitude = finite(camera.longitude, '经度');
   const latitude = finite(camera.latitude, '纬度');
   const height = finite(camera.height, '高度');
   if (Math.abs(longitude) > 180 || Math.abs(latitude) > 90 || height < 0) throw new Error('安装位置超出有效范围');
+  return Cartesian3.fromDegrees(longitude, latitude, height);
+}
+
+function cameraBasis(position: Cartesian3, rig: { mount: Matrix3; camera: Matrix3 }): CameraBasis {
+  const enu = Matrix4.getMatrix3(Transforms.eastNorthUpToFixedFrame(position), new Matrix3());
+  const world = Matrix3.multiply(enu, rig.camera, new Matrix3());
+  return {
+    position,
+    right: Matrix3.getColumn(world, 0, new Cartesian3()),
+    direction: Matrix3.getColumn(world, 1, new Cartesian3()),
+    up: Matrix3.getColumn(world, 2, new Cartesian3()),
+    panAxis: Matrix3.multiplyByVector(Matrix3.multiply(enu, rig.mount, new Matrix3()), Cartesian3.UNIT_Z, new Cartesian3()),
+  };
+}
+
+const validFov = (value: number | null | undefined): value is number => typeof value === 'number' && value > 0 && value < 180;
+
+export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
+  const position = cameraPosition(camera);
   const horizontalFov = finite(ptz.HorizontalFieldAngle, '接口水平视场角');
   const verticalFov = finite(ptz.VerticalFieldAngle, '接口垂直视场角');
-  if (horizontalFov <= 0 || horizontalFov >= 180 || verticalFov <= 0 || verticalFov >= 180) {
+  if (!validFov(horizontalFov) || !validFov(verticalFov)) {
     throw new Error('接口返回的视场角无效');
   }
   const pan = finite(ptz.Pan, '云台 P');
@@ -43,18 +69,16 @@ export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
   const roll = finite(camera.pAxisRoll, 'P 轴左右倾');
   const tiltOffset = finite(camera.tiltOffset, 'T 偏移');
   const imageRoll = finite(camera.imageRoll, '画面 Roll 修正');
-  const position = Cartesian3.fromDegrees(longitude, latitude, height);
-  const enu = Matrix4.getMatrix3(Transforms.eastNorthUpToFixedFrame(position), new Matrix3());
   const rig = createLocalRigRotation({ pAxisPitch: pitch, pAxisRoll: roll, panOffset: offset, tiltOffset, imageRoll }, { Pan: pan, Tilt: tilt });
-  const world = Matrix3.multiply(enu, rig.camera, new Matrix3());
-  return {
-    position,
-    right: Matrix3.getColumn(world, 0, new Cartesian3()),
-    direction: Matrix3.getColumn(world, 1, new Cartesian3()),
-    up: Matrix3.getColumn(world, 2, new Cartesian3()),
-    panAxis: Matrix3.multiplyByVector(Matrix3.multiply(enu, rig.mount, new Matrix3()), Cartesian3.UNIT_Z, new Cartesian3()),
-    horizontalFov, verticalFov,
-  };
+  return { ...cameraBasis(position, rig), horizontalFov, verticalFov };
+}
+
+export function createZeroPosePreview(camera: CameraLocation, zeroPose: ZeroPose, ptz: RawPtz | null) {
+  const basis = cameraBasis(cameraPosition(camera), createZeroPoseRigRotation(zeroPose, ptz ?? { Pan: 0, Tilt: 0 }));
+  const horizontalFov = ptz?.HorizontalFieldAngle, verticalFov = ptz?.VerticalFieldAngle;
+  const pose: CameraPose | null = validFov(horizontalFov) && validFov(verticalFov)
+    ? { ...basis, horizontalFov, verticalFov } : null;
+  return { basis, pose };
 }
 
 export function pointTargetPtz(

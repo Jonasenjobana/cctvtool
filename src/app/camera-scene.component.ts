@@ -3,12 +3,14 @@ import {
 } from '@angular/core';
 import type { AfterViewInit, OnChanges, OnDestroy, SimpleChanges } from '@angular/core';
 import {
-  ArcType, Cartesian2, Cartesian3, Color, ConstantPositionProperty, Ellipsoid, EllipsoidalOccluder, Entity, GeometryInstance,
-  HeadingPitchRange, LabelStyle, Material, MaterialAppearance, Matrix4, PerspectiveFrustum, PlaneGeometry, PolylineCollection, Primitive, Viewer,
+  ArcType, Cartesian2, Cartesian3, Color, ConstantPositionProperty, ConstantProperty, Ellipsoid, EllipsoidalOccluder, Entity, GeometryInstance,
+  HeadingPitchRange, LabelStyle, Material, MaterialAppearance, Matrix3, Matrix4, PerspectiveFrustum, PlaneGeometry, PolylineCollection,
+  Primitive, Quaternion, Transforms, Viewer,
 } from 'cesium';
 import type { Polyline } from 'cesium';
-import { createCameraPose, footprintSegments, frustumCorners, observationFov, vesselCorners, videoFovPlane } from './camera-math';
-import type { CameraPose, VesselDimensions } from './camera-math';
+import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, observationFov, vesselCorners, videoFovPlane } from './camera-math';
+import type { CameraBasis, CameraPose, VesselDimensions } from './camera-math';
+import type { ZeroPose } from '#zero-pose';
 import type { CameraDraft, PtzReading } from './models';
 import { createAmapImagery } from './amap-imagery';
 import { startVideoFrameLoop } from './video-frame-loop';
@@ -58,6 +60,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @ViewChild('container', { static: true }) container!: ElementRef<HTMLDivElement>;
   @Input() camera: CameraDraft | null = null;
   @Input() reading: PtzReading | null = null;
+  @Input() zeroPosePreview: { pose: ZeroPose; view: 'external' | 'lens' } | null = null;
   @Input() following = true;
   @Input() video: HTMLVideoElement | null = null;
   @Input() snapshotUrl: string | null = null;
@@ -81,8 +84,11 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   private lines?: PolylineCollection;
   private readonly lineMap = new Map<string, Polyline>();
   private readonly temporaryPointEntities = new Map<number, { entity: Entity; position: Cartesian3; input: TemporaryMapPoint }>();
+  private readonly previewEntities = new Map<string, Entity>();
   private marker?: Entity;
   private pose?: CameraPose;
+  private previewBasis?: CameraBasis;
+  private previewExterior = false;
   private observer?: ResizeObserver;
   private previousKey = '';
   private wasFollowing = false;
@@ -129,7 +135,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         this.observer = new ResizeObserver(() => {
           if (!this.viewer || this.viewer.isDestroyed()) return;
           this.viewer.resize();
-          if (this.following && this.pose) this.focus();
+          if (this.zeroPosePreview ? this.zeroPosePreview.view === 'lens' : this.following) this.focus();
           this.viewer.scene.requestRender();
         });
         this.observer.observe(this.container.nativeElement);
@@ -231,40 +237,100 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     const viewer = this.viewer;
     if (!viewer || viewer.isDestroyed()) return;
     const raw = this.reading?.raw;
-    const key = JSON.stringify([this.camera, raw?.Pan, raw?.Tilt, raw?.Zoom, raw?.HorizontalFieldAngle, raw?.VerticalFieldAngle]);
+    const preview = this.zeroPosePreview;
+    const key = JSON.stringify([this.camera, preview, raw?.Pan, raw?.Tilt, raw?.Zoom, raw?.HorizontalFieldAngle, raw?.VerticalFieldAngle]);
     if (key === this.previousKey) {
-      if (this.following && !this.wasFollowing) this.focus();
+      if (!preview && this.following && !this.wasFollowing) this.focus();
       this.wasFollowing = this.following;
       this.updateVideo();
       return;
     }
+    const exterior = preview?.view === 'external';
+    const centerExterior = exterior && (!this.previewExterior || !this.previewBasis);
+    this.previewExterior = exterior;
     this.previousKey = key;
     this.pose = undefined;
+    this.previewBasis = undefined;
     for (const line of this.lineMap.values()) line.show = false;
+    for (const entity of this.previewEntities.values()) entity.show = false;
     if (this.marker) this.marker.show = false;
     try {
       if (!this.camera) throw new Error('请选择或注册摄像头');
       if (this.camera.longitude !== null && this.camera.latitude !== null && this.camera.height !== null && this.marker) {
         this.marker.position = new ConstantPositionProperty(Cartesian3.fromDegrees(this.camera.longitude, this.camera.latitude, this.camera.height));
-        this.marker.show = true;
+        this.marker.show = !preview;
       }
-      if (!raw) throw new Error('等待有效的 PTZ 回读');
-      this.pose = createCameraPose(this.camera, raw);
-      const corners = frustumCorners(this.pose, videoPlaneDistance);
-      const frustumColor = Color.fromCssColorString('#ffd77a');
-      corners.forEach((corner, index) => this.setLine(`ray-${index}`, [this.pose!.position, corner], frustumColor));
-      this.setLine('frame', [...corners, corners[0]], frustumColor);
-      this.setLine('axis', [this.pose.position, Cartesian3.add(this.pose.position,
-        Cartesian3.multiplyByScalar(this.pose.panAxis, 50, new Cartesian3()), new Cartesian3())], Color.fromCssColorString('#68cda4'));
-      footprintSegments(this.pose).forEach((points, index) => this.setLine(`footprint-${index}`, points, Color.fromCssColorString('#54c5ff'), 3));
-      this.problem.set('');
-      if (this.following) this.focus();
+      if (preview) {
+        const geometry = createZeroPosePreview(this.camera, preview.pose, raw ?? null);
+        this.previewBasis = geometry.basis;
+        this.pose = geometry.pose ?? undefined;
+        if (exterior) this.drawZeroPoseModel(geometry.basis);
+      } else {
+        if (!raw) throw new Error('等待有效的 PTZ 回读');
+        this.pose = createCameraPose(this.camera, raw);
+      }
+      const pose = this.pose;
+      if (pose) {
+        const corners = frustumCorners(pose, videoPlaneDistance);
+        const frustumColor = Color.fromCssColorString('#ffd77a');
+        corners.forEach((corner, index) => this.setLine(`ray-${index}`, [pose.position, corner], frustumColor));
+        this.setLine('frame', [...corners, corners[0]], frustumColor);
+        if (!preview) {
+          this.setLine('axis', [pose.position, Cartesian3.add(pose.position,
+            Cartesian3.multiplyByScalar(pose.panAxis, 50, new Cartesian3()), new Cartesian3())], Color.fromCssColorString('#68cda4'));
+        }
+        footprintSegments(pose).forEach((points, index) => this.setLine(`footprint-${index}`, points, Color.fromCssColorString('#54c5ff'), 3));
+      }
+      this.problem.set(preview && raw && !pose ? '回读视场角无效，当前显示相机姿态' : '');
+      if (centerExterior) this.focusZeroPoseExterior();
+      else if (preview ? preview.view === 'lens' : this.following) this.focus();
     } catch (error) {
       this.problem.set(error instanceof Error ? error.message : '无法生成当前视场');
     }
     this.wasFollowing = this.following;
     this.updateVideo();
     viewer.scene.requestRender();
+  }
+
+  private drawZeroPoseModel(basis: CameraBasis) {
+    const { position, right, direction, up } = basis;
+    const rotation = new Matrix3(right.x, direction.x, up.x, right.y, direction.y, up.y, right.z, direction.z, up.z);
+    const orientation = Quaternion.fromRotationMatrix(rotation);
+    const modelFrame = Matrix4.fromRotationTranslation(rotation, position);
+    this.showPreviewEntity('body', Matrix4.multiplyByPoint(modelFrame, new Cartesian3(0, -5.5, 0), new Cartesian3()), {
+      box: { dimensions: new Cartesian3(5, 7, 4), material: Color.fromCssColorString('#52617a') },
+    }, orientation);
+    // Cesium 圆柱沿自身 Z 轴，旋到相机 Y 轴后，镜头前端位于光轴起点。
+    const lensOrientation = Quaternion.multiply(orientation,
+      Quaternion.fromAxisAngle(Cartesian3.UNIT_X, -Math.PI / 2), new Quaternion());
+    this.showPreviewEntity('lens', Matrix4.multiplyByPoint(modelFrame, new Cartesian3(0, -1, 0), new Cartesian3()), {
+      cylinder: { length: 2, topRadius: 1.5, bottomRadius: 1.5, slices: 32, material: Color.fromCssColorString('#263a53') },
+    }, lensOrientation);
+    const enu = Transforms.eastNorthUpToFixedFrame(position);
+    const axes = [
+      ['east', '东', Matrix4.multiplyByPoint(enu, new Cartesian3(15, 0, 0), new Cartesian3()), Color.SALMON],
+      ['north', '北', Matrix4.multiplyByPoint(enu, new Cartesian3(0, 15, 0), new Cartesian3()), Color.LIGHTGREEN],
+      ['up', '天', Matrix4.multiplyByPoint(enu, new Cartesian3(0, 0, 15), new Cartesian3()), Color.SKYBLUE],
+      ['optical', '光轴', Matrix4.multiplyByPoint(modelFrame, new Cartesian3(0, 26, 0), new Cartesian3()), Color.GOLD],
+    ] as const;
+    for (const [key, label, end, color] of axes) {
+      this.setLine(`preview-${key}`, [position, end], color, 3);
+      this.showPreviewEntity(key, end, {
+        label: { text: label, font: '12px sans-serif', fillColor: color, outlineColor: Color.BLACK,
+          outlineWidth: 2, style: LabelStyle.FILL_AND_OUTLINE, pixelOffset: new Cartesian2(0, -8) },
+      });
+    }
+  }
+
+  private showPreviewEntity(key: string, position: Cartesian3, options: Entity.ConstructorOptions, orientation?: Quaternion) {
+    let entity = this.previewEntities.get(key);
+    if (!entity) {
+      entity = this.viewer!.entities.add(options);
+      this.previewEntities.set(key, entity);
+    }
+    entity.position = new ConstantPositionProperty(position);
+    if (orientation) entity.orientation = new ConstantProperty(orientation);
+    entity.show = true;
   }
 
   private updateVideo() {
@@ -347,17 +413,28 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   focus() {
-    if (!this.viewer || !this.pose) return;
+    const basis = this.previewBasis ?? this.pose;
+    if (!this.viewer || !basis) return;
     const camera = this.viewer.camera;
     const aspect = Math.max(1, this.container.nativeElement.clientWidth) / Math.max(1, this.container.nativeElement.clientHeight);
     const frustum = camera.frustum as PerspectiveFrustum;
     frustum.aspectRatio = aspect;
-    frustum.fov = observationFov(this.pose, aspect);
+    frustum.fov = this.pose ? observationFov(this.pose, aspect) : Math.PI / 3;
     frustum.near = 0.1;
     frustum.far = 50000000;
     camera.cancelFlight();
     camera.lookAtTransform(Matrix4.IDENTITY);
-    camera.setView({ destination: this.pose.position, orientation: { direction: this.pose.direction, up: this.pose.up } });
+    camera.setView({ destination: basis.position, orientation: { direction: basis.direction, up: basis.up } });
+    this.viewer.scene.requestRender();
+  }
+
+  focusZeroPoseExterior() {
+    if (!this.viewer || !this.previewBasis) return;
+    const camera = this.viewer.camera;
+    (camera.frustum as PerspectiveFrustum).fov = Math.PI / 3;
+    camera.cancelFlight();
+    camera.lookAt(this.previewBasis.position, new HeadingPitchRange(3 * Math.PI / 4, -Math.PI / 6, 45));
+    camera.lookAtTransform(Matrix4.IDENTITY);
     this.viewer.scene.requestRender();
   }
 
@@ -393,5 +470,6 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     if (this.viewer && !this.viewer.isDestroyed()) this.viewer.destroy();
     this.lineMap.clear();
     this.temporaryPointEntities.clear();
+    this.previewEntities.clear();
   }
 }

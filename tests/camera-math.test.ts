@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Cartesian3, Cartographic, Matrix4, Transforms } from 'cesium';
-import { createCameraPose, footprintSegments, frustumCorners, observationFov, pointTargetPtz, videoFovPlane } from '../src/app/camera-math.ts';
+import { Cartesian3, Cartographic, Matrix3, Matrix4, Quaternion, Transforms } from 'cesium';
+import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, observationFov, pointTargetPtz, videoFovPlane } from '../src/app/camera-math.ts';
 import type { CameraDraft, RawPtz } from '../src/app/models.ts';
+import { createZeroPoseQuaternion, createZeroPoseRotation, resolveZeroPose, updateZeroPoseTiltOffset } from '#zero-pose';
 
 const camera: CameraDraft = {
   name: 'test', serial: '01', code: '02', longitude: 113.9, latitude: 22.1, height: 100,
@@ -10,6 +11,68 @@ const camera: CameraDraft = {
 };
 const ptz: RawPtz = { Pan: 0, Tilt: 0, Zoom: 15, HorizontalFieldAngle: 4.32, VerticalFieldAngle: 2.43 };
 const near = (a: number, b: number, epsilon = 1e-9) => assert.ok(Math.abs(a - b) <= epsilon, `${a} ≠ ${b}`);
+
+test('零位预览在回读缺失时显示零位方向，转动后按补偿与实际视场角显示', () => {
+  const location = { ...camera, longitude: 0, latitude: 0, panOffset: 24 };
+  const zeroPose = { roll: 0, pitch: 0, yaw: 90, tiltOffset: 30 };
+  const reference = createZeroPosePreview(location, zeroPose, null);
+  const atZero = createZeroPosePreview(location, zeroPose, { ...ptz, Zoom: 1 });
+  // 赤道和本初子午线交点的地固坐标中，东为 +Y，北为 +Z，天为 +X。
+  near(Cartesian3.distance(reference.basis.direction, Cartesian3.UNIT_Y), 0);
+  near(Cartesian3.distance(reference.basis.up, Cartesian3.UNIT_X), 0);
+  near(Cartesian3.distance(atZero.basis.direction, reference.basis.direction), 0);
+  near(Cartesian3.distance(atZero.basis.up, reference.basis.up), 0);
+  assert.equal(reference.pose, null);
+  assert.equal(atZero.pose?.horizontalFov, ptz.HorizontalFieldAngle);
+  assert.equal(atZero.pose?.verticalFov, ptz.VerticalFieldAngle);
+  const reading = { ...ptz, Pan: 90, Tilt: 30, HorizontalFieldAngle: 8.7, VerticalFieldAngle: 4.9 };
+  const turned = createZeroPosePreview(location, zeroPose, reading);
+  near(Cartesian3.distance(turned.basis.direction, new Cartesian3(0, 0, -1)), 0);
+  assert.equal(turned.pose?.horizontalFov, 8.7);
+  assert.equal(turned.pose?.verticalFov, 4.9);
+  const withoutFov = createZeroPosePreview(location, zeroPose, { ...reading, HorizontalFieldAngle: null });
+  near(Cartesian3.distance(withoutFov.basis.direction, turned.basis.direction), 0);
+  assert.equal(withoutFov.pose, null);
+});
+
+test('旧转台的零位角可初始化草稿，补偿调整保留机械 P 轴且四元数与姿态等价', () => {
+  const legacy = { ...camera, panOffset: -15, pAxisPitch: 12, pAxisRoll: 0, tiltOffset: 7, imageRoll: -11 };
+  const initial = resolveZeroPose(legacy);
+  near(initial.yaw, 345);
+  near(initial.pitch, 19);
+  near(initial.roll, -11);
+  assert.equal(initial.tiltOffset, 7);
+  const verticalLegacy = resolveZeroPose({ ...legacy, pAxisPitch: 83 });
+  near(verticalLegacy.yaw, 345);
+  near(verticalLegacy.pitch, 90);
+  near(verticalLegacy.roll, -11);
+
+  const zeroPose = { roll: 14, pitch: -12, yaw: 305, tiltOffset: 17 };
+  assert.deepEqual(resolveZeroPose({ ...legacy, zeroPose }), zeroPose);
+  const adjusted = updateZeroPoseTiltOffset(zeroPose, -10);
+  assert.equal(adjusted.tiltOffset, -10);
+  assert.notEqual(adjusted.pitch, zeroPose.pitch);
+  assert.notEqual(adjusted.yaw, zeroPose.yaw);
+  const quaternion = createZeroPoseQuaternion(adjusted);
+  near(Quaternion.magnitude(quaternion), 1);
+  assert.ok(Matrix3.equalsEpsilon(Matrix3.fromQuaternion(quaternion), createZeroPoseRotation(adjusted), 1e-12));
+  for (const Pan of [0.1, 359.9, 110]) {
+    for (const Tilt of [-30, 0, 40]) {
+      const before = createZeroPosePreview(camera, zeroPose, { ...ptz, Pan, Tilt: Tilt + 27 });
+      const after = createZeroPosePreview(camera, adjusted, { ...ptz, Pan, Tilt });
+      near(Cartesian3.distance(before.basis.panAxis, after.basis.panAxis), 0);
+      near(Cartesian3.distance(before.basis.direction, after.basis.direction), 0);
+      near(Cartesian3.distance(before.basis.up, after.basis.up), 0);
+    }
+  }
+  const nearVertical = { roll: 0, pitch: 60, yaw: 40, tiltOffset: 5 };
+  const vertical = updateZeroPoseTiltOffset(nearVertical, 35);
+  const before = createZeroPosePreview(camera, nearVertical, { ...ptz, Pan: 91, Tilt: -20 });
+  const after = createZeroPosePreview(camera, vertical, { ...ptz, Pan: 91, Tilt: 10 });
+  near(vertical.pitch, 90);
+  near(Cartesian3.distance(before.basis.direction, after.basis.direction), 0);
+  near(Cartesian3.distance(before.basis.up, after.basis.up), 0);
+});
 
 test('无底座倾斜时安装朝向与 P 角偏移等价，原始 PTZ 保持不变，零值位置有效', () => {
   const position = { ...camera, longitude: 0, latitude: 0, height: 0 };

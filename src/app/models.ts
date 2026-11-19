@@ -1,3 +1,5 @@
+import type { ZeroPose } from '#zero-pose';
+
 export interface Calibration {
   longitude: number | null;
   latitude: number | null;
@@ -14,6 +16,7 @@ export interface CameraInput extends Calibration {
   serial: string;
   code: string;
   maxZoom?: number;
+  zeroPose?: ZeroPose;
 }
 
 export interface Camera extends CameraInput {

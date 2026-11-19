@@ -25,6 +25,9 @@ import { predictVesselPosition } from './ais-prediction';
 import type { VesselTarget } from './ais.models';
 import { HoldPtzControl } from './hold-ptz-control';
 import { createPtzPath } from '../../shared/snapshot-path';
+import { resolveZeroPose } from '#zero-pose';
+import type { ZeroPose } from '#zero-pose';
+import { ZeroPoseEditorComponent } from './zero-pose-editor.component';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
 import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
 import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
@@ -37,7 +40,7 @@ interface PreparedPreciseTarget { target: PreciseTarget; message: string; sent?:
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent, PlotLayersComponent, AisPanelComponent],
+  imports: [FormsModule, DatePipe, DecimalPipe, IconComponent, CameraSceneComponent, LiveVideoComponent, CalibrationHelpComponent, SnapshotItemComponent, SnapshotTasksComponent, RecognitionTasksComponent, PlotLayersComponent, AisPanelComponent, ZeroPoseEditorComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './app.component.html',
   styleUrl: './app.component.css',
@@ -57,6 +60,7 @@ export class AppComponent implements OnDestroy {
   readonly cameras = signal<Camera[]>([]);
   readonly selectedId = signal('');
   readonly draft = signal<CameraDraft>(emptyCamera());
+  readonly zeroPoseView = signal<'external' | 'lens' | null>(null);
   readonly reading = signal<PtzReading | null>(null);
   readonly ptzPollingIntervalSeconds = signal(10);
   readonly stale = signal(true);
@@ -152,6 +156,14 @@ export class AppComponent implements OnDestroy {
     } : this.draft();
   });
   readonly sceneCamera = computed(() => this.selectedId() ? this.formValue() : null);
+  readonly zeroPose = computed(() => {
+    const camera = this.selectedCamera();
+    return camera ? this.draft().zeroPose ?? resolveZeroPose(camera) : null;
+  });
+  readonly zeroPosePreview = computed(() => {
+    const pose = this.zeroPose(), view = this.zeroPoseView();
+    return view && pose && this.page() === 'scene' && !this.selectedSnapshot() ? { pose, view } : null;
+  });
   readonly videoChannelMatches = computed(() => {
     const source = this.playbackSource();
     const camera = this.selectedCamera();
@@ -162,9 +174,14 @@ export class AppComponent implements OnDestroy {
   readonly sceneVideo = computed(() => this.showVideo() && !this.selectedSnapshot() && this.videoChannelMatches()
     ? this.liveVideo() : null);
   readonly preview = computed(() => this.hidePreview() ? null : (this.selectedSnapshot() || this.lastSnapshot()));
+  readonly zeroPoseDirty = computed(() => {
+    const draft = this.draft().zeroPose, saved = this.selectedCamera()?.zeroPose;
+    return draft !== saved && (!draft || !saved || draft.yaw !== saved.yaw || draft.pitch !== saved.pitch
+      || draft.roll !== saved.roll || draft.tiltOffset !== saved.tiltOffset);
+  });
   readonly isDirty = computed(() => {
     const original = this.selectedCamera() || emptyCamera();
-    return editableKeys.some((key) => original[key] !== this.draft()[key]);
+    return this.zeroPoseDirty() || editableKeys.some((key) => original[key] !== this.draft()[key]);
   });
   readonly formValid = computed(() => {
     const draft = this.draft();
@@ -347,8 +364,9 @@ export class AppComponent implements OnDestroy {
     this.ais.clearTracking();
     this.plotNavigationRevision++;
     this.plotFocusRequest.set(null);
-    const { name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = camera;
-    this.draft.set({ name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll });
+    const { name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll, zeroPose } = camera;
+    this.draft.set({ name, serial, code, maxZoom, longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll, zeroPose });
+    this.zeroPoseView.set(null);
     this.selectedId.set(camera.id);
     this.reading.set(null);
     this.stale.set(true);
@@ -548,6 +566,7 @@ export class AppComponent implements OnDestroy {
     this.plotFocusRequest.set(null);
     this.selectedId.set('');
     this.draft.set(emptyCamera());
+    this.zeroPoseView.set(null);
     this.reading.set(null);
     this.stale.set(true);
     this.selectedSnapshot.set(null);
@@ -586,6 +605,18 @@ export class AppComponent implements OnDestroy {
     this.formError.set('');
   }
 
+  editZeroPose(zeroPose: ZeroPose | undefined) {
+    this.draft.update((draft) => ({ ...draft, zeroPose }));
+    this.formMessage.set('');
+    this.formError.set('');
+  }
+
+  setZeroPoseView(view: 'external' | 'lens' | null) {
+    if (view === 'external' && this.zeroPoseView() === view) this.scene?.focusZeroPoseExterior();
+    else if (view === 'lens' && this.zeroPoseView() === view) this.scene?.focus();
+    else this.zeroPoseView.set(view);
+  }
+
   private calibration(): Calibration {
     const { longitude, latitude, height, pAxisPitch, pAxisRoll, panOffset, tiltOffset, imageRoll } = this.draft();
     return { longitude, latitude, height, pAxisPitch: pAxisPitch!, pAxisRoll: pAxisRoll!, panOffset: panOffset!,
@@ -596,10 +627,13 @@ export class AppComponent implements OnDestroy {
     if (!this.formValid() || this.saving() || this.operating() || this.scanning() || this.selectedSnapshot()) return;
     this.ais.clearTracking();
     const id = this.selectedId();
+    const zeroPose = this.zeroPoseDirty() ? this.draft().zeroPose
+      : this.selectedCamera()?.zeroPose ? undefined : this.zeroPosePreview()?.pose;
     const input: CameraInput = {
       name: this.draft().name.trim(), serial: this.draft().serial.trim(), code: this.draft().code.trim(),
       maxZoom: this.draft().maxZoom!,
       ...this.calibration(),
+      zeroPose,
     };
     const channelChanged = this.selectedCamera()?.serial !== input.serial || this.selectedCamera()?.code !== input.code;
     this.saving.set(true);
@@ -607,7 +641,7 @@ export class AppComponent implements OnDestroy {
     try {
       const camera = await this.api.saveCamera(id, input);
       this.cameras.update((cameras) => id ? cameras.map((item) => item.id === id ? camera : item) : [...cameras, camera]);
-      this.draft.set({ ...input });
+      this.draft.set({ ...input, zeroPose: camera.zeroPose });
       if (!id) this.activate(camera);
       else if (channelChanged) this.loadPlayback();
       this.apiConnected.set(true);

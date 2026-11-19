@@ -138,6 +138,10 @@
 .form-section{padding-bottom:18px;margin-bottom:18px;border-bottom:1px solid #edf0f3}
 .form-section:last-child{margin-bottom:0;border-bottom:0}
 .form-section h3{font-size:11px;font-weight:500;color:#7b8797;margin-bottom:13px}
+.zero-pose-section .parameter-heading{justify-content:space-between}
+.zero-pose-section button{padding:5px 8px;font-size:11px}
+.zero-pose-source{margin:7px 0 10px;font-size:11px;color:#526278}
+.zero-pose-reset{margin-top:10px}
 .parameter-heading{display:flex;align-items:center;gap:7px;margin-bottom:13px}
 .parameter-heading h3{margin-bottom:0}
 .field-heading{display:flex;align-items:center;gap:6px;margin-bottom:6px;min-height:16px}

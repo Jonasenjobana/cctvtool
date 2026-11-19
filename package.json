@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "imports": {
-    "#camera-rotation": "./shared/camera-rotation.ts"
+    "#camera-rotation": "./shared/camera-rotation.ts",
+    "#zero-pose": "./shared/zero-pose.ts"
   },
   "engines": {
     "node": ">=22.22.3 <23"

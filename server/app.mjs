@@ -40,6 +40,16 @@ const cameraSchema = {
     code: { type: 'string', minLength: 1, maxLength: 100 },
     maxZoom: { type: 'number', minimum: 1 },
     ...calibrationProperties,
+    zeroPose: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        roll: { type: 'number', minimum: -180, maximum: 180 },
+        pitch: { type: 'number', minimum: -90, maximum: 90 },
+        yaw: { type: 'number', minimum: 0, exclusiveMaximum: 360 },
+        tiltOffset: calibrationProperties.tiltOffset,
+      },
+      required: ['roll', 'pitch', 'yaw', 'tiltOffset'],
+    },
   },
   required: ['name', 'serial', 'code', ...calibrationKeys],
 };
@@ -57,6 +67,7 @@ const fieldLabels = {
   name: '名称', serial: '设备编号', code: '通道编号', longitude: '经度', latitude: '纬度', height: '高度',
   pAxisPitch: 'P 轴前后倾', pAxisRoll: 'P 轴左右倾', panOffset: '默认朝向',
   tiltOffset: 'T 偏移', imageRoll: '画面 Roll 修正', maxZoom: '最大倍率 Z',
+  zeroPose: '零位姿态', roll: '零位 Roll', pitch: '零位 Pitch', yaw: '零位 Yaw',
   command: '控制指令', speed: '控制速度', pan: '目标 P', tilt: '目标 T', zoom: '目标 Z',
   controlPoints: 'PTZ 控制点', maxPanStep: '最大 P 间隔', settleMs: '稳定等待时间', moveTimeoutMs: '定位超时',
   sourceFileName: '来源文件名', geojsonText: 'GeoJSON 原文', cameraIds: '关联摄像头', visible: '图层显隐',

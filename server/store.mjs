@@ -10,7 +10,10 @@ const zeroCorrections = { tiltOffset: 0, imageRoll: 0 };
 const plotLayerColumns = 'id, name, sourceFileName, byteLength, featureCount, geometryTypes, createdAt, updatedAt';
 
 const defaultMaxZoom = (name) => name === '天津船闸' ? 32 : 73;
-function cameraRecord(row) { return { ...zeroCorrections, maxZoom: defaultMaxZoom(row.name), ...row }; }
+function cameraRecord({ zeroPose, ...row }) {
+  return { ...zeroCorrections, maxZoom: defaultMaxZoom(row.name), ...row,
+    ...(zeroPose ? { zeroPose: JSON.parse(zeroPose) } : {}) };
+}
 
 function snapshotRecord(row) {
   const snapshot = JSON.parse(row.metadata);
@@ -36,6 +39,7 @@ export class CameraStore {
         longitude REAL, latitude REAL, height REAL,
         pAxisPitch REAL NOT NULL, pAxisRoll REAL NOT NULL, panOffset REAL NOT NULL,
         tiltOffset REAL NOT NULL DEFAULT 0, imageRoll REAL NOT NULL DEFAULT 0,
+        zeroPose TEXT,
         createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
         UNIQUE(serial, code)
       );
@@ -75,7 +79,7 @@ export class CameraStore {
     `);
       const columns = new Set(this.db.prepare('PRAGMA table_info(cameras)').all().map((column) => column.name));
       const missing = Object.keys(zeroCorrections).filter((key) => !columns.has(key));
-      if (missing.length || !columns.has('maxZoom')) {
+      if (missing.length || !columns.has('maxZoom') || !columns.has('zeroPose')) {
         this.db.exec('BEGIN IMMEDIATE');
         try {
           for (const key of missing) this.db.exec(`ALTER TABLE cameras ADD COLUMN ${key} REAL NOT NULL DEFAULT 0`);
@@ -83,6 +87,7 @@ export class CameraStore {
             this.db.exec('ALTER TABLE cameras ADD COLUMN maxZoom REAL NOT NULL DEFAULT 73');
             this.db.prepare('UPDATE cameras SET maxZoom = 32 WHERE name = ?').run('天津船闸');
           }
+          if (!columns.has('zeroPose')) this.db.exec('ALTER TABLE cameras ADD COLUMN zeroPose TEXT');
           this.db.exec('COMMIT');
         } catch (error) {
           this.db.exec('ROLLBACK');
@@ -135,15 +140,16 @@ export class CameraStore {
     const previous = id ? this.getCamera(id) : null;
     const record = { ...input, maxZoom: input.maxZoom ?? previous?.maxZoom ?? defaultMaxZoom(input.name) };
     const values = cameraKeys.map((key) => record[key]);
+    const zeroPose = input.zeroPose === undefined ? null : JSON.stringify(input.zeroPose);
     const now = new Date().toISOString();
     try {
       if (id) {
-        this.db.prepare(`UPDATE cameras SET ${cameraKeys.map((key) => `${key} = ?`).join(', ')}, updatedAt = ? WHERE id = ?`)
-          .run(...values, now, id);
+        this.db.prepare(`UPDATE cameras SET ${cameraKeys.map((key) => `${key} = ?`).join(', ')},
+          zeroPose = COALESCE(?, zeroPose), updatedAt = ? WHERE id = ?`).run(...values, zeroPose, now, id);
       } else {
         id = randomUUID();
-        this.db.prepare(`INSERT INTO cameras (id, ${cameraKeys.join(', ')}, createdAt, updatedAt)
-          VALUES (${Array(cameraKeys.length + 3).fill('?').join(', ')})`).run(id, ...values, now, now);
+        this.db.prepare(`INSERT INTO cameras (id, ${cameraKeys.join(', ')}, zeroPose, createdAt, updatedAt)
+          VALUES (${Array(cameraKeys.length + 4).fill('?').join(', ')})`).run(id, ...values, zeroPose, now, now);
       }
     } catch (error) {
       if (error.message.includes('UNIQUE constraint failed')) throw httpError(409, '该设备通道已注册');

@@ -18,7 +18,7 @@
     } @else if (page() === 'plotting') {
       <app-plot-layers [cameras]="cameras()" [selectedCameraId]="selectedId()" [focusing]="plotPreparing() || !!operating() || saving()" (focused)="focusPlotLayer($event)" />
     } @else {
-    <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
+    <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [zeroPosePreview]="zeroPosePreview()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
       [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" [temporaryPoints]="temporaryPoints()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)"
       [vessels]="aisTargets()" [vesselSource]="ais.selectedSource()" [vesselBodies]="ais.bodyOverrides()" [useVesselBodyGeometry]="ais.useBodyGeometry()" [trackedMmsi]="ais.trackedMmsi()" [predictedMmsi]="ais.predictedTarget()?.mmsi ?? ''" (vesselSelected)="selectAisTarget($event)" />
     <header class="map-toolbar">
@@ -36,9 +36,14 @@
           <span class="history-badge">历史快照</span>
           <button type="button" (click)="exitHistory()"><app-icon name="back" />返回实时</button>
         }
-        <button type="button" [class.selected]="following()" [disabled]="!selectedId()" (click)="following.set(!following())">{{ following() ? '跟随摄像头' : '固定观察' }}</button>
-        <button type="button" [disabled]="!selectedId()" (click)="bestView()"><app-icon name="target" />最佳观察</button>
-        <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId()" (click)="overview()"><app-icon name="map" /></button>
+        @if (zeroPosePreview(); as preview) {
+          <button type="button" [class.selected]="preview.view === 'external'" [attr.aria-pressed]="preview.view === 'external'" (click)="setZeroPoseView('external')">模型外侧</button>
+          <button type="button" [class.selected]="preview.view === 'lens'" [attr.aria-pressed]="preview.view === 'lens'" (click)="setZeroPoseView('lens')">镜头视角</button>
+        } @else {
+          <button type="button" [class.selected]="following()" [disabled]="!selectedId()" (click)="following.set(!following())">{{ following() ? '跟随摄像头' : '固定观察' }}</button>
+          <button type="button" [disabled]="!selectedId()" (click)="bestView()"><app-icon name="target" />最佳观察</button>
+          <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId()" (click)="overview()"><app-icon name="map" /></button>
+        }
       </div>
       @if (showTemporaryPoints()) {
         <div class="temporary-point-container">
@@ -266,6 +271,21 @@
             }
           </section>
         }
+        @if (selectedId() && !selectedSnapshot() && page() === 'scene') {
+          <section class="form-section zero-pose-section">
+            <div class="parameter-heading">
+              <h3>零位姿态</h3>
+              <button type="button" [attr.aria-expanded]="!!zeroPosePreview()" (click)="setZeroPoseView(zeroPosePreview() ? null : 'external')">
+                {{ zeroPosePreview() ? '退出预览' : '编辑并预览' }}
+              </button>
+            </div>
+            @if (zeroPosePreview(); as preview) {
+              <div class="zero-pose-source" role="status">{{ sceneReading() ? '按实时 P/T 回读预览' : '零位参考 · P 0° / T 0° / Z 1' }}</div>
+              <app-zero-pose-editor [pose]="preview.pose" [disabled]="saving()" (changed)="editZeroPose($event)" />
+              <button type="button" class="zero-pose-reset" [disabled]="!zeroPoseDirty()" (click)="editZeroPose(selectedCamera()?.zeroPose)">放弃零位修改</button>
+            }
+          </section>
+        }
         <section class="form-section">
           <div class="parameter-heading"><h3>云台 P 轴姿态</h3><app-calibration-help topic="p-axis" /></div>
           <div class="field-grid">
@@ -306,7 +326,7 @@
       <div class="form-footer">
         @if (formError()) { <p class="inline-error" role="alert">{{ formError() }}</p> }
         @if (formMessage()) { <p class="saved-message" role="status"><app-icon name="check" />{{ formMessage() }}</p> }
-        <button type="submit" class="save-button" [disabled]="!formValid() || saving() || !!operating() || scanning() || !!selectedSnapshot() || (!isDirty() && !!selectedId())"><app-icon name="save" />{{ saving() ? '正在保存…' : selectedId() ? '保存配置' : '注册并保存' }}</button>
+        <button type="submit" class="save-button" [disabled]="!formValid() || saving() || !!operating() || scanning() || !!selectedSnapshot() || (!isDirty() && !!selectedId() && !(zeroPosePreview() && !selectedCamera()?.zeroPose))"><app-icon name="save" />{{ saving() ? '正在保存…' : selectedId() ? '保存配置' : '注册并保存' }}</button>
       </div>
     </form>
   </aside>

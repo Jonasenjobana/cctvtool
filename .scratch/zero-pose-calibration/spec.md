@@ -1,7 +1,6 @@
 # Cesium 相机零位姿态标定规格
 
-Status: open
-Labels: ready-for-agent
+Status: implemented
 
 ## Problem Statement
 

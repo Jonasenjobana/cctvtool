@@ -6,7 +6,7 @@
 
 **Blocked by:** [由海天线生成零位姿态候选](02-fit-zero-pose-from-horizon.md)。
 
-**Status:** done
+**Status:** implemented
 
 - [x] 沿用已有基础来源与高倍来源选择流程。能说明来源无有效标定、无正式标注或缺少合格高倍观测时无法生成的具体原因。
 - [x] 按每张图自己的 P/T、视场角和尺寸共同拟合零位 Roll 和 Pitch，冻结已有 Yaw 和 T 补偿。基础组与高倍组按现有等权口径贡献误差。

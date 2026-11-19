@@ -195,7 +195,7 @@ export interface ZeroPoseValidationCriteria {
   minimumHighZoom: number; maximumVerticalOffsetPixels: number; maximumDirectionDifferenceDegrees: number; maximumRmsPixels: number;
 }
 export interface ZeroPoseValidationEvidence {
-  version: 1; id: string; generatedAt: string; status: ZeroPoseValidation['status'];
+  version: 1 | 2; id: string; generatedAt: string; status: ZeroPoseValidation['status'];
   source: { kind: 'zero-pose' | 'zero-pose-refinement'; model: ZeroPoseCandidate['model']; taskId: string; revision: number;
     resultId: string; sourceSnapshotIds: string[]; selectionRevision?: number; sources?: InstallationRefinement['sources'] };
   validation: { taskId: string; revision: number; sourceSnapshotIds: string[] };
@@ -203,6 +203,7 @@ export interface ZeroPoseValidationEvidence {
   baseline: { model: string; calibration: Calibration; sources: {
     kind: InstallationValidation['reference']['kind']; model: string; taskId: string; resultId: string; revision: number;
     sourceSnapshotIds: string[]; selectionRevision?: number;
+    sources?: Omit<InstallationRefinement['sources'][number], 'inputSnapshotIds'>[];
   }[] };
   criteria: ZeroPoseValidationCriteria;
 }
@@ -214,7 +215,9 @@ export interface ZeroPoseValidation {
   coverage: { lowSnapshotCount: number; highSnapshotCount: number; comparableHighSnapshotCount: number;
     highPoseCount: number; distinctPanCount: number; panCoverageDegrees: number; reasons: string[] };
   sourceSnapshotIds: string[]; failedSnapshotIds: string[]; excluded: InstallationValidation['excluded'];
-  baseline: { model: string; installation: InstallationValidation['installation']; rmsResidualPixels: number | null };
+  baseline: { rmsResidualPixels: number | null } & ({
+    model: 'wgs84-horizon-installation-v1'; installation: InstallationValidation['installation'];
+  } | { model: typeof ZERO_POSE_MODEL; zeroPose: ZeroPose });
   candidate: { model: ZeroPoseCandidate['model']; zeroPose: ZeroPose; rmsResidualPixels: number | null };
   perSnapshot: {
     snapshotId: string; pan: number; tilt: number; zoom: number; zoomGroup: 'low' | 'high';
@@ -237,6 +240,7 @@ export interface ZeroPoseCandidate {
   message: string; stale: boolean; staleReasons: string[];
   applied: boolean; appliedAt: string | null;
   validation?: ZeroPoseValidationEvidence;
+  validationStaleReason?: string | null;
 }
 export interface ZeroPoseMeasurement {
   taskId: string; revision: number; resultId: string;
@@ -280,6 +284,7 @@ export type InstallationRefinement = RefinementState & ({
   before: ZeroPoseRefinementComparison; after: ZeroPoseRefinementComparison;
   baseCamera: Camera & { zeroPose: ZeroPose };
   validation?: ZeroPoseValidationEvidence;
+  validationStaleReason?: string | null;
 });
 export interface RefinementMeasurement {
   taskId: string; revision: number; selectionRevision: number; mode: 'before' | 'after'; resultId: string | null;
@@ -304,4 +309,7 @@ export interface RecognitionItem {
   detection: { error: string | null; warnings: string[]; refinementStatus: string; elapsedMs: number } | null;
 }
 export interface RecognitionTaskPage { tasks: RecognitionTask[]; total: number; offset: number; nextOffset: number | null }
-export interface RecognitionItemPage { task: RecognitionTask; items: RecognitionItem[]; total: number; offset: number; nextOffset: number | null }
+export interface RecognitionItemPage {
+  task: Pick<RecognitionTask, 'id' | 'revision' | 'updatedAt' | 'status'>;
+  items: RecognitionItem[]; total: number; offset: number; nextOffset: number | null;
+}

@@ -7,10 +7,13 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { httpError } from './errors.mjs';
 import { calibrationOf } from './store.mjs';
-import { estimateInstallation, estimateZeroPose, evaluateInstallation, refineInstallation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
+import { backfillCalibrationSources, calibrationSourceFor } from './calibration-source.mjs';
+import { estimateInstallation, estimateZeroPose, evaluateInstallation, invalidHorizonAnnotation, refineInstallation,
+  validHorizonAnnotation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
 import { refinementInputs, refinementStaleReasons, requireZeroPoseRefinement, withRefinementState } from './installation-refinement.mjs';
 import { requireZeroPoseCandidate, zeroPoseCandidateStaleReasons } from './zero-pose-candidate.mjs';
-import { evaluateZeroPoseValidation, requireZeroPoseValidation, validPoints, zeroPoseValidationCriteriaSchema } from './zero-pose-validation.mjs';
+import { evaluateZeroPoseValidation, requireZeroPoseValidation, zeroPoseValidationCriteriaSchema,
+  zeroPoseValidationStaleReason } from './zero-pose-validation.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
@@ -24,7 +27,7 @@ const median = (values) => {
 export function horizonDiscontinuities(items) {
   const groups = new Map();
   for (const item of items) {
-    if (!validPoints(item.detectedPoints) || item.snapshot.poseChanged) continue;
+    if (!validHorizonAnnotation(item.detectedPoints) || item.snapshot.poseChanged) continue;
     const ptz = item.snapshot.ptz.raw;
     const key = JSON.stringify([ptz.Tilt, ptz.Zoom, ptz.HorizontalFieldAngle, ptz.VerticalFieldAngle]);
     const group = groups.get(key) || [];
@@ -102,15 +105,22 @@ export function createEssldRecognizer() {
 
 export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recognizer = createEssldRecognizer() }) {
   store.interruptRecognitionTasks();
+  backfillCalibrationSources(store);
   const queued = [];
   let current = null, closing = false;
 
   function withRecognitionState(task) {
     if (task.zeroPoseCandidate) {
       const staleReasons = zeroPoseCandidateStaleReasons(store, task);
-      task = { ...task, zeroPoseCandidate: { ...task.zeroPoseCandidate, stale: staleReasons.length > 0, staleReasons } };
+      const validationStaleReason = zeroPoseValidationStaleReason(store, task.zeroPoseCandidate.validation);
+      task = { ...task, zeroPoseCandidate: { ...task.zeroPoseCandidate, stale: staleReasons.length > 0, staleReasons, validationStaleReason } };
     }
-    return withRefinementState(store, task);
+    task = withRefinementState(store, task);
+    if (task.refinement?.model === ZERO_POSE_MODEL) {
+      const validationStaleReason = zeroPoseValidationStaleReason(store, task.refinement.validation);
+      return { ...task, refinement: { ...task.refinement, validationStaleReason } };
+    }
+    return task;
   }
 
   function editable(id, revision) {
@@ -123,14 +133,15 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   function installationChanges(task) {
     const camera = store.getCamera(task.cameraId);
     const items = store.recognitionItems(task.id);
-    const selected = items.filter((item) => !item.ignored && !item.missing && validPoints(item.points));
+    const selected = items.filter((item) => !item.ignored && !item.missing && validHorizonAnnotation(item.points));
     const snapshots = selected.map((item) => item.snapshot);
     const dates = items.map((item) => +new Date(item.snapshot.createdAt));
     const result = estimateInstallation(camera, snapshots, selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
       startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
     });
-    result.excluded.push(...items.filter((item) => item.ignored || item.missing).map((item) => ({ snapshotId: item.snapshotId,
-      reason: item.missing ? '源截图已删除' : item.ignoreReason })));
+    result.excluded.push(...items.filter((item) => item.ignored || item.missing || !validHorizonAnnotation(item.points))
+      .map((item) => ({ snapshotId: item.snapshotId,
+        reason: item.missing ? '源截图已删除' : item.ignored ? item.ignoreReason : invalidHorizonAnnotation })));
     return { result, resultId: randomUUID(), resultRevision: task.revision, appliedAt: null, appliedRevision: null,
       fitCamera: { ...calibrationOf(camera), serial: camera.serial, code: camera.code, updatedAt: camera.updatedAt } };
   }
@@ -146,7 +157,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       if (item.missing) reason = '源截图已删除';
       else if (item.snapshot.cameraId !== task.cameraId) reason = '截图不属于该摄像头';
       else if (item.ignored) reason = item.ignoreReason || '已忽略';
-      else if (!validPoints(item.points)) reason = '海天线正式标注无效';
+      else if (!validHorizonAnnotation(item.points)) reason = invalidHorizonAnnotation;
       else if (!store.hasSnapshotImage(item.snapshot)) reason = '源截图文件缺失';
       if (reason) excluded.push({ snapshotId: item.snapshotId, reason }); else selected.push(item);
     }
@@ -200,7 +211,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
             throw httpError(500, '模型返回了错误或重复的截图编号');
           }
           seen.add(result.snapshotId);
-          const points = validPoints(result.points) ? result.points : [];
+          const points = validHorizonAnnotation(result.points) ? result.points : [];
           const reason = result.error || (points.length ? '' : '未得到画面内有效海天线，请手动标注或忽略');
           store.updateRecognitionItem(id, result.snapshotId, {
             detectedPoints: points, points, source: 'model', ignored: !points.length, ignoreReason: reason,
@@ -284,12 +295,21 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     }
     return store.saveRecognitionPanoramaGuide(task.id, revision, guide);
   });
-  app.get('/api/recognition-tasks/:id/items', { schema: { querystring: paging } }, async (request) => {
-    const task = store.getRecognitionTask(request.params.id);
+  app.get('/api/recognition-tasks/:id/items', { schema: { querystring: {
+    ...paging, properties: { ...paging.properties, taskState: { type: 'string', const: 'version' } },
+  } } }, async (request) => {
+    const { id } = request.params;
     const options = pageOptions(request.query);
-    const items = store.recognitionItems(task.id, options);
-    return { task: withRecognitionState(task), items, total: task.sampleCount, offset: options.offset,
-      nextOffset: options.offset + items.length < task.sampleCount ? options.offset + items.length : null };
+    let task, total;
+    if (request.query.taskState === 'version') {
+      ({ sampleCount: total, ...task } = store.getRecognitionTaskVersion(id));
+    } else {
+      task = withRecognitionState(store.getRecognitionTask(id));
+      total = task.sampleCount;
+    }
+    const items = store.recognitionItems(id, options);
+    return { task, items, total, offset: options.offset,
+      nextOffset: options.offset + items.length < total ? options.offset + items.length : null };
   });
   app.post('/api/recognition-tasks/:id/cancel', async (request) => {
     const task = store.getRecognitionTask(request.params.id);
@@ -310,7 +330,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     const previous = store.getRecognitionItem(task.id, request.params.snapshotId);
     const points = request.body.points || previous.points;
     const ignored = request.body.ignored ?? previous.ignored;
-    if (!ignored && !validPoints(points)) throw httpError(400, '请先标注横向跨度至少为图宽 10% 的海天线，再参与计算');
+    if (!ignored && !validHorizonAnnotation(points)) throw httpError(400, '请先标注横向跨度至少为图宽 10% 的海天线，再参与计算');
     return store.transaction(() => {
       const item = store.updateRecognitionItem(task.id, previous.snapshotId, { points, ignored,
         ...(request.body.points ? { source: 'manual' } : {}), ignoreReason: ignored ? '已人工忽略' : '' });
@@ -402,15 +422,20 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   } } }, async (request) => {
     const task = editable(request.params.id, request.body.revision);
     if (task.refinementSelection?.revision !== request.body.selectionRevision) throw httpError(409, '精修来源选择已变化，请刷新后重试');
-    const input = refinementInputs(store, task, task.refinementSelection);
     const { mode, resultId } = request.body;
-    const frozen = mode === 'after' || (input.model === ZERO_POSE_MODEL && !!resultId);
+    const frozen = mode === 'after' || (task.refinementSelection.base?.model === ZERO_POSE_MODEL && !!resultId);
     const candidate = frozen ? task.refinement : null;
     if (frozen) {
       if (!candidate || candidate.resultId !== resultId) throw httpError(409, '精修候选编号已变化，请刷新后重试');
       const changed = refinementStaleReasons(store, task);
       if (changed.length) throw httpError(409, changed.join('；'));
     }
+    const input = candidate?.model === ZERO_POSE_MODEL ? {
+      camera: candidate.generatedCamera, model: ZERO_POSE_MODEL,
+      selected: candidate.sources.flatMap(({ taskId, sourceSnapshotIds }) =>
+        store.recognitionItems(taskId, { snapshotIds: sourceSnapshotIds }).map((item) => ({ ...item, taskId }))),
+      baseSnapshotIds: candidate.sources.find((source) => source.role === 'base').sourceSnapshotIds,
+    } : refinementInputs(store, task, task.refinementSelection);
     const frozenIds = candidate && new Set(candidate.sourceSnapshotIds);
     const selected = frozenIds ? input.selected.filter((item) => frozenIds.has(item.snapshotId)) : input.selected;
     if (frozenIds && selected.length !== frozenIds.size) throw httpError(409, '精修参与原图已变化，请重新生成候选');
@@ -441,6 +466,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       const field = kind === 'zero-pose' ? 'zeroPoseCandidate' : 'refinement';
       const candidate = field === 'zeroPoseCandidate' ? requireZeroPoseCandidate(store, reference, referenceResultId)
         : requireZeroPoseRefinement(store, reference, referenceResultId);
+      if (candidate.applied) throw httpError(409, '该零位候选已经应用，请生成新候选后再复核');
       const result = evaluateZeroPoseValidation(store, task, reference, candidate, kind, criteria);
       store.updateRecognitionTask(reference.id, { [field]: { ...candidate, validation: result.evidence } });
       return result;
@@ -481,7 +507,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       throw httpError(409, '标定来源的参与截图已删除，请重新生成标定结果');
     }
     const items = store.recognitionItems(task.id);
-    const selected = items.filter((item) => !item.ignored && !item.missing && validPoints(item.points));
+    const selected = items.filter((item) => !item.ignored && !item.missing && validHorizonAnnotation(item.points));
     if (selected.some((item) => fittedIds.has(item.snapshotId))) {
       throw httpError(409, '复核图片与拟合图片存在重叠，请使用未参与拟合的独立截图');
     }
@@ -490,8 +516,8 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       selected.map((item) => item.snapshot), selected.map((item) => ({ snapshotId: item.snapshotId, points: item.points })), {
         startTime: new Date(Math.min(...dates)).toISOString(), endTime: new Date(Math.max(...dates) + 1).toISOString(),
       });
-    result.excluded.push(...items.filter((item) => item.ignored || item.missing || !validPoints(item.points)).map((item) => ({ snapshotId: item.snapshotId,
-      reason: item.missing ? '源截图已删除' : item.ignored ? item.ignoreReason : '海天线正式标注无效或横向跨度不足图片宽度的 10%' })));
+    result.excluded.push(...items.filter((item) => item.ignored || item.missing || !validHorizonAnnotation(item.points)).map((item) => ({ snapshotId: item.snapshotId,
+      reason: item.missing ? '源截图已删除' : item.ignored ? item.ignoreReason : invalidHorizonAnnotation })));
     return { ...result, taskId: task.id, revision: task.revision, reference: { kind, taskId: reference.id, resultId,
       revision: reference.revision, createdAt: reference.createdAt,
       ...(kind === 'refinement' ? { selectionRevision: fittedResult.selectionRevision, sources: fittedResult.sources } : {}) } };
@@ -506,9 +532,11 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
     if (!validationId) throw httpError(400, '请提交通过的独立复核证据编号');
     requireZeroPoseValidation(store, task, candidate, validationId);
     const camera = store.getCamera(task.cameraId);
+    const source = calibrationSourceFor(task, candidate, field === 'refinement' ? 'refinement' : 'ordinary');
     const updatedCamera = store.saveCamera({ ...camera, zeroPose: candidate.zeroPose }, camera.id,
-      { calibrationModel: ZERO_POSE_MODEL, activeZeroPose: candidate.zeroPose });
-    const updated = store.updateRecognitionTask(task.id, { [field]: { ...candidate, applied: true, appliedAt: new Date().toISOString() } });
+      { calibrationModel: ZERO_POSE_MODEL, activeZeroPose: candidate.zeroPose, source });
+    const updated = store.updateRecognitionTask(task.id, { [field]: { ...candidate, applied: true,
+      appliedAt: new Date().toISOString(), appliedCameraUpdatedAt: updatedCamera.updatedAt } });
     return { task: withRecognitionState(updated), camera: updatedCamera };
   }
   app.post('/api/recognition-tasks/:id/refinement-apply', applySchema('wgs84-horizon-refinement-v1'), async (request) => store.transaction(() => {
@@ -531,7 +559,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       throw httpError(409, '摄像头配置已变化，请重新生成精修候选后再应用');
     }
     const installation = Object.fromEntries(fittedKeys.map((key) => [key, candidate.installation[key]]));
-    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id, null);
+    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id, { source: calibrationSourceFor(task, candidate, 'refinement') });
     const updated = store.updateRecognitionTask(task.id, { refinement: { ...candidate, applied: true, appliedAt: new Date().toISOString() } });
     return { task: withRecognitionState(updated), camera: updatedCamera };
   }));
@@ -559,7 +587,7 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       throw httpError(409, '参与计算的截图已删除，请重新生成数据');
     }
     const installation = Object.fromEntries(fittedKeys.map((key) => [key, task.result.installation[key]]));
-    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id, null);
+    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id, { source: calibrationSourceFor(task, task.result, 'ordinary') });
     const updated = store.updateRecognitionTask(task.id, { appliedAt: new Date().toISOString(), appliedRevision: task.revision,
       result: { ...task.result, applied: true } });
     return { task: withRecognitionState(updated), camera: updatedCamera };

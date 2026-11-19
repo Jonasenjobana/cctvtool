@@ -28,7 +28,7 @@ type Axis = { key: 'yaw' | 'pitch' | 'roll'; label: string; direction: string; m
         </div>
       }
     </div>
-    <label class="tilt" for="zero-pose-tilt">T 补偿（°）
+    <label class="tilt" for="zero-pose-tilt">零位 T 补偿（°）
       <input id="zero-pose-tilt" type="number" min="-180" max="180" step="any"
         [value]="pose().tiltOffset" [disabled]="disabled()" (input)="edit('tiltOffset', $event)" (blur)="restoreIfInvalid('tiltOffset', $event)">
     </label>

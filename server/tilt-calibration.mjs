@@ -8,6 +8,15 @@ const maximumRmsPixels = 5;
 const installationModel = 'wgs84-horizon-installation-v1';
 export { ZERO_POSE_MODEL };
 
+const validHorizonPoint = (point) => [point?.x, point?.y].every((value) => Number.isFinite(value) && value >= 0 && value <= 1);
+const minimumHorizonSpan = 0.1;
+export const invalidHorizonAnnotation = '海天线正式标注无效或横向跨度不足图片宽度的 10%';
+
+export function validHorizonAnnotation(points) {
+  return Array.isArray(points) && points.length === 2 && points.every(validHorizonPoint)
+    && Math.abs(points[0].x - points[1].x) >= minimumHorizonSpan;
+}
+
 export function calibrationRange(startTime, endTime) {
   const withZone = /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/i;
   if (!withZone.test(startTime) || !withZone.test(endTime)) {
@@ -22,7 +31,7 @@ export function calibrationRange(startTime, endTime) {
 }
 
 export function panCoverage(values) {
-  const angles = [...new Set(values.map((value) => Math.round((((value % 360) + 360) % 360) * 100) / 100))].sort((a, b) => a - b);
+  const angles = [...new Set(values.map((value) => Math.round((((value % 360) + 360) % 360) * 100) % 36000 / 100))].sort((a, b) => a - b);
   if (angles.length < 2) return { distinctPanCount: angles.length, panCoverageDegrees: 0 };
   const gaps = angles.map((angle, index) => (angles[index + 1] ?? angles[0] + 360) - angle);
   return { distinctPanCount: angles.length, panCoverageDegrees: 360 - Math.max(...gaps) };
@@ -68,11 +77,11 @@ function prepareSamples(camera, snapshots, observations, range) {
     else if (![snapshot.width, snapshot.height].every((value) => Number.isInteger(value) && value > 0)) reason = '图片尺寸无效';
     if (reason) { excluded.push({ snapshotId: snapshot.id, reason }); continue; }
     const points = observation.points;
-    if (!Array.isArray(points) || points.length < 2 || points.some((point) => ![point.x, point.y].every(
-      (value) => Number.isFinite(value) && value >= 0 && value <= 1,
-    ))) throw httpError(400, '每张图至少提供两个位于 0～1 范围内的归一化海天线点');
+    if (!Array.isArray(points) || points.length < 2 || !points.every(validHorizonPoint)) {
+      throw httpError(400, '每张图至少提供两个位于 0～1 范围内的归一化海天线点');
+    }
     const spread = Math.max(...points.map((point) => point.x)) - Math.min(...points.map((point) => point.x));
-    if (spread < 0.1) {
+    if (spread < minimumHorizonSpan) {
       excluded.push({ snapshotId: snapshot.id, reason: '海天线标注横向跨度不足图片宽度的 10%' });
       continue;
     }

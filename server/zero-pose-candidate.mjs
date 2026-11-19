@@ -2,6 +2,12 @@ import { isDeepStrictEqual } from 'node:util';
 import { httpError } from './errors.mjs';
 import { ZERO_POSE_MODEL } from './tilt-calibration.mjs';
 
+export function matchesZeroPoseCamera(camera, candidate) {
+  const { generatedCamera, applied, appliedCameraUpdatedAt, zeroPose } = candidate;
+  return isDeepStrictEqual(camera, applied ? { ...generatedCamera, zeroPose, calibrationModel: ZERO_POSE_MODEL,
+    activeZeroPose: zeroPose, updatedAt: appliedCameraUpdatedAt ?? camera.updatedAt } : generatedCamera);
+}
+
 export function zeroPoseCandidateStaleReasons(store, task) {
   const candidate = task.zeroPoseCandidate;
   if (!candidate) return [];
@@ -10,15 +16,14 @@ export function zeroPoseCandidateStaleReasons(store, task) {
   if (candidate.revision !== task.revision || ['queued', 'running'].includes(task.status)) {
     reasons.push('正式标注版本已变化或识别未结束');
   }
-  if (!isDeepStrictEqual(store.getCamera(task.cameraId), candidate.generatedCamera)) {
+  if (!matchesZeroPoseCamera(store.getCamera(task.cameraId), candidate)) {
     reasons.push('相机配置版本已变化');
   }
   if (candidate.sourceSnapshotIds.length) {
-    const items = new Map(store.recognitionItems(task.id).map((item) => [item.snapshotId, item]));
-    if (candidate.sourceSnapshotIds.some((id) => {
-      const item = items.get(id);
-      return !item || item.missing || !store.hasSnapshotImage(item.snapshot);
-    })) reasons.push('拟合参与原图已删除或缺失');
+    const items = store.recognitionItems(task.id, { snapshotIds: candidate.sourceSnapshotIds });
+    if (items.length !== candidate.sourceSnapshotIds.length || items.some((item) => item.missing || !store.hasSnapshotImage(item.snapshot))) {
+      reasons.push('拟合参与原图已删除或缺失');
+    }
   }
   return reasons;
 }

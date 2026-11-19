@@ -569,11 +569,7 @@ export class AppComponent implements OnDestroy {
       }
     }
     this.cameras.update((cameras) => cameras.map((item) => item.id === camera.id ? camera : item));
-    if (this.selectedId() === camera.id) {
-      this.draft.update((draft) => ({ ...draft, pAxisPitch: camera.pAxisPitch, pAxisRoll: camera.pAxisRoll,
-        tiltOffset: camera.tiltOffset, imageRoll: camera.imageRoll }));
-      this.formMessage.set('已应用识别任务生成的安装参数');
-    }
+    if (this.selectedId() === camera.id) this.formMessage.set('已应用识别任务生成的安装参数');
   }
 
   newCamera() {

@@ -1,13 +1,10 @@
 import { isDeepStrictEqual } from 'node:util';
 import { httpError } from './errors.mjs';
-import { ZERO_POSE_MODEL } from './tilt-calibration.mjs';
-import { requireZeroPoseCandidate } from './zero-pose-candidate.mjs';
+import { invalidHorizonAnnotation, validHorizonAnnotation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
+import { matchesZeroPoseCamera, requireZeroPoseCandidate } from './zero-pose-candidate.mjs';
 
 const activeStatuses = ['queued', 'running'];
 const fixedKeys = ['longitude', 'latitude', 'height', 'panOffset', 'serial', 'code'];
-const validPoints = (points) => Array.isArray(points) && points.length === 2
-  && points.every((point) => [point?.x, point?.y].every((value) => Number.isFinite(value) && value >= 0 && value <= 1))
-  && Math.abs(points[0].x - points[1].x) >= 0.1;
 
 export function refinementStaleReasons(store, task) {
   if (!task.refinement) return [];
@@ -16,7 +13,7 @@ export function refinementStaleReasons(store, task) {
   const reasons = result.selectionRevision !== task.refinementSelection?.revision ? ['精修来源选择已变化'] : [];
   const camera = store.getCamera(task.cameraId);
   if (zeroPose) {
-    if (!isDeepStrictEqual(camera, result.generatedCamera)) reasons.push('相机配置版本已变化');
+    if (!matchesZeroPoseCamera(camera, result)) reasons.push('相机配置版本已变化');
   } else if (fixedKeys.some((key) => camera[key] !== result.baseCamera[key])) reasons.push('固定安装条件或设备通道已变化');
   for (const source of result.sources) {
     let current;
@@ -39,10 +36,10 @@ export function refinementStaleReasons(store, task) {
         reasons.push('基础标定结果已变化或失效');
       }
     }
-    const items = new Map(store.recognitionItems(current.id).map((item) => [item.snapshotId, item]));
-    const participants = source.sourceSnapshotIds.map((id) => items.get(id));
-    if (participants.some((item) => !item || item.missing)) reasons.push(`来源任务 ${source.taskId} 的参与截图已删除`);
-    else if (zeroPose && participants.some((item) => !store.hasSnapshotImage(item.snapshot))) {
+    const participants = store.recognitionItems(current.id, { snapshotIds: source.sourceSnapshotIds });
+    if (participants.length !== source.sourceSnapshotIds.length || participants.some((item) => item.missing)) {
+      reasons.push(`来源任务 ${source.taskId} 的参与截图已删除`);
+    } else if (zeroPose && participants.some((item) => !store.hasSnapshotImage(item.snapshot))) {
       reasons.push(`来源任务 ${source.taskId} 的参与原图文件缺失`);
     }
   }
@@ -110,7 +107,7 @@ export function refinementInputs(store, task, selection) {
       let reason;
       if (item.missing) reason = '源截图已删除';
       else if (item.ignored) reason = item.ignoreReason || '已忽略';
-      else if (!validPoints(item.points)) reason = '海天线正式标注无效';
+      else if (!validHorizonAnnotation(item.points)) reason = invalidHorizonAnnotation;
       else if (zeroPose && !store.hasSnapshotImage(item.snapshot)) reason = '源截图文件缺失';
       if (reason) excluded.push({ taskId: current.id, snapshotId: item.snapshotId, reason });
       else selected.push({ ...item, taskId: current.id });

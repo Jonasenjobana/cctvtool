@@ -312,7 +312,33 @@ test('零位精修复核排除全部来源参与图，应用状态写入失败�
   assert.deepEqual(applied.json().camera.activeZeroPose, main.refinement.zeroPose);
   assert.equal(applied.json().task.refinement.applied, true);
   assert.deepEqual(applied.json().task.result, main.result);
+  assert.equal(applied.json().task.refinement.stale, false);
+  for (const mode of ['before', 'after']) {
+    const preview = await f.post(main, 'refinement-measure', { mode, selectionRevision: 1, resultId: main.refinement.resultId });
+    assert.equal(preview.statusCode, 200, preview.body);
+    assert.deepEqual(preview.json().sourceSnapshotIds, main.refinement.sourceSnapshotIds);
+    assert.ok(preview.json().perSnapshot.some((row) => row.taskId === base.id && row.group === 'base'));
+  }
   assert.equal((await apply()).statusCode, 409);
+  await unlink(join(f.dataDir, 'snapshots', 'base-0.jpg'));
+  assert.equal((await f.get(main.id)).refinement.stale, true);
+  assert.equal((await f.post(main, 'refinement-measure', {
+    mode: 'before', selectionRevision: 1, resultId: main.refinement.resultId,
+  })).statusCode, 409);
+
+  const regeneratedBase = (await f.post(base, 'generate', { model: zeroPoseModel })).json();
+  assert.equal((await f.select(main, { ...regeneratedBase, baseModel: zeroPoseModel, resultId: regeneratedBase.zeroPoseCandidate.resultId },
+    [f.extra])).statusCode, 200);
+  const secondRefinement = await f.post(main, 'refine', { selectionRevision: 2 });
+  assert.equal(secondRefinement.statusCode, 200, secondRefinement.body);
+  assert.notEqual(secondRefinement.json().refinement.resultId, main.refinement.resultId);
+  assert.ok(!secondRefinement.json().refinement.applied);
+  const candidate = (await f.post(validation, 'generate', { model: zeroPoseModel })).json().zeroPoseCandidate;
+  assert.equal(candidate.status, 'estimated', candidate.message);
+  const overlap = await f.post(f.extra, 'validate', { referenceKind: 'zero-pose', referenceTaskId: validation.id,
+    referenceResultId: candidate.resultId, criteria: request.criteria });
+  assert.equal(overlap.statusCode, 409);
+  assert.match(overlap.json().message, /旧基准的拟合图片存在重叠/);
 });
 
 test('手动应用精修只保存四项修正和独立应用状态，保留普通结果、其他任务与历史采样并拒绝重复请求', async (t) => {

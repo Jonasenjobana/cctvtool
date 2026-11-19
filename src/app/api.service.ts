@@ -133,7 +133,9 @@ export class ApiService {
     return firstValueFrom(this.http.put<PanoramaGuideState>(`/api/recognition-tasks/${id}/panorama-guide`, { revision, guide }).pipe(timeout(10000)));
   }
   recognitionItems(id: string, offset = 0) {
-    return firstValueFrom(this.http.get<RecognitionItemPage>(`/api/recognition-tasks/${id}/items`, { params: { offset, limit: 100 } }).pipe(timeout(10000)));
+    return firstValueFrom(this.http.get<RecognitionItemPage>(`/api/recognition-tasks/${id}/items`, {
+      params: { offset, limit: 100, taskState: 'version' },
+    }).pipe(timeout(10000)));
   }
   saveAnnotation(id: string, snapshotId: string, revision: number, ignored: boolean, points?: HorizonPoint[]) {
     return firstValueFrom(this.http.put<{ task: RecognitionTask; item: RecognitionItem }>(`/api/recognition-tasks/${id}/items/${snapshotId}`,

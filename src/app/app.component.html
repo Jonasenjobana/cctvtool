@@ -299,8 +299,8 @@
           <summary>高级标定</summary>
           <div class="field-grid">
             <div class="calibration-field">
-              <div class="field-heading"><label for="tilt-offset">T 偏移<span>°</span></label><app-calibration-help topic="tilt-offset" /></div>
-              <input id="tilt-offset" name="tiltOffset" type="number" step="0.01" min="-180" max="180" required title="T 偏移正值上抬" [ngModel]="formValue().tiltOffset" (ngModelChange)="editNumber('tiltOffset', $event)">
+              <div class="field-heading"><label for="tilt-offset">四参数 T 偏移<span>°</span></label><app-calibration-help topic="tilt-offset" /></div>
+              <input id="tilt-offset" name="tiltOffset" type="number" step="0.01" min="-180" max="180" required title="四参数 T 偏移正值上抬" [ngModel]="formValue().tiltOffset" (ngModelChange)="editNumber('tiltOffset', $event)">
             </div>
             <div class="calibration-field">
               <div class="field-heading"><label for="image-roll">画面 Roll 修正<span>°</span></label><app-calibration-help topic="image-roll" /></div>

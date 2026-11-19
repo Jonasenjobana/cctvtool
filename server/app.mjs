@@ -286,7 +286,7 @@ export async function createApp({
       input[key] = input[key].trim();
       if (!input[key]) throw httpError(400, `请填写${fieldLabels[key]}`);
     }
-    return store.saveCamera(input, request.params.id);
+    return store.transaction(() => store.saveCamera(input, request.params.id));
   });
   app.get('/api/cameras/:id/ptz', async (request) => livegbs.readPtz(store.getCamera(request.params.id)));
 

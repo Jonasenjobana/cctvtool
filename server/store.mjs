@@ -11,9 +11,10 @@ const plotLayerColumns = 'id, name, sourceFileName, byteLength, featureCount, ge
 
 const defaultMaxZoom = (name) => name === '天津船闸' ? 32 : 73;
 function cameraRecord({ zeroPose, activeCalibration, ...row }) {
+  const { calibrationModel, activeZeroPose } = activeCalibration ? JSON.parse(activeCalibration) : {};
   return { ...zeroCorrections, maxZoom: defaultMaxZoom(row.name), ...row,
     ...(zeroPose ? { zeroPose: JSON.parse(zeroPose) } : {}),
-    ...(activeCalibration ? JSON.parse(activeCalibration) : {}) };
+    ...(calibrationModel ? { calibrationModel, activeZeroPose } : {}) };
 }
 
 function snapshotRecord(row) {
@@ -65,10 +66,14 @@ export class CameraStore {
         createdAt TEXT NOT NULL, metadata TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS recognition_tasks_time ON recognition_tasks(createdAt DESC);
+      CREATE INDEX IF NOT EXISTS recognition_tasks_page_version ON recognition_tasks(id,
+        json_extract(metadata, '$.revision'), json_extract(metadata, '$.updatedAt'),
+        json_extract(metadata, '$.status'), json_extract(metadata, '$.sampleCount'));
       CREATE TABLE IF NOT EXISTS recognition_items (
         taskId TEXT NOT NULL REFERENCES recognition_tasks(id), snapshotId TEXT NOT NULL,
         position INTEGER NOT NULL, metadata TEXT NOT NULL, PRIMARY KEY(taskId, snapshotId)
       );
+      CREATE INDEX IF NOT EXISTS recognition_items_position ON recognition_items(taskId, position);
       CREATE TABLE IF NOT EXISTS recognition_panorama_guides (
         taskId TEXT PRIMARY KEY REFERENCES recognition_tasks(id), guide TEXT,
         revision INTEGER NOT NULL
@@ -144,8 +149,26 @@ export class CameraStore {
     return cameraRecord(camera);
   }
 
+  getCalibrationSource(id) {
+    const { source } = this.db.prepare("SELECT json_extract(activeCalibration, '$.source') AS source FROM cameras WHERE id = ?").get(id);
+    return source ? JSON.parse(source) : null;
+  }
+
+  camerasWithoutCalibrationSource() {
+    return this.db.prepare("SELECT * FROM cameras WHERE json_type(activeCalibration, '$.source') IS NULL").all().map(cameraRecord);
+  }
+
+  backfillCalibrationSource(id, source) {
+    this.db.prepare(`UPDATE cameras SET activeCalibration = json_set(COALESCE(activeCalibration, '{}'), '$.source', json(?))
+      WHERE id = ? AND json_type(activeCalibration, '$.source') IS NULL`).run(JSON.stringify(source), id);
+  }
+
   saveCamera(input, id, activeCalibration) {
     const previous = id ? this.getCamera(id) : null;
+    if (previous && activeCalibration === undefined && (previous.serial !== input.serial || previous.code !== input.code
+      || (!previous.calibrationModel && calibrationKeys.some((key) => previous[key] !== input[key])))) {
+      activeCalibration = { source: null };
+    }
     const record = { ...input, maxZoom: input.maxZoom ?? previous?.maxZoom ?? defaultMaxZoom(input.name) };
     const values = cameraKeys.map((key) => record[key]);
     const zeroPose = input.zeroPose === undefined ? null : JSON.stringify(input.zeroPose);
@@ -374,6 +397,16 @@ export class CameraStore {
     return JSON.parse(row.metadata);
   }
 
+  getRecognitionTaskVersion(id) {
+    // 页间比对只读索引里的版本字段，避免每页重新载入候选诊断和参与图名单。
+    const row = this.db.prepare(`SELECT id, json_extract(metadata, '$.revision') AS revision,
+      json_extract(metadata, '$.updatedAt') AS updatedAt, json_extract(metadata, '$.status') AS status,
+      json_extract(metadata, '$.sampleCount') AS sampleCount FROM recognition_tasks INDEXED BY recognition_tasks_page_version
+      WHERE id = ?`).get(id);
+    if (!row) throw httpError(404, '识别任务不存在');
+    return row;
+  }
+
   getRecognitionPanoramaGuide(id) {
     this.getRecognitionTask(id);
     const row = this.db.prepare('SELECT guide, revision FROM recognition_panorama_guides WHERE taskId = ?').get(id);
@@ -408,14 +441,18 @@ export class CameraStore {
 
   listAppliedRecognitionTasks(cameraId) {
     return this.db.prepare(`SELECT metadata FROM recognition_tasks WHERE cameraId = ? AND
-      (json_extract(metadata, '$.result.applied') = 1 OR json_extract(metadata, '$.refinement.applied') = 1)
+      (json_extract(metadata, '$.result.applied') = 1 OR json_extract(metadata, '$.refinement.applied') = 1
+        OR json_extract(metadata, '$.zeroPoseCandidate.applied') = 1)
       ORDER BY createdAt DESC, id DESC`).all(cameraId).map(({ metadata }) => JSON.parse(metadata));
   }
 
-  recognitionItems(id, { limit = -1, offset = 0 } = {}) {
+  recognitionItems(id, { limit = -1, offset = 0, snapshotIds } = {}) {
+    const bySnapshotIds = snapshotIds ? 'AND r.snapshotId IN (SELECT value FROM json_each(?))' : '';
+    // 条目位置连续且不可编辑，原图删除也保留条目，可按位置直接定位分页起点。
     return this.db.prepare(`SELECT r.metadata, s.id AS sourceId FROM recognition_items r
-      LEFT JOIN snapshots s ON s.id = r.snapshotId WHERE r.taskId = ? ORDER BY r.position LIMIT ? OFFSET ?`)
-      .all(id, limit, offset).map((row) => ({ ...JSON.parse(row.metadata), missing: !row.sourceId }));
+      LEFT JOIN snapshots s ON s.id = r.snapshotId WHERE r.taskId = ? AND r.position >= ? ${bySnapshotIds} ORDER BY r.position LIMIT ?`)
+      .all(id, offset, ...(snapshotIds ? [JSON.stringify(snapshotIds)] : []), limit)
+      .map((row) => ({ ...JSON.parse(row.metadata), missing: !row.sourceId }));
   }
 
   getRecognitionItem(taskId, snapshotId) {

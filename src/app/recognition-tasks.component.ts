@@ -132,11 +132,12 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       entries.push({ key: `refinement:${task.id}`, kind: 'refinement', task, resultId: refinement.resultId,
         installation: refinement.installation, sourceSnapshotIds: refinement.sourceSnapshotIds });
     }
-    if (candidate?.status === 'estimated' && !candidate.stale && candidate.zeroPose) {
+    if (candidate?.status === 'estimated' && !candidate.stale && !candidate.applied && candidate.zeroPose) {
       entries.push({ key: `zero-pose:${task.id}`, kind: 'zero-pose', task, resultId: candidate.resultId,
         zeroPose: candidate.zeroPose, sourceSnapshotIds: candidate.sourceSnapshotIds });
     }
-    if (refinement?.status === 'estimated' && !refinement.stale && refinement.model === ZERO_POSE_MODEL && refinement.zeroPose) {
+    if (refinement?.status === 'estimated' && !refinement.stale && !refinement.applied
+      && refinement.model === ZERO_POSE_MODEL && refinement.zeroPose) {
       entries.push({ key: `zero-pose-refinement:${task.id}`, kind: 'zero-pose-refinement', task, resultId: refinement.resultId,
         zeroPose: refinement.zeroPose, sourceSnapshotIds: refinement.sourceSnapshotIds });
     }
@@ -196,7 +197,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     (this.comparisonMode() === 'zero-pose' && !this.dirty() && !this.zeroPoseCandidate()?.stale ? this.zeroPoseCandidate() : this.comparison())
       ?.excluded.find((row) => row.snapshotId === this.displayedItem()?.snapshotId)?.reason);
   readonly theoreticalLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选理论海天线' : this.comparisonMode() === 'validation'
-    ? this.zeroPoseComparison() ? `${this.validationModel() === 'baseline' ? '已保存四参数' : '零位候选'}理论海天线`
+    ? this.zeroPoseComparison() ? `${this.validationModel() === 'baseline' ? '生效模型' : '零位候选'}理论海天线`
       : this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
     : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
   readonly measurementLabel = computed(() => {
@@ -407,9 +408,10 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       ]);
       if (itemsResult.status === 'rejected') throw itemsResult.reason;
       const page = itemsResult.value, entries = [...page.items];
+      const running = ['queued', 'running'].includes(page.task.status);
       let offset = page.nextOffset;
       // 识别停止后只补齐条目元数据，单图参照和导航不依赖是否已生成全景。
-      while (!['queued', 'running'].includes(page.task.status) && offset !== null) {
+      while (!running && offset !== null) {
         const next = await this.api.recognitionItems(id, offset);
         if (this.destroyed || revision !== this.revision) return;
         if (next.task.revision !== page.task.revision || next.task.updatedAt !== page.task.updatedAt || next.total !== page.total) {
@@ -418,10 +420,18 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         entries.push(...next.items);
         offset = next.nextOffset;
       }
+      const task = await this.api.recognitionTask(id);
       if (this.destroyed || revision !== this.revision || this.hasDraft()) return;
-      this.setTask(page.task);
-      const sourceIds = [...new Set([this.validationSource()?.task.id, page.task.refinementSelection?.base?.taskId,
-        ...page.task.refinementSelection?.supplemental.map((source) => source.taskId) || []]
+      if (task.revision !== page.task.revision || task.sampleCount !== page.total || (!running && task.updatedAt !== page.task.updatedAt)) {
+        throw new Error('识别任务或标注已变化，请刷新后重新读取');
+      }
+      if (running && !['queued', 'running'].includes(task.status)) {
+        await this.loadTask(id, false);
+        return;
+      }
+      this.setTask(task);
+      const sourceIds = [...new Set([this.validationSource()?.task.id, task.refinementSelection?.base?.taskId,
+        ...task.refinementSelection?.supplemental.map((source) => source.taskId) || []]
         .filter((source): source is string => !!source))];
       const sourceResults = await Promise.allSettled(sourceIds.map((source) => this.api.recognitionTask(source)));
       if (this.destroyed || revision !== this.revision) return;
@@ -442,7 +452,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         this.guide.set(null);
         this.guideError.set(`全景参考线读取失败：${errorMessage(guideResult.reason)}`);
       }
-      const sourceGroup = await this.api.snapshotGroup(page.task.sourceTaskId);
+      const sourceGroup = await this.api.snapshotGroup(task.sourceTaskId);
       if (!this.destroyed && revision === this.revision) { this.sourceGroup.set(sourceGroup); loaded = true; }
     } catch (error) {
       if (!this.destroyed && revision === this.revision) this.problem.set(error instanceof Error && error.name === 'Error' ? error.message : errorMessage(error));
@@ -960,6 +970,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       } else {
         const page = await this.api.recognitionItems(id!, offset);
         if (this.destroyed || revision !== this.revision) return;
+        const task = this.selected()!;
+        if (page.task.revision !== task.revision || page.total !== task.sampleCount
+          || (!this.running() && page.task.updatedAt !== task.updatedAt)) {
+          throw new Error('识别任务或标注已变化，请刷新后重新读取');
+        }
         const ids = new Set(this.items().map((item) => item.snapshotId));
         this.items.update((items) => [...items, ...page.items.filter((item) => !ids.has(item.snapshotId))]);
         this.nextItemOffset.set(page.nextOffset);
@@ -1363,20 +1378,24 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         const page = await this.api.recognitionItems(taskId, offset);
         if (this.destroyed || revision !== this.revision || this.selected()?.refinement?.resultId !== candidate.resultId
           || this.selected()?.refinementSelection?.revision !== candidate.selectionRevision) return;
-        const zeroPose = page.task.zeroPoseCandidate;
-        const baseChanged = source.role === 'base' && (source.model === ZERO_POSE_MODEL
-          ? zeroPose?.resultId !== source.resultId || zeroPose?.stale : page.task.resultId !== source.resultId);
-        if (page.task.revision !== source.revision || ['queued', 'running'].includes(page.task.status) || baseChanged) {
+        if (page.task.revision !== source.revision || ['queued', 'running'].includes(page.task.status)) {
           throw new Error('精修参与图的来源版本已变化，请刷新并重新生成候选');
         }
         const item = page.items.find((entry) => entry.snapshotId === snapshotId);
         if (item) {
           if (item.missing) throw new Error('精修参与图的原图已删除，请刷新并重新生成候选');
+          const currentSource = await this.api.recognitionTask(taskId);
+          if (this.destroyed || revision !== this.revision || this.selected()?.refinement?.resultId !== candidate.resultId
+            || this.selected()?.refinementSelection?.revision !== candidate.selectionRevision) return;
+          const baseResultId = source.model === ZERO_POSE_MODEL ? currentSource.zeroPoseCandidate?.resultId : currentSource.resultId;
+          if (currentSource.updatedAt !== page.task.updatedAt || (source.role === 'base' && baseResultId !== source.resultId)) {
+            throw new Error('精修参与图的来源版本已变化，请刷新并重新生成候选');
+          }
           this.showOverview();
           this.endDrag();
           this.singleImageId.set('');
           this.singleImageError.set('');
-          this.sourceImage.set({ task: page.task, item });
+          this.sourceImage.set({ task: currentSource, item });
           this.comparisonMode.set(mode);
           await this.measureRefinement();
           return;
@@ -1405,13 +1424,15 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   }
   signedResidual(value: number | null, digits = 2) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(digits)}`; }
   zeroPoseValidationStatus(candidate: ZeroPoseApplicationCandidate) {
+    if (candidate.validationStaleReason) return `复核证据已过期。${candidate.validationStaleReason}`;
     if (!candidate.validation) return '待独立复核';
     return {
       passed: '独立复核通过', failed: '独立复核超差', insufficient_data: '独立复核缺少有效原图', insufficient_coverage: '独立复核覆盖不足',
     }[candidate.validation.status];
   }
   canApplyZeroPose(candidate: ZeroPoseApplicationCandidate) {
-    return candidate.status === 'estimated' && candidate.validation?.status === 'passed' && !candidate.applied && !candidate.stale
+    return candidate.status === 'estimated' && candidate.validation?.status === 'passed' && !candidate.validationStaleReason
+      && !candidate.applied && !candidate.stale
       && !this.busy() && !this.loading() && !this.dirty() && !this.running() && !this.generatingPanorama() && !this.guideDrawing();
   }
   async applyZeroPose(refinement: boolean) {

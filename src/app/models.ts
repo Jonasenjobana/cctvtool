@@ -1,6 +1,6 @@
-import type { ZeroPose } from '#zero-pose';
+import type { ActiveCalibration, ZERO_POSE_MODEL, ZeroPose } from '#zero-pose';
 
-export interface Calibration {
+export interface Calibration extends ActiveCalibration {
   longitude: number | null;
   latitude: number | null;
   height: number | null;
@@ -11,7 +11,7 @@ export interface Calibration {
   imageRoll: number;
 }
 
-export interface CameraInput extends Calibration {
+export interface CameraInput extends Omit<Calibration, keyof ActiveCalibration> {
   name: string;
   serial: string;
   code: string;
@@ -19,14 +19,14 @@ export interface CameraInput extends Calibration {
   zeroPose?: ZeroPose;
 }
 
-export interface Camera extends CameraInput {
+export interface Camera extends CameraInput, ActiveCalibration {
   id: string;
   maxZoom: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type CameraDraft = Omit<CameraInput, 'maxZoom' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll'> & {
+export type CameraDraft = Omit<CameraInput, 'maxZoom' | 'pAxisPitch' | 'pAxisRoll' | 'panOffset' | 'tiltOffset' | 'imageRoll'> & ActiveCalibration & {
   maxZoom?: number | null;
   pAxisPitch: number | null;
   pAxisRoll: number | null;
@@ -196,7 +196,8 @@ export interface ZeroPoseValidationCriteria {
 }
 export interface ZeroPoseValidationEvidence {
   version: 1; id: string; generatedAt: string; status: ZeroPoseValidation['status'];
-  source: { kind: 'zero-pose'; model: ZeroPoseCandidate['model']; taskId: string; revision: number; resultId: string; sourceSnapshotIds: string[] };
+  source: { kind: 'zero-pose' | 'zero-pose-refinement'; model: ZeroPoseCandidate['model']; taskId: string; revision: number;
+    resultId: string; sourceSnapshotIds: string[]; selectionRevision?: number; sources?: InstallationRefinement['sources'] };
   validation: { taskId: string; revision: number; sourceSnapshotIds: string[] };
   camera: { id: string; updatedAt: string };
   baseline: { model: string; calibration: Calibration; sources: {
@@ -208,7 +209,7 @@ export interface ZeroPoseValidationEvidence {
 export interface ZeroPoseValidation {
   taskId: string; revision: number; generatedAt: string;
   status: InstallationValidation['status'] | 'insufficient_coverage'; message: string;
-  reference: Pick<ZeroPoseValidationEvidence['source'], 'kind' | 'model' | 'taskId' | 'revision' | 'resultId'> & { createdAt: string };
+  reference: Omit<ZeroPoseValidationEvidence['source'], 'sourceSnapshotIds'> & { createdAt: string };
   evidence: ZeroPoseValidationEvidence;
   coverage: { lowSnapshotCount: number; highSnapshotCount: number; comparableHighSnapshotCount: number;
     highPoseCount: number; distinctPanCount: number; panCoverageDegrees: number; reasons: string[] };
@@ -222,7 +223,7 @@ export interface ZeroPoseValidation {
   }[];
 }
 export interface ZeroPoseCandidate {
-  model: 'wgs84-horizon-zero-pose-v1';
+  model: typeof ZERO_POSE_MODEL;
   resultId: string; revision: number; generatedAt: string; startTime: string; endTime: string;
   status: InstallationEstimate['status']; zeroPose: ZeroPose | null;
   generatedCamera: Camera;
@@ -278,6 +279,7 @@ export type InstallationRefinement = RefinementState & ({
   model: ZeroPoseCandidate['model']; zeroPose: ZeroPose | null;
   before: ZeroPoseRefinementComparison; after: ZeroPoseRefinementComparison;
   baseCamera: Camera & { zeroPose: ZeroPose };
+  validation?: ZeroPoseValidationEvidence;
 });
 export interface RefinementMeasurement {
   taskId: string; revision: number; selectionRevision: number; mode: 'before' | 'after'; resultId: string | null;

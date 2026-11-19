@@ -55,6 +55,21 @@ export function withRefinementState(store, task) {
   return { ...task, refinement: { ...task.refinement, stale: staleReasons.length > 0, staleReasons } };
 }
 
+export function requireZeroPoseRefinement(store, task, resultId) {
+  const candidate = task.refinement;
+  if (candidate?.resultId !== resultId || candidate.model !== ZERO_POSE_MODEL
+    || candidate.status !== 'estimated' || !candidate.zeroPose) {
+    throw httpError(409, '请先生成通过质量检查的最新零位精修候选');
+  }
+  const changed = refinementStaleReasons(store, task);
+  if (changed.length) throw httpError(409, changed.join('；'));
+  const { sources } = refinementInputs(store, task, task.refinementSelection);
+  if (!isDeepStrictEqual(sources, candidate.sources.map(({ sourceSnapshotIds, ...source }) => source))) {
+    throw httpError(409, '精修来源或输入截图已变化，请重新生成精修候选');
+  }
+  return candidate;
+}
+
 export function refinementInputs(store, task, selection) {
   if (!selection?.base) throw httpError(409, '请先选择合格的基础标定结果');
   const { base } = selection;

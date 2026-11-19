@@ -384,8 +384,8 @@
             <section class="validation-section" aria-label="零位姿态候选">
               <div class="section-heading"><h2>零位姿态候选</h2></div>
               <p class="result-message" [class.error]="candidate.status !== 'estimated'">{{ candidate.message }}</p>
-              @if (candidate.stale) { <p class="error">候选已过期。{{ candidate.staleReasons.join('，') }}</p> }
-              <p class="note">{{ candidate.model }} · 标注版本 {{ candidate.revision }} · 相机配置 {{ candidate.generatedCamera.updatedAt | date:'yyyy-MM-dd HH:mm:ss' }}</p>
+              @if (candidate.stale && !candidate.applied) { <p class="error">候选已过期。{{ candidate.staleReasons.join('，') }}</p> }
+              <p class="note">本任务普通拟合 · {{ candidate.model }} · 标注版本 {{ candidate.revision }} · 相机配置 {{ candidate.generatedCamera.updatedAt | date:'yyyy-MM-dd HH:mm:ss' }}</p>
               <table><tbody>
                 @if (candidate.zeroPose; as pose) {
                   <tr><th scope="row">零位 Roll</th><td>{{ pose.roll | number:'1.4-4' }}°</td></tr>
@@ -394,6 +394,11 @@
                 <tr><th scope="row">固定 Yaw</th><td>{{ candidate.fixedCalibration.yaw | number:'1.4-4' }}°</td></tr>
                 <tr><th scope="row">固定 T 补偿</th><td>{{ candidate.fixedCalibration.tiltOffset | number:'1.4-4' }}°</td></tr>
               </tbody></table>
+              <p class="note" role="status">{{ zeroPoseValidationStatus(candidate) }}
+                @if (candidate.validation; as evidence) { · {{ evidence.generatedAt | date:'MM-dd HH:mm:ss' }} · {{ evidence.validation.sourceSnapshotIds.length }} 张原图 }
+              </p>
+              <button type="button" class="primary apply-button" [disabled]="!canApplyZeroPose(candidate)" (click)="applyZeroPose(false)">
+                <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '零位候选已应用' : '应用零位候选到摄像头' }}</button>
               <dl class="result-metrics">
                 <div><dt>参与原图</dt><dd>{{ candidate.sourceSnapshotIds.length }}<small>张</small></dd></div>
                 <div><dt>P 覆盖</dt><dd>{{ candidate.panCoverageDegrees | number:'1.1-1' }}<small>°</small></dd></div>
@@ -462,9 +467,9 @@
               </div>
             }
             @if (refinement(); as candidate) {
-              <p class="result-message" [class.error]="candidate.stale || candidate.status === 'unreliable' || candidate.status === 'insufficient_data'" role="status">
-                {{ candidate.stale ? '精修候选已过期' : candidate.message }}</p>
-              @if (candidate.stale) { <ul class="error">@for (reason of candidate.staleReasons; track $index) { <li>{{ reason }}</li> }</ul> }
+              <p class="result-message" [class.error]="(candidate.stale && !candidate.applied) || candidate.status === 'unreliable' || candidate.status === 'insufficient_data'" role="status">
+                {{ candidate.stale && !candidate.applied ? '精修候选已过期' : candidate.message }}</p>
+              @if (candidate.stale && !candidate.applied) { <ul class="error">@for (reason of candidate.staleReasons; track $index) { <li>{{ reason }}</li> }</ul> }
               <table><thead><tr><th scope="col">参数</th><th scope="col">基准值</th><th scope="col">{{ candidate.status === 'unreliable' ? '求解值' : '候选值' }}</th></tr></thead><tbody>
                 @if (candidate.model === 'wgs84-horizon-zero-pose-v1') {
                   @for (field of refinementZeroPoseFields; track field.key) {
@@ -482,6 +487,12 @@
                 <button type="button" class="primary apply-button" (click)="applyRefinement()"
                   [disabled]="busy() || loading() || dirty() || running() || generatingPanorama() || candidate.status !== 'estimated' || candidate.stale || candidate.applied">
                   <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '精修已应用' : '应用精修到摄像头' }}</button>
+              } @else {
+                <p class="note" role="status">{{ zeroPoseValidationStatus(candidate) }}
+                  @if (candidate.validation; as evidence) { · {{ evidence.generatedAt | date:'MM-dd HH:mm:ss' }} · {{ evidence.validation.sourceSnapshotIds.length }} 张原图 }
+                </p>
+                <button type="button" class="primary apply-button" [disabled]="!canApplyZeroPose(candidate)" (click)="applyZeroPose(true)">
+                  <app-icon [name]="candidate.applied ? 'check' : 'save'" />{{ candidate.applied ? '零位精修已应用' : '应用零位精修到摄像头' }}</button>
               }
               <div class="validation-table" tabindex="0" role="region" aria-label="联合精修分组前后误差">
                 <table><thead><tr><th scope="col">组</th><th scope="col">有效图</th><th scope="col">Z</th><th scope="col">P 覆盖</th>
@@ -559,7 +570,7 @@
                   @for (field of fields; track field.key) { <tr><th scope="row">{{ field.label }}</th><td>{{ reference.installation[field.key] | number:'1.4-4' }}°</td></tr> }
                 </tbody></table>
               }
-              @if (reference.kind === 'refinement') {
+              @if (reference.kind === 'refinement' || reference.kind === 'zero-pose-refinement') {
                 <details><summary>精修来源（{{ reference.task.refinement?.sources.length }} 个任务）</summary><ul>
                   @for (source of reference.task.refinement?.sources; track source.taskId) {
                     <li>{{ source.role === 'base' ? '基础' : '高倍' }} · {{ source.taskId }} · {{ source.sourceSnapshotIds.length }} 张参与图</li>
@@ -571,10 +582,13 @@
               <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadMore('tasks')">加载更多标定任务</button>
             }
             <button type="button" class="primary apply-button" [disabled]="busy() || loading() || running() || generatingPanorama() || measuring() || !validationSource()
-                || (validationSource()?.kind === 'zero-pose' && !validationCriteria())"
+                || (validationNeedsCriteria() && !validationCriteria())"
               (click)="validate()">复核本任务截图</button>
             @if (zeroPoseComparison(); as assessment) {
               <p class="result-message" [class.error]="assessment.status !== 'passed'" role="status">{{ assessment.message }}</p>
+              @if (assessment.status === 'passed') {
+                <button type="button" [disabled]="busy() || loading() || generatingPanorama()" (click)="loadTask(assessment.reference.taskId)">打开已复核候选</button>
+              }
               <p class="note">低倍 {{ assessment.coverage.lowSnapshotCount }} 张 · 高倍 {{ assessment.coverage.highSnapshotCount }} 张
                 · 高倍可比较 {{ assessment.coverage.comparableHighSnapshotCount }} 张／{{ assessment.coverage.highPoseCount }} 组 P/T
                 · P 覆盖 {{ assessment.coverage.panCoverageDegrees | number:'1.2-2' }}°</p>

@@ -10,9 +10,10 @@ const zeroCorrections = { tiltOffset: 0, imageRoll: 0 };
 const plotLayerColumns = 'id, name, sourceFileName, byteLength, featureCount, geometryTypes, createdAt, updatedAt';
 
 const defaultMaxZoom = (name) => name === '天津船闸' ? 32 : 73;
-function cameraRecord({ zeroPose, ...row }) {
+function cameraRecord({ zeroPose, activeCalibration, ...row }) {
   return { ...zeroCorrections, maxZoom: defaultMaxZoom(row.name), ...row,
-    ...(zeroPose ? { zeroPose: JSON.parse(zeroPose) } : {}) };
+    ...(zeroPose ? { zeroPose: JSON.parse(zeroPose) } : {}),
+    ...(activeCalibration ? JSON.parse(activeCalibration) : {}) };
 }
 
 function snapshotRecord(row) {
@@ -21,8 +22,13 @@ function snapshotRecord(row) {
   return { ...snapshot, calibration: { ...zeroCorrections, ...snapshot.calibration } };
 }
 
-export function calibrationOf(camera) {
+export function legacyCalibrationOf(camera) {
   return Object.fromEntries(calibrationKeys.map((key) => [key, camera[key]]));
+}
+
+export function calibrationOf(camera) {
+  const { calibrationModel, activeZeroPose } = camera;
+  return { ...legacyCalibrationOf(camera), ...(calibrationModel ? { calibrationModel, activeZeroPose } : {}) };
 }
 
 export class CameraStore {
@@ -40,7 +46,7 @@ export class CameraStore {
         longitude REAL, latitude REAL, height REAL,
         pAxisPitch REAL NOT NULL, pAxisRoll REAL NOT NULL, panOffset REAL NOT NULL,
         tiltOffset REAL NOT NULL DEFAULT 0, imageRoll REAL NOT NULL DEFAULT 0,
-        zeroPose TEXT,
+        zeroPose TEXT, activeCalibration TEXT,
         createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
         UNIQUE(serial, code)
       );
@@ -80,7 +86,7 @@ export class CameraStore {
     `);
       const columns = new Set(this.db.prepare('PRAGMA table_info(cameras)').all().map((column) => column.name));
       const missing = Object.keys(zeroCorrections).filter((key) => !columns.has(key));
-      if (missing.length || !columns.has('maxZoom') || !columns.has('zeroPose')) {
+      if (missing.length || !columns.has('maxZoom') || !columns.has('zeroPose') || !columns.has('activeCalibration')) {
         this.db.exec('BEGIN IMMEDIATE');
         try {
           for (const key of missing) this.db.exec(`ALTER TABLE cameras ADD COLUMN ${key} REAL NOT NULL DEFAULT 0`);
@@ -89,6 +95,7 @@ export class CameraStore {
             this.db.prepare('UPDATE cameras SET maxZoom = 32 WHERE name = ?').run('天津船闸');
           }
           if (!columns.has('zeroPose')) this.db.exec('ALTER TABLE cameras ADD COLUMN zeroPose TEXT');
+          if (!columns.has('activeCalibration')) this.db.exec('ALTER TABLE cameras ADD COLUMN activeCalibration TEXT');
           this.db.exec('COMMIT');
         } catch (error) {
           this.db.exec('ROLLBACK');
@@ -137,20 +144,22 @@ export class CameraStore {
     return cameraRecord(camera);
   }
 
-  saveCamera(input, id) {
+  saveCamera(input, id, activeCalibration) {
     const previous = id ? this.getCamera(id) : null;
     const record = { ...input, maxZoom: input.maxZoom ?? previous?.maxZoom ?? defaultMaxZoom(input.name) };
     const values = cameraKeys.map((key) => record[key]);
     const zeroPose = input.zeroPose === undefined ? null : JSON.stringify(input.zeroPose);
+    const active = activeCalibration ? JSON.stringify(activeCalibration) : null;
     const now = new Date().toISOString();
     try {
       if (id) {
         this.db.prepare(`UPDATE cameras SET ${cameraKeys.map((key) => `${key} = ?`).join(', ')},
-          zeroPose = COALESCE(?, zeroPose), updatedAt = ? WHERE id = ?`).run(...values, zeroPose, now, id);
+          zeroPose = COALESCE(?, zeroPose), activeCalibration = CASE WHEN ? THEN ? ELSE activeCalibration END,
+          updatedAt = ? WHERE id = ?`).run(...values, zeroPose, Number(activeCalibration !== undefined), active, now, id);
       } else {
         id = randomUUID();
-        this.db.prepare(`INSERT INTO cameras (id, ${cameraKeys.join(', ')}, zeroPose, createdAt, updatedAt)
-          VALUES (${Array(cameraKeys.length + 4).fill('?').join(', ')})`).run(id, ...values, zeroPose, now, now);
+        this.db.prepare(`INSERT INTO cameras (id, ${cameraKeys.join(', ')}, zeroPose, activeCalibration, createdAt, updatedAt)
+          VALUES (${Array(cameraKeys.length + 5).fill('?').join(', ')})`).run(id, ...values, zeroPose, active, now, now);
       }
     } catch (error) {
       if (error.message.includes('UNIQUE constraint failed')) throw httpError(409, '该设备通道已注册');

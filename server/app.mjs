@@ -5,6 +5,7 @@ import { open, rename, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { CameraStore, calibrationKeys, calibrationOf } from './store.mjs';
 import { LiveGbsClient } from './livegbs.mjs';
 import { readImageInfo } from './image.mjs';
@@ -190,7 +191,7 @@ export async function createApp({
       createdAt: new Date().toISOString(), requestedAt: image.requestedAt,
       receivedAt: image.receivedAt, durationMs: image.durationMs, snapshotTime: image.snapshotTime,
       ptz: before, ptzAfter: after, calibration,
-      usesDraft: calibrationKeys.some((key) => calibration[key] !== camera[key]),
+      usesDraft: !isDeepStrictEqual(calibrationOf(calibration), calibrationOf(camera)),
       poseChanged, timeAlignment: 'unverified',
       ...(scan ? { groupId: scan.groupId, scanIndex: scan.index, scanTarget: scan.target } : {}),
     };
@@ -356,7 +357,7 @@ export async function createApp({
       const group = { id: randomUUID(), cameraId: id, cameraName: camera.name, serial: camera.serial, code: camera.code,
         kind: 'scan', createdAt: new Date().toISOString(), finishedAt: null, status: 'running',
         ...plan, settleMs: request.body.settleMs, moveTimeoutMs: request.body.moveTimeoutMs,
-        calibration: request.body.calibration || calibrationOf(camera), completedCount: 0, error: null };
+        calibration: calibrationOf({ ...camera, ...request.body.calibration }), completedCount: 0, error: null };
       store.addSnapshotGroup(group);
       startSnapshotGroup(camera, group);
       return reply.code(202).header('Location', `/api/snapshot-groups/${group.id}`).send(store.getSnapshotGroup(group.id));
@@ -408,7 +409,7 @@ export async function createApp({
   }, async (request, reply) => {
     const record = await withDeviceOperation(request.params.id, async () => {
       const camera = store.getCamera(request.params.id);
-      const calibration = request.body?.calibration || calibrationOf(camera);
+      const calibration = calibrationOf({ ...camera, ...request.body?.calibration });
       return captureSnapshot(camera, calibration);
     });
     return reply.code(201).send(record);

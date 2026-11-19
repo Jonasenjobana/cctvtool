@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server/app.mjs';
 import { LiveGbsClient } from '../server/livegbs.mjs';
 import { readImageInfo } from '../server/image.mjs';
+import { CameraStore } from '../server/store.mjs';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK1sAAAAASUVORK5CYII=', 'base64');
 const input = {
@@ -167,6 +168,30 @@ test('零位草稿可保存和重载，旧保存请求及历史截图保留各�
   assert.deepEqual(current.json().calibration, original.json().calibration);
   assert.equal(current.json().ptz.raw.Pan, original.json().ptz.raw.Pan);
   assert.deepEqual(f.state.ptzCommands, []);
+});
+
+test('显式和默认截图校准冻结生效零位，历史截图保留拍摄时四参数', async (t) => {
+  const f = await fixture(t);
+  const url = `/api/cameras/${f.camera.id}/snapshots`;
+  const capture = async (payload = {}) => {
+    const response = await f.app.inject({ method: 'POST', url, payload });
+    assert.equal(response.statusCode, 201, response.body);
+    return response.json();
+  };
+  const historical = await capture();
+  const activeZeroPose = { roll: -1.2, pitch: 4.6, yaw: 88, tiltOffset: 2.3 };
+  const calibrationModel = 'wgs84-horizon-zero-pose-v1';
+  const store = new CameraStore(f.dataDir);
+  try { store.saveCamera({ ...input, zeroPose: { ...activeZeroPose, yaw: 128 } }, f.camera.id, { calibrationModel, activeZeroPose }); }
+  finally { store.close(); }
+  const explicit = await capture({ calibration: { ...historical.calibration, height: 50 } });
+  assert.deepEqual(explicit.calibration, { ...historical.calibration, height: 50, calibrationModel, activeZeroPose });
+  assert.equal(explicit.usesDraft, true);
+  const current = await capture();
+  assert.deepEqual(current.calibration, { ...historical.calibration, calibrationModel, activeZeroPose });
+  assert.equal(current.usesDraft, false);
+  assert.deepEqual(current.ptz.raw, historical.ptz.raw);
+  assert.deepEqual((await f.app.inject(url)).json().find((snapshot) => snapshot.id === historical.id), historical);
 });
 
 test('并发回读只登录一次，token 被拒绝后合并重新登录且不向前端泄露认证数据', async (t) => {

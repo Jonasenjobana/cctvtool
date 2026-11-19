@@ -1,6 +1,7 @@
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
+import { ZERO_POSE_MODEL } from '#zero-pose';
 import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
 import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage, InstallationValidation,
   RefinementSelection, RefinementMeasurement, ZeroPoseCandidate, ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
@@ -162,12 +163,13 @@ export class ApiService {
     return firstValueFrom(this.http.post<InstallationValidation | ZeroPoseValidation>(`/api/recognition-tasks/${id}/validate`,
       { revision, referenceTaskId, referenceResultId, referenceKind, ...(criteria ? { criteria } : {}) }).pipe(timeout(95000)));
   }
-  applyRefinement(id: string, revision: number, resultId: string) {
+  applyRefinement(id: string, revision: number, resultId: string, validationId?: string) {
     return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/refinement-apply`,
-      { revision, resultId }).pipe(timeout(10000)));
+      { revision, resultId, ...(validationId ? { model: ZERO_POSE_MODEL, validationId } : {}) }).pipe(timeout(validationId ? 95000 : 10000)));
   }
-  applyInstallation(id: string, revision: number, resultId: string) {
-    return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/apply`, { revision, resultId }).pipe(timeout(10000)));
+  applyInstallation(id: string, revision: number, resultId: string, validationId?: string) {
+    return firstValueFrom(this.http.post<{ task: RecognitionTask; camera: Camera }>(`/api/recognition-tasks/${id}/apply`,
+      { revision, resultId, ...(validationId ? { model: ZERO_POSE_MODEL, validationId } : {}) }).pipe(timeout(validationId ? 95000 : 10000)));
   }
   cancelRecognition(id: string) {
     return firstValueFrom(this.http.post<RecognitionTask>(`/api/recognition-tasks/${id}/cancel`, {}).pipe(timeout(10000)));

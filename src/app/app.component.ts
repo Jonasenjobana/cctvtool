@@ -25,7 +25,7 @@ import { predictVesselPosition } from './ais-prediction';
 import type { VesselTarget } from './ais.models';
 import { HoldPtzControl } from './hold-ptz-control';
 import { createPtzPath } from '../../shared/snapshot-path';
-import { resolveZeroPose } from '#zero-pose';
+import { resolveZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
 import type { ZeroPose } from '#zero-pose';
 import { ZeroPoseEditorComponent } from './zero-pose-editor.component';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
@@ -155,7 +155,14 @@ export class AppComponent implements OnDestroy {
       maxZoom: this.selectedCamera()?.maxZoom, ...snapshot.calibration,
     } : this.draft();
   });
-  readonly sceneCamera = computed(() => this.selectedId() ? this.formValue() : null);
+  private readonly liveCalibrationCamera = computed<CameraDraft>(() => {
+    const { calibrationModel, activeZeroPose } = this.selectedCamera() ?? {};
+    return { ...this.draft(), calibrationModel, activeZeroPose };
+  });
+  readonly sceneCamera = computed(() => {
+    if (!this.selectedId()) return null;
+    return this.selectedSnapshot() ? this.formValue() : this.liveCalibrationCamera();
+  });
   readonly zeroPose = computed(() => {
     const camera = this.selectedCamera();
     return camera ? this.draft().zeroPose ?? resolveZeroPose(camera) : null;
@@ -492,7 +499,7 @@ export class AppComponent implements OnDestroy {
   }
 
   private calculatePointTarget(point: TemporaryMapPoint, reading: RawPtz) {
-    const camera = this.draft();
+    const camera = this.liveCalibrationCamera();
     const target = pointTargetPtz(camera, reading, point);
     const framing = point.vessel ? estimateVesselZoom(camera, reading, point, point.vessel, target, this.pointZoomMax()) : null;
     return { target: framing ? { ...target, zoom: framing.zoom } : target, framing };
@@ -551,6 +558,16 @@ export class AppComponent implements OnDestroy {
   }
 
   installationApplied(camera: Camera) {
+    if (camera.id === this.selectedId()) {
+      this.ais.clearTracking();
+      this.zeroPoseView.set(null);
+      if (camera.calibrationModel === ZERO_POSE_MODEL) {
+        if (!this.zeroPoseDirty()) this.editZeroPose(camera.zeroPose);
+      } else {
+        const { pAxisPitch, pAxisRoll, tiltOffset, imageRoll } = camera;
+        this.draft.update((draft) => ({ ...draft, pAxisPitch, pAxisRoll, tiltOffset, imageRoll }));
+      }
+    }
     this.cameras.update((cameras) => cameras.map((item) => item.id === camera.id ? camera : item));
     if (this.selectedId() === camera.id) {
       this.draft.update((draft) => ({ ...draft, pAxisPitch: camera.pAxisPitch, pAxisRoll: camera.pAxisRoll,
@@ -830,7 +847,7 @@ export class AppComponent implements OnDestroy {
     this.reading.set(reading);
     this.stale.set(false);
     this.liveError.set('');
-    const camera = this.draft(), saved = this.selectedCamera();
+    const camera = this.liveCalibrationCamera(), saved = this.selectedCamera();
     if (!this.formValid() || camera.serial !== saved?.serial || camera.code !== saved?.code) throw new Error('请检查安装参数，并先保存设备通道修改后再追踪');
     return camera;
   }

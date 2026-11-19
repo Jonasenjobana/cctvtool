@@ -48,6 +48,20 @@ test('单张截图无需全景即可按已知方位往返投影，跨正北保�
   assert.equal(panoramaPointToImagePoint(frame, { heading: radians(410), elevation: 0 }), null);
 });
 
+test('全景按每张截图冻结的模型回看，并沿新版零位方位展开跨零 P', () => {
+  const legacy = snapshot(0, 350);
+  const zeroPose = { roll: 0, pitch: 0, yaw: 78, tiltOffset: 0 };
+  const newModel = (index: number, pan: number) => {
+    const shot = snapshot(index, pan);
+    return { ...shot, calibration: { ...shot.calibration, calibrationModel: 'wgs84-horizon-zero-pose-v1' as const,
+      activeZeroPose: zeroPose } };
+  };
+  assert.ok(Math.abs(createPanoramaFrame(legacy).heading - radians(350)) < 1e-12);
+  const plan = createPanoramaPlan([newModel(0, 350), newModel(1, 10)]);
+  assert.ok(Math.abs(plan.frames[0].heading - radians(428)) < 1e-12);
+  assert.ok(Math.abs(plan.frames[1].heading - radians(448)) < 1e-12);
+});
+
 test('持久参考点在跨正北全景改变分辨率后重建，恢复同一方向和相对位置', () => {
   const shots = [snapshot(0, 350), snapshot(1, 10)];
   const first = createPanoramaPlan(shots);

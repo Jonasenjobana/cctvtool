@@ -279,8 +279,9 @@
                 {{ zeroPosePreview() ? '退出预览' : '编辑并预览' }}
               </button>
             </div>
+            <div class="zero-pose-source">生效模型 {{ selectedCamera()?.calibrationModel ?? '四参数安装模型' }}</div>
             @if (zeroPosePreview(); as preview) {
-              <div class="zero-pose-source" role="status">{{ sceneReading() ? '按实时 P/T 回读预览' : '零位参考 · P 0° / T 0° / Z 1' }}</div>
+              <div class="zero-pose-source" role="status">{{ sceneReading() ? '按实时 P/T 回读预览草稿' : '草稿零位参考 · P 0° / T 0° / Z 1' }}</div>
               <app-zero-pose-editor [pose]="preview.pose" [disabled]="saving()" (changed)="editZeroPose($event)" />
               <button type="button" class="zero-pose-reset" [disabled]="!zeroPoseDirty()" (click)="editZeroPose(selectedCamera()?.zeroPose)">放弃零位修改</button>
             }

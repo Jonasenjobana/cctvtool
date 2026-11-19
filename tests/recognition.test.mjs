@@ -320,6 +320,62 @@ test('零位独立复核用同批原图测量已保存四参数和冻结候选�
   assert.deepEqual(stricter.json().perSnapshot[0].failures, ['左端垂直偏差', '中点垂直偏差', '右端垂直偏差']);
 });
 
+test('通过独立复核的普通零位候选只应用一次，保存草稿仍独立于生效模型', async (t) => {
+  const f = await zeroPoseValidationFixture(t);
+  const apply = (changes = {}) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.reference.id}/apply`,
+    payload: { revision: f.reference.revision, resultId: f.candidate.resultId, model: zeroPoseModel, ...changes } });
+  assert.equal((await apply({ validationId: 'unverified' })).statusCode, 409);
+  const { evidence } = (await f.validateZeroPose()).json();
+  assert.equal(evidence.status, 'passed');
+  const responses = await Promise.all([apply({ validationId: evidence.id }), apply({ validationId: evidence.id })]);
+  assert.deepEqual(responses.map((response) => response.statusCode).sort(), [200, 409]);
+  const { task, camera } = responses.find((response) => response.statusCode === 200).json();
+  assert.equal(camera.calibrationModel, zeroPoseModel);
+  assert.deepEqual(camera.activeZeroPose, f.candidate.zeroPose);
+  assert.deepEqual(camera.zeroPose, f.candidate.zeroPose);
+  assert.equal(task.zeroPoseCandidate.applied, true);
+  assert.deepEqual(task.zeroPoseCandidate.validation, evidence);
+  assert.deepEqual(task.result, f.reference.result);
+  const draft = { ...camera.zeroPose, yaw: 5 };
+  const saved = await f.app.inject({ method: 'PUT', url: `/api/cameras/${camera.id}`, payload: { ...f.input, zeroPose: draft } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.deepEqual(saved.json().zeroPose, draft);
+  assert.deepEqual(saved.json().activeZeroPose, f.candidate.zeroPose);
+  await f.app.close();
+  f.app = await createApp(f.options);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json()[0], saved.json());
+
+  const legacy = await post(f, f.reference.id, 'generate', f.reference.revision);
+  assert.equal(legacy.json().result.status, 'estimated', legacy.json().result.message);
+  const restored = await post(f, f.reference.id, 'apply', f.reference.revision);
+  assert.equal(restored.statusCode, 200, restored.body);
+  assert.equal(restored.json().camera.calibrationModel, undefined);
+  assert.equal(restored.json().camera.activeZeroPose, undefined);
+  assert.deepEqual(restored.json().camera.zeroPose, draft);
+});
+
+test('普通零位应用拒绝跨模型编号、失败或被替换的复核以及缺失的复核原图', async (t) => {
+  const f = await zeroPoseValidationFixture(t);
+  const legacy = (await post(f, f.reference.id, 'generate', f.reference.revision)).json();
+  const apply = (validationId, changes = {}) => f.app.inject({ method: 'POST', url: `/api/recognition-tasks/${f.reference.id}/apply`,
+    payload: { revision: f.reference.revision, resultId: f.candidate.resultId, model: zeroPoseModel, validationId, ...changes } });
+  const passed = (await f.validateZeroPose()).json().evidence;
+  assert.equal((await apply(passed.id, { resultId: legacy.resultId })).statusCode, 409);
+  assert.equal((await apply(undefined, { model: undefined })).statusCode, 409);
+  const failed = (await f.validateZeroPose({ criteria: { ...validationCriteria, maximumVerticalOffsetPixels: 2 } })).json().evidence;
+  assert.equal(failed.status, 'failed');
+  assert.equal((await apply(passed.id)).statusCode, 409);
+  assert.equal((await apply(failed.id)).statusCode, 409);
+
+  const latest = (await f.validateZeroPose()).json().evidence;
+  await unlink(join(f.dataDir, 'snapshots', 'validation-1.jpg'));
+  const missing = await apply(latest.id);
+  assert.equal(missing.statusCode, 409, missing.body);
+  assert.match(missing.json().message, /独立复核参与原图/);
+  assert.deepEqual((await f.app.inject('/api/cameras')).json()[0], f.camera);
+  assert.equal((await f.app.inject(`/api/recognition-tasks/${f.reference.id}`)).json().zeroPoseCandidate.applied, false);
+});
+
 test('零位独立复核报告逐图超差及相对旧基准的退化', async (t) => {
   const f = await zeroPoseValidationFixture(t, {
     transformItem(item, index, fixture) {

@@ -1,11 +1,24 @@
 import { Math as CesiumMath, Matrix3, Quaternion } from 'cesium';
 import { createLocalRigRotation } from '#camera-rotation';
 
+export const ZERO_POSE_MODEL = 'wgs84-horizon-zero-pose-v1';
+
 export interface ZeroPose {
   roll: number;
   pitch: number;
   yaw: number;
   tiltOffset: number;
+}
+
+export interface ActiveCalibration {
+  calibrationModel?: typeof ZERO_POSE_MODEL;
+  activeZeroPose?: ZeroPose;
+}
+
+export function activeZeroPoseOf(calibration: ActiveCalibration): ZeroPose | undefined {
+  if (calibration.calibrationModel === undefined) return;
+  if (calibration.calibrationModel !== ZERO_POSE_MODEL || !calibration.activeZeroPose) throw new Error('生效零位标定版本或参数无效');
+  return calibration.activeZeroPose;
 }
 
 export function createZeroPoseRotation(pose: ZeroPose): Matrix3 {

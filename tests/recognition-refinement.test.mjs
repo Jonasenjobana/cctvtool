@@ -274,8 +274,50 @@ test('有效精修候选可供新截图固定参数独立复核，复核保持�
   assert.deepEqual((await f.app.inject('/api/cameras')).json(), cameras);
 });
 
+test('零位精修复核排除全部来源参与图，应用状态写入失败回滚并可重试', async (t) => {
+  const f = await fixture(t, { includeValidation: true, zeroPose: actualZeroPose });
+  const base = (await f.post(f.base, 'generate', { model: zeroPoseModel })).json();
+  assert.equal((await f.select(f.main, { ...base, baseModel: zeroPoseModel, resultId: base.zeroPoseCandidate.resultId }, [f.extra])).statusCode, 200);
+  const main = (await f.post(f.main, 'refine', { selectionRevision: 1 })).json();
+  assert.equal(main.refinement.status, 'estimated', main.refinement.message);
+  const validation = await f.task('validation');
+  const request = { referenceKind: 'zero-pose-refinement', referenceTaskId: main.id, referenceResultId: main.refinement.resultId,
+    criteria: { minimumHighZoom: 10, maximumVerticalOffsetPixels: 5, maximumDirectionDifferenceDegrees: 0.5, maximumRmsPixels: 5 } };
+  assert.equal((await f.post(f.extra, 'validate', request)).statusCode, 409);
+  const reviewed = await f.post(validation, 'validate', request);
+  assert.equal(reviewed.statusCode, 200, reviewed.body);
+  const { status, evidence } = reviewed.json();
+  assert.equal(status, 'passed');
+  assert.equal(evidence.source.selectionRevision, main.refinement.selectionRevision);
+  assert.deepEqual(evidence.source.sources, main.refinement.sources);
+  assert.deepEqual((await f.get(main.id)).refinement.validation, evidence);
+  const apply = (changes = {}) => f.post(main, 'refinement-apply', { resultId: main.refinement.resultId, model: zeroPoseModel,
+    validationId: evidence.id, ...changes });
+  assert.equal((await apply({ model: undefined, validationId: undefined })).statusCode, 409);
+  assert.equal((await apply({ resultId: base.zeroPoseCandidate.resultId })).statusCode, 409);
+  const database = new DatabaseSync(join(f.dataDir, 'cctv.sqlite'));
+  try {
+    database.exec(`CREATE TRIGGER reject_zero_pose_refinement_application BEFORE UPDATE OF metadata ON recognition_tasks
+      WHEN json_extract(NEW.metadata, '$.refinement.applied') = 1
+      BEGIN SELECT RAISE(ABORT, '测试零位精修应用状态写入失败'); END`);
+    const failed = await apply();
+    assert.equal(failed.statusCode, 500, failed.body);
+    assert.deepEqual((await f.app.inject('/api/cameras')).json()[0], f.camera);
+    assert.equal((await f.get(main.id)).refinement.applied, false);
+    database.exec('DROP TRIGGER reject_zero_pose_refinement_application');
+  } finally { database.close(); }
+  const applied = await apply();
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.equal(applied.json().camera.calibrationModel, zeroPoseModel);
+  assert.deepEqual(applied.json().camera.activeZeroPose, main.refinement.zeroPose);
+  assert.equal(applied.json().task.refinement.applied, true);
+  assert.deepEqual(applied.json().task.result, main.result);
+  assert.equal((await apply()).statusCode, 409);
+});
+
 test('手动应用精修只保存四项修正和独立应用状态，保留普通结果、其他任务与历史采样并拒绝重复请求', async (t) => {
-  const f = await fixture(t, { includeValidation: true });
+  const f = await fixture(t, { includeValidation: true, savedZeroPose: actualZeroPose,
+    seed(store, camera) { store.saveCamera(camera, camera.id, { calibrationModel: zeroPoseModel, activeZeroPose: actualZeroPose }); } });
   const ordinary = (await f.post(f.main, 'generate')).json();
   assert.equal(ordinary.result.status, 'estimated');
   await f.select(ordinary, f.base, [f.extra]);
@@ -291,7 +333,10 @@ test('手动应用精修只保存四项修正和独立应用状态，保留普�
     f.post(main, 'refinement-apply', { resultId: main.refinement.resultId })]);
   assert.deepEqual(requests.map((response) => response.statusCode).sort(), [200, 409]);
   const applied = requests.find((response) => response.statusCode === 200).json();
-  assert.deepEqual(applied.camera, { ...camera, ...main.refinement.installation, updatedAt: applied.camera.updatedAt });
+  const { calibrationModel, activeZeroPose, ...legacyCamera } = camera;
+  assert.equal(calibrationModel, zeroPoseModel);
+  assert.deepEqual(activeZeroPose, actualZeroPose);
+  assert.deepEqual(applied.camera, { ...legacyCamera, ...main.refinement.installation, updatedAt: applied.camera.updatedAt });
   assert.deepEqual(applied.task, { ...main, updatedAt: applied.task.updatedAt,
     refinement: { ...main.refinement, applied: true, appliedAt: applied.task.refinement.appliedAt } });
   assert.ok(applied.task.refinement.appliedAt);

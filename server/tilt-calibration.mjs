@@ -1,12 +1,12 @@
 import { Cartesian3, Ellipsoid, Matrix3, Matrix4, Transforms } from 'cesium';
 import { createLocalRigRotation } from '#camera-rotation';
-import { createZeroPoseRigRotation, resolveZeroPose } from '#zero-pose';
+import { createZeroPoseRigRotation, resolveZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
 import { httpError } from './errors.mjs';
 
 const rad = Math.PI / 180;
 const maximumRmsPixels = 5;
 const installationModel = 'wgs84-horizon-installation-v1';
-export const ZERO_POSE_MODEL = 'wgs84-horizon-zero-pose-v1';
+export { ZERO_POSE_MODEL };
 
 export function calibrationRange(startTime, endTime) {
   const withZone = /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/i;

@@ -6,11 +6,11 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { httpError } from './errors.mjs';
-import { calibrationKeys, calibrationOf } from './store.mjs';
+import { calibrationOf } from './store.mjs';
 import { estimateInstallation, estimateZeroPose, evaluateInstallation, refineInstallation, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
-import { refinementInputs, refinementStaleReasons, withRefinementState } from './installation-refinement.mjs';
+import { refinementInputs, refinementStaleReasons, requireZeroPoseRefinement, withRefinementState } from './installation-refinement.mjs';
 import { requireZeroPoseCandidate, zeroPoseCandidateStaleReasons } from './zero-pose-candidate.mjs';
-import { evaluateZeroPoseValidation, validPoints, zeroPoseValidationCriteriaSchema } from './zero-pose-validation.mjs';
+import { evaluateZeroPoseValidation, requireZeroPoseValidation, validPoints, zeroPoseValidationCriteriaSchema } from './zero-pose-validation.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const activeStatuses = ['queued', 'running'];
@@ -429,18 +429,20 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
   app.post('/api/recognition-tasks/:id/validate', { schema: { body: {
     ...bodyWithRevision, required: ['revision', 'referenceTaskId', 'referenceResultId'], properties: {
       ...bodyWithRevision.properties, referenceTaskId: { type: 'string', minLength: 1 }, referenceResultId: { type: 'string', minLength: 1 },
-      referenceKind: { type: 'string', enum: ['ordinary', 'refinement', 'zero-pose'] },
+      referenceKind: { type: 'string', enum: ['ordinary', 'refinement', 'zero-pose', 'zero-pose-refinement'] },
       criteria: zeroPoseValidationCriteriaSchema,
     },
   } } }, async (request) => {
     const { revision, referenceTaskId, referenceResultId, criteria } = request.body;
     const kind = request.body.referenceKind || 'ordinary';
-    if (kind === 'zero-pose') return store.transaction(() => {
+    if (kind === 'zero-pose' || kind === 'zero-pose-refinement') return store.transaction(() => {
       const task = editable(request.params.id, revision);
       const reference = store.getRecognitionTask(referenceTaskId);
-      const candidate = requireZeroPoseCandidate(store, reference, referenceResultId);
+      const field = kind === 'zero-pose' ? 'zeroPoseCandidate' : 'refinement';
+      const candidate = field === 'zeroPoseCandidate' ? requireZeroPoseCandidate(store, reference, referenceResultId)
+        : requireZeroPoseRefinement(store, reference, referenceResultId);
       const result = evaluateZeroPoseValidation(store, task, reference, candidate, kind, criteria);
-      store.updateRecognitionTask(reference.id, { zeroPoseCandidate: { ...candidate, validation: result.evidence } });
+      store.updateRecognitionTask(reference.id, { [field]: { ...candidate, validation: result.evidence } });
       return result;
     });
     if (criteria) throw httpError(400, '验收门槛仅用于零位候选的独立复核');
@@ -494,50 +496,74 @@ export function registerRecognitionRoutes(app, { store, dataDir, isBusy, recogni
       revision: reference.revision, createdAt: reference.createdAt,
       ...(kind === 'refinement' ? { selectionRevision: fittedResult.selectionRevision, sources: fittedResult.sources } : {}) } };
   });
-  app.post('/api/recognition-tasks/:id/refinement-apply', { schema: { body: {
-    ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },
-  } } }, async (request) => store.transaction(() => {
+  const applySchema = (legacyModel) => ({ schema: { body: {
+    ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties,
+      resultId: { type: 'string', minLength: 1 }, model: { type: 'string', enum: [legacyModel, ZERO_POSE_MODEL] },
+      validationId: { type: 'string', minLength: 1 },
+    },
+  } } });
+  function applyZeroPose(task, candidate, field, validationId) {
+    if (!validationId) throw httpError(400, '请提交通过的独立复核证据编号');
+    requireZeroPoseValidation(store, task, candidate, validationId);
+    const camera = store.getCamera(task.cameraId);
+    const updatedCamera = store.saveCamera({ ...camera, zeroPose: candidate.zeroPose }, camera.id,
+      { calibrationModel: ZERO_POSE_MODEL, activeZeroPose: candidate.zeroPose });
+    const updated = store.updateRecognitionTask(task.id, { [field]: { ...candidate, applied: true, appliedAt: new Date().toISOString() } });
+    return { task: withRecognitionState(updated), camera: updatedCamera };
+  }
+  app.post('/api/recognition-tasks/:id/refinement-apply', applySchema('wgs84-horizon-refinement-v1'), async (request) => store.transaction(() => {
     // 写锁取得后重读候选、全部来源及完整相机版本，校验和两项写入属于同一次事务。
-    const task = editable(request.params.id, request.body.revision);
+    const { revision, resultId, model, validationId } = request.body;
+    const task = editable(request.params.id, revision);
     const candidate = task.refinement;
-    if (!candidate || candidate.resultId !== request.body.resultId) throw httpError(409, '精修候选编号已变化，请刷新并复核最新结果');
-    if (candidate.status !== 'estimated' || candidate.model !== 'wgs84-horizon-refinement-v1') throw httpError(409, '请先生成通过质量检查的精修候选');
+    if (!candidate || candidate.resultId !== resultId) throw httpError(409, '精修候选编号已变化，请刷新并复核最新结果');
     if (candidate.applied || candidate.appliedAt) throw httpError(409, '本版精修候选已经应用');
+    if (isBusy(task.cameraId)) throw httpError(409, '该摄像头正在控制或截图，请停止后再应用');
+    if (model === ZERO_POSE_MODEL) {
+      return applyZeroPose(task, requireZeroPoseRefinement(store, task, resultId), 'refinement', validationId);
+    }
+    if (validationId) throw httpError(400, '复核证据编号仅用于应用零位候选');
+    if (candidate.status !== 'estimated' || candidate.model !== 'wgs84-horizon-refinement-v1') throw httpError(409, '请先生成通过质量检查的精修候选');
     const changed = refinementStaleReasons(store, task);
     if (changed.length) throw httpError(409, changed.join('；'));
     const camera = store.getCamera(task.cameraId);
-    if (Object.keys(camera).some((key) => camera[key] !== candidate.generatedCamera[key])) {
+    if (!isDeepStrictEqual(camera, candidate.generatedCamera)) {
       throw httpError(409, '摄像头配置已变化，请重新生成精修候选后再应用');
     }
-    if (isBusy(task.cameraId)) throw httpError(409, '该摄像头正在控制或截图，请停止后再应用');
     const installation = Object.fromEntries(fittedKeys.map((key) => [key, candidate.installation[key]]));
-    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id);
+    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id, null);
     const updated = store.updateRecognitionTask(task.id, { refinement: { ...candidate, applied: true, appliedAt: new Date().toISOString() } });
     return { task: withRecognitionState(updated), camera: updatedCamera };
   }));
-  app.post('/api/recognition-tasks/:id/apply', { schema: { body: {
-    ...bodyWithRevision, required: ['revision', 'resultId'], properties: { ...bodyWithRevision.properties, resultId: { type: 'string', minLength: 1 } },
-  } } }, async (request) => {
-    const task = editable(request.params.id, request.body.revision);
+  app.post('/api/recognition-tasks/:id/apply', applySchema('wgs84-horizon-installation-v1'), async (request) => store.transaction(() => {
+    const { revision, resultId, model, validationId } = request.body;
+    const task = editable(request.params.id, revision);
     if (isBusy(task.cameraId)) throw httpError(409, '该摄像头正在控制或截图，请停止后再应用');
-    if (task.result?.status !== 'estimated' || task.resultRevision !== task.revision) throw httpError(409, '请先生成通过质量检查的最新计算结果');
-    if (task.resultId !== request.body.resultId) throw httpError(409, '计算结果已重新生成，请刷新并复核最新结果');
+    if (model === ZERO_POSE_MODEL) {
+      if (task.zeroPoseCandidate?.resultId === resultId && task.zeroPoseCandidate.applied) throw httpError(409, '本版零位候选已经应用');
+      const candidate = requireZeroPoseCandidate(store, task, resultId, revision);
+      return applyZeroPose(task, candidate, 'zeroPoseCandidate', validationId);
+    }
+    if (validationId) throw httpError(400, '复核证据编号仅用于应用零位候选');
+    if (task.result?.status !== 'estimated' || task.result.model !== 'wgs84-horizon-installation-v1' || task.resultRevision !== task.revision) {
+      throw httpError(409, '请先生成通过质量检查的最新计算结果');
+    }
+    if (task.resultId !== resultId) throw httpError(409, '计算结果已重新生成，请刷新并复核最新结果');
     if (task.appliedRevision === task.revision) throw httpError(409, '本版结果已经应用');
     const camera = store.getCamera(task.cameraId);
-    if ([...calibrationKeys, 'serial', 'code'].some((key) => camera[key] !== task.fitCamera[key])) {
+    if (camera.serial !== task.fitCamera.serial || camera.code !== task.fitCamera.code
+      || !isDeepStrictEqual(calibrationOf(camera), calibrationOf(task.fitCamera))) {
       throw httpError(409, '摄像头配置已变化，请重新生成数据后再应用');
     }
     if (store.recognitionItems(task.id).some((item) => task.result.sourceSnapshotIds.includes(item.snapshotId) && item.missing)) {
       throw httpError(409, '参与计算的截图已删除，请重新生成数据');
     }
-    return store.transaction(() => {
-      const installation = Object.fromEntries(fittedKeys.map((key) => [key, task.result.installation[key]]));
-      const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id);
-      const updated = store.updateRecognitionTask(task.id, { appliedAt: new Date().toISOString(), appliedRevision: task.revision,
-        result: { ...task.result, applied: true } });
-      return { task: withRecognitionState(updated), camera: updatedCamera };
-    });
-  });
+    const installation = Object.fromEntries(fittedKeys.map((key) => [key, task.result.installation[key]]));
+    const updatedCamera = store.saveCamera({ ...camera, ...installation }, camera.id, null);
+    const updated = store.updateRecognitionTask(task.id, { appliedAt: new Date().toISOString(), appliedRevision: task.revision,
+      result: { ...task.result, applied: true } });
+    return { task: withRecognitionState(updated), camera: updatedCamera };
+  }));
   return { createTask,
     async close() { closing = true; if (current) { const running = current; running.controller.abort(); await running.task; } } };
 }

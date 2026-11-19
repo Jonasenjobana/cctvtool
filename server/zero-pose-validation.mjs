@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { httpError } from './errors.mjs';
-import { calibrationKeys, calibrationOf } from './store.mjs';
+import { calibrationKeys, legacyCalibrationOf } from './store.mjs';
 import { evaluateInstallation, panCoverage, ZERO_POSE_MODEL } from './tilt-calibration.mjs';
 
 const legacyModel = 'wgs84-horizon-installation-v1';
@@ -119,17 +119,18 @@ export function evaluateZeroPoseValidation(store, task, reference, candidate, ki
     insufficient_coverage: '独立原图的可比较观测覆盖不足',
   }[status];
   const generatedAt = new Date().toISOString();
+  const referenceVersion = { kind, model, taskId: reference.id, revision: reference.revision, resultId: candidate.resultId,
+    ...(kind === 'zero-pose-refinement' ? { selectionRevision: candidate.selectionRevision, sources: candidate.sources } : {}) };
   const evidence = {
     version: 1, id: randomUUID(), status, generatedAt,
-    source: { kind, model, taskId: reference.id, revision: reference.revision, resultId: candidate.resultId,
-      sourceSnapshotIds: candidate.sourceSnapshotIds },
+    source: { ...referenceVersion, sourceSnapshotIds: candidate.sourceSnapshotIds },
     validation: { taskId: task.id, revision: task.revision, sourceSnapshotIds },
     camera: { id: camera.id, updatedAt: camera.updatedAt },
-    baseline: { model: baselineModel, calibration: calibrationOf(camera), sources },
+    baseline: { model: baselineModel, calibration: legacyCalibrationOf(camera), sources },
     criteria,
   };
   return { taskId: task.id, revision: task.revision, generatedAt, status, message, evidence, coverage, perSnapshot,
-    reference: { kind, model, taskId: reference.id, resultId: candidate.resultId, revision: reference.revision, createdAt: reference.createdAt },
+    reference: { ...referenceVersion, createdAt: reference.createdAt },
     sourceSnapshotIds, failedSnapshotIds, excluded: [...excluded, ...geometryExclusions],
     baseline: { model: baselineModel, installation, rmsResidualPixels: baselineRms },
     candidate: { model, zeroPose: candidate.zeroPose, rmsResidualPixels: candidateRms } };

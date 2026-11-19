@@ -35,6 +35,30 @@ test('零位预览在回读缺失时显示零位方向，转动后按补偿与�
   assert.equal(withoutFov.pose, null);
 });
 
+test('生效零位模型使用冻结姿态，设备回零、跨零 P 和多组 T 均可正反算', () => {
+  const activeZeroPose = { roll: 13, pitch: -7, yaw: 117, tiltOffset: 11 };
+  const draft = { ...camera, panOffset: 205, tiltOffset: -25, imageRoll: 40, zeroPose: { ...activeZeroPose, yaw: 0 } };
+  const active = { ...draft, calibrationModel: 'wgs84-horizon-zero-pose-v1' as const, activeZeroPose };
+  for (const [Pan, Tilt] of [[0, 0], [359.9, -31], [0.1, 12], [137, 47]]) {
+    const reading = { ...ptz, Pan, Tilt };
+    const pose = createCameraPose(active, reading);
+    const preview = createZeroPosePreview(active, activeZeroPose, reading).basis;
+    for (const key of ['direction', 'right', 'up', 'panAxis'] as const) {
+      near(Cartesian3.distance(pose[key], preview[key]), 0);
+    }
+    const point = Cartographic.fromCartesian(Cartesian3.add(pose.position,
+      Cartesian3.multiplyByScalar(pose.direction, 80, new Cartesian3()), new Cartesian3()));
+    const aim = pointTargetPtz(active, reading, { longitude: point.longitude * 180 / Math.PI,
+      latitude: point.latitude * 180 / Math.PI, height: point.height });
+    near((aim.pan - Pan + 540) % 360 - 180, 0, 1e-7);
+    near(aim.tilt, Tilt, 1e-7);
+    assert.equal(aim.zoom, reading.Zoom);
+  }
+  const legacy = createCameraPose(draft, ptz);
+  near(Cartesian3.distance(legacy.direction, createCameraPose({ ...draft, zeroPose: undefined }, ptz).direction), 0);
+  assert.ok(Cartesian3.distance(legacy.direction, createCameraPose(active, ptz).direction) > 1);
+});
+
 test('旧转台的零位角可初始化草稿，补偿调整保留机械 P 轴且四元数与姿态等价', () => {
   const legacy = { ...camera, panOffset: -15, pAxisPitch: 12, pAxisRoll: 0, tiltOffset: 7, imageRoll: -11 };
   const initial = resolveZeroPose(legacy);

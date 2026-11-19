@@ -4,8 +4,9 @@ import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
 import { IconComponent } from './icon.component';
-import type { Camera, HorizonPoint, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement, RefinementSelection,
-  SnapshotGroup, ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
+import type { Camera, HorizonPoint, InstallationRefinement, InstallationValidation, RecognitionItem, RecognitionTask, RefinementMeasurement,
+  RefinementSelection, SnapshotGroup, ZeroPoseCandidate, ZeroPoseMeasurement, ZeroPoseValidation, ZeroPoseValidationCriteria } from './models';
+import { ZERO_POSE_MODEL } from '#zero-pose';
 import type { ZeroPose } from '#zero-pose';
 import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePointToPanoramaPoint, movePanoramaEndpoint,
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
@@ -17,7 +18,7 @@ import type { HorizonAdjustment, HorizonView } from './horizon-precision';
 import { renderTaskPanorama, renderTaskPanoramaFrame } from './task-panorama';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
 
-const zeroPoseRefinementModel = 'wgs84-horizon-zero-pose-v1';
+type ZeroPoseApplicationCandidate = ZeroPoseCandidate | Extract<InstallationRefinement, { model: typeof ZERO_POSE_MODEL }>;
 
 type ValidationSource = { key: string; task: RecognitionTask; resultId: string; sourceSnapshotIds: string[] } & (
   { kind: InstallationValidation['reference']['kind']; installation: InstallationValidation['installation'] }
@@ -99,7 +100,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     }
     return undefined;
   });
-  readonly validationSourceLabels = { ordinary: '普通结果', refinement: '精修候选', 'zero-pose': '零位普通候选' };
+  readonly validationSourceLabels = { ordinary: '普通结果', refinement: '精修候选', 'zero-pose': '零位普通候选',
+    'zero-pose-refinement': '零位精修候选' };
   readonly comparisonMode = signal<'validation' | 'before' | 'after' | 'zero-pose'>('validation');
   private readonly zeroPoseMeasurementResult = signal<ZeroPoseMeasurement | null>(null);
   readonly zeroPoseCandidate = computed(() => this.selected()?.zeroPoseCandidate);
@@ -134,9 +136,17 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       entries.push({ key: `zero-pose:${task.id}`, kind: 'zero-pose', task, resultId: candidate.resultId,
         zeroPose: candidate.zeroPose, sourceSnapshotIds: candidate.sourceSnapshotIds });
     }
+    if (refinement?.status === 'estimated' && !refinement.stale && refinement.model === ZERO_POSE_MODEL && refinement.zeroPose) {
+      entries.push({ key: `zero-pose-refinement:${task.id}`, kind: 'zero-pose-refinement', task, resultId: refinement.resultId,
+        zeroPose: refinement.zeroPose, sourceSnapshotIds: refinement.sourceSnapshotIds });
+    }
     return entries;
   }));
   readonly validationSource = computed(() => this.validationSources().find((entry) => entry.key === this.validationReferenceId()));
+  readonly validationNeedsCriteria = computed(() => {
+    const source = this.validationSource();
+    return !!source && 'zeroPose' in source;
+  });
   readonly refinementSourceOptions = computed(() => [
     ...this.tasks().flatMap((task) => {
       const result = task.zeroPoseCandidate;
@@ -189,10 +199,11 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     ? this.zeroPoseComparison() ? `${this.validationModel() === 'baseline' ? '已保存四参数' : '零位候选'}理论海天线`
       : this.validationSource()?.kind === 'refinement' ? '精修独立复核理论海天线' : '普通独立复核理论海天线'
     : this.comparisonMode() === 'after' ? '精修候选理论海天线' : '基础参数理论海天线');
-  readonly measurementLabel = computed(() => this.comparisonMode() === 'zero-pose' ? '零位候选原图预览' : this.comparisonMode() === 'validation'
-    ? this.validationSource()?.kind === 'zero-pose' ? '零位候选独立复核'
-      : this.validationSource()?.kind === 'refinement' ? '精修候选独立复核' : '普通结果独立复核'
-    : this.comparisonMode() === 'after' ? '候选海天线对照' : '基准海天线对照');
+  readonly measurementLabel = computed(() => {
+    const mode = this.comparisonMode(), source = this.validationSource();
+    if (mode === 'validation') return `${source ? this.validationSourceLabels[source.kind] : '普通结果'}独立复核`;
+    return mode === 'zero-pose' ? '零位候选原图预览' : mode === 'after' ? '候选海天线对照' : '基准海天线对照';
+  });
   readonly residualPositions = { left: '左端', center: '中点', right: '右端' };
   readonly panorama = signal<{ url: string; width: number; height: number; count: number; missing: number; plan: PanoramaPlan } | null>(null);
   readonly generatingPanorama = signal(false);
@@ -1140,7 +1151,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (!task) return;
     this.busy.set(true); this.problem.set(''); this.message.set('');
     try {
-      const result = await this.api.generateInstallation(task.id, task.revision, zeroPose ? 'wgs84-horizon-zero-pose-v1' : undefined);
+      const result = await this.api.generateInstallation(task.id, task.revision, zeroPose ? ZERO_POSE_MODEL : undefined);
       if (!this.destroyed) this.setTask(result);
     } catch (error) { this.problem.set(errorMessage(error)); }
     finally { this.busy.set(false); }
@@ -1208,9 +1219,10 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     if (this.comparisonMode() !== 'validation') return this.measureRefinement();
     if (this.destroyed) return;
     const task = this.selected(), reference = this.validationSource();
-    const criteria = reference?.kind === 'zero-pose' ? this.validationCriteria() : undefined;
+    const zeroPose = reference && 'zeroPose' in reference;
+    const criteria = zeroPose ? this.validationCriteria() : undefined;
     // 新版仅在显式提交时保存复核证据，打开另一张图只切换当前对照。
-    if (reference?.kind === 'zero-pose' && (!submitValidation || !criteria)) return;
+    if (zeroPose && (!submitValidation || !criteria)) return;
     const request = ++this.validationRequest;
     this.validationResult.set(null);
     this.measuring.set(false);
@@ -1240,7 +1252,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       || (mode === 'after' && (!task.refinement || task.refinement.stale))) return;
     const revision = this.revision, selectionRevision = task.refinementSelection.revision;
     const candidate = task.refinement;
-    const resultId = candidate && !candidate.stale && (mode === 'after' || candidate.model === zeroPoseRefinementModel)
+    const resultId = candidate && !candidate.stale && (mode === 'after' || candidate.model === ZERO_POSE_MODEL)
       ? candidate.resultId : undefined;
     this.measuring.set(true);
     try {
@@ -1254,7 +1266,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     finally { if (request === this.validationRequest) this.measuring.set(false); }
   }
   private refinementKey(base: RefinementSelection['base'] | undefined) {
-    return base?.model === zeroPoseRefinementModel ? `zero-pose:${base.taskId}` : base?.taskId || '';
+    return base?.model === ZERO_POSE_MODEL ? `zero-pose:${base.taskId}` : base?.taskId || '';
   }
   async selectRefinementBase(key: string) {
     const base = this.refinementSourceOptions().find((source) => source.key === key)?.base;
@@ -1352,7 +1364,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
         if (this.destroyed || revision !== this.revision || this.selected()?.refinement?.resultId !== candidate.resultId
           || this.selected()?.refinementSelection?.revision !== candidate.selectionRevision) return;
         const zeroPose = page.task.zeroPoseCandidate;
-        const baseChanged = source.role === 'base' && (source.model === zeroPoseRefinementModel
+        const baseChanged = source.role === 'base' && (source.model === ZERO_POSE_MODEL
           ? zeroPose?.resultId !== source.resultId || zeroPose?.stale : page.task.resultId !== source.resultId);
         if (page.task.revision !== source.revision || ['queued', 'running'].includes(page.task.status) || baseChanged) {
           throw new Error('精修参与图的来源版本已变化，请刷新并重新生成候选');
@@ -1392,6 +1404,33 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     return min === max ? min.toFixed(1) : `${min.toFixed(1)}～${max.toFixed(1)}`;
   }
   signedResidual(value: number | null, digits = 2) { return value === null ? '不可比较' : `${value > 0 ? '+' : ''}${value.toFixed(digits)}`; }
+  zeroPoseValidationStatus(candidate: ZeroPoseApplicationCandidate) {
+    if (!candidate.validation) return '待独立复核';
+    return {
+      passed: '独立复核通过', failed: '独立复核超差', insufficient_data: '独立复核缺少有效原图', insufficient_coverage: '独立复核覆盖不足',
+    }[candidate.validation.status];
+  }
+  canApplyZeroPose(candidate: ZeroPoseApplicationCandidate) {
+    return candidate.status === 'estimated' && candidate.validation?.status === 'passed' && !candidate.applied && !candidate.stale
+      && !this.busy() && !this.loading() && !this.dirty() && !this.running() && !this.generatingPanorama() && !this.guideDrawing();
+  }
+  async applyZeroPose(refinement: boolean) {
+    const task = this.selected(), candidate = refinement ? task?.refinement : task?.zeroPoseCandidate;
+    if (!task || candidate?.model !== ZERO_POSE_MODEL || !candidate.validation || !this.canApplyZeroPose(candidate)) return;
+    const name = refinement ? '零位精修候选' : '零位普通候选';
+    if (!window.confirm(`将「${candidate.generatedCamera.name}」的生效标定切换为这份${name}？\n${candidate.model}`)) return;
+    this.busy.set(true); this.problem.set(''); this.message.set('');
+    try {
+      const id = candidate.validation.id;
+      const result = await (refinement ? this.api.applyRefinement(task.id, task.revision, candidate.resultId, id)
+        : this.api.applyInstallation(task.id, task.revision, candidate.resultId, id));
+      if (this.destroyed) return;
+      this.setTask(result.task);
+      this.applied.emit(result.camera);
+      this.message.set(`${name}已应用到摄像头`);
+    } catch (error) { this.problem.set(errorMessage(error)); }
+    finally { this.busy.set(false); }
+  }
   async applyRefinement() {
     const task = this.selected(), candidate = task?.refinement;
     if (!task || candidate?.model !== 'wgs84-horizon-refinement-v1' || candidate.status !== 'estimated' || candidate.stale || candidate.applied

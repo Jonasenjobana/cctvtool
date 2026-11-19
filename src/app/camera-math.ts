@@ -3,7 +3,7 @@ import {
 } from 'cesium';
 import type { CameraDraft, PreciseTarget, RawPtz } from './models';
 import { createLocalRigRotation } from '#camera-rotation';
-import { createZeroPoseRigRotation } from '#zero-pose';
+import { activeZeroPoseOf, createZeroPoseRigRotation } from '#zero-pose';
 import type { ZeroPose } from '#zero-pose';
 
 export interface CameraBasis {
@@ -55,6 +55,17 @@ function cameraBasis(position: Cartesian3, rig: { mount: Matrix3; camera: Matrix
 
 const validFov = (value: number | null | undefined): value is number => typeof value === 'number' && value > 0 && value < 180;
 
+function cameraRig(camera: CameraDraft, ptz: Pick<RawPtz, 'Pan' | 'Tilt'>) {
+  const zeroPose = activeZeroPoseOf(camera);
+  if (zeroPose) return { ...createZeroPoseRigRotation(zeroPose, ptz), tiltOffset: zeroPose.tiltOffset };
+  const installation = {
+    panOffset: finite(camera.panOffset, '默认朝向'),
+    pAxisPitch: finite(camera.pAxisPitch, 'P 轴前后倾'), pAxisRoll: finite(camera.pAxisRoll, 'P 轴左右倾'),
+    tiltOffset: finite(camera.tiltOffset, 'T 偏移'), imageRoll: finite(camera.imageRoll, '画面 Roll 修正'),
+  };
+  return { ...createLocalRigRotation(installation, ptz), tiltOffset: installation.tiltOffset };
+}
+
 export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
   const position = cameraPosition(camera);
   const horizontalFov = finite(ptz.HorizontalFieldAngle, '接口水平视场角');
@@ -64,12 +75,7 @@ export function createCameraPose(camera: CameraDraft, ptz: RawPtz): CameraPose {
   }
   const pan = finite(ptz.Pan, '云台 P');
   const tilt = finite(ptz.Tilt, '云台 T');
-  const offset = finite(camera.panOffset, '默认朝向');
-  const pitch = finite(camera.pAxisPitch, 'P 轴前后倾');
-  const roll = finite(camera.pAxisRoll, 'P 轴左右倾');
-  const tiltOffset = finite(camera.tiltOffset, 'T 偏移');
-  const imageRoll = finite(camera.imageRoll, '画面 Roll 修正');
-  const rig = createLocalRigRotation({ pAxisPitch: pitch, pAxisRoll: roll, panOffset: offset, tiltOffset, imageRoll }, { Pan: pan, Tilt: tilt });
+  const rig = cameraRig(camera, { Pan: pan, Tilt: tilt });
   return { ...cameraBasis(position, rig), horizontalFov, verticalFov };
 }
 
@@ -86,20 +92,13 @@ export function pointTargetPtz(
   target: { longitude: number; latitude: number; height?: number },
   { allowBeyondHorizon = false } = {},
 ): PreciseTarget {
-  const longitude = finite(camera.longitude, '经度'), latitude = finite(camera.latitude, '纬度');
-  const height = finite(camera.height, '高度');
-  if (Math.abs(longitude) > 180 || Math.abs(latitude) > 90 || height < 0) throw new Error('安装位置超出有效范围');
+  const position = cameraPosition(camera);
   if (![target.longitude, target.latitude].every(Number.isFinite)
     || Math.abs(target.longitude) > 180 || Math.abs(target.latitude) > 90) throw new Error('临时点经纬度超出有效范围');
   const pan = finite(ptz.Pan, '云台 P'), tilt = finite(ptz.Tilt, '云台 T'), zoom = finite(ptz.Zoom, '当前倍率');
   if (zoom < 1) throw new Error('当前倍率必须大于或等于 1');
   if (tilt < -90 || tilt > 90) throw new Error('当前 T 必须位于 -90～90°');
-  const installation = {
-    pAxisPitch: finite(camera.pAxisPitch, 'P 轴前后倾'), pAxisRoll: finite(camera.pAxisRoll, 'P 轴左右倾'),
-    panOffset: finite(camera.panOffset, '默认朝向'), tiltOffset: finite(camera.tiltOffset, 'T 偏移'),
-    imageRoll: finite(camera.imageRoll, '画面 Roll 修正'),
-  };
-  const position = Cartesian3.fromDegrees(longitude, latitude, height);
+  const { mount, tiltOffset } = cameraRig(camera, { Pan: 0, Tilt: 0 });
   const targetHeight = finite(target.height ?? 0, '目标高度');
   if (targetHeight < 0) throw new Error('目标高度不能小于 0');
   const destination = Cartesian3.fromDegrees(target.longitude, target.latitude, targetHeight);
@@ -110,7 +109,6 @@ export function pointTargetPtz(
   }
   Cartesian3.normalize(direction, direction);
   const enu = Matrix4.getMatrix3(Transforms.eastNorthUpToFixedFrame(position), new Matrix3());
-  const mount = createLocalRigRotation(installation, { Pan: 0, Tilt: 0 }).mount;
   const world = Matrix3.multiply(enu, mount, new Matrix3());
   const local = Matrix3.multiplyByVector(Matrix3.transpose(world, new Matrix3()), direction, new Cartesian3());
   const horizontal = Math.hypot(local.x, local.y);
@@ -120,7 +118,7 @@ export function pointTargetPtz(
   // 画面 Roll 绕光轴旋转，不改变中心指向，也不参与目标 T 的修正。
   const candidates = [{ pan: targetPan, elevation }, { pan: targetPan + 180, elevation: 180 - elevation }]
     .map((candidate) => {
-      const angle = CesiumMath.toRadians(installation.tiltOffset - candidate.elevation);
+      const angle = CesiumMath.toRadians(tiltOffset - candidate.elevation);
       return { pan: ((candidate.pan % 360) + 360) % 360,
         tilt: CesiumMath.toDegrees(Math.atan2(Math.sin(angle), Math.cos(angle))), zoom };
     })

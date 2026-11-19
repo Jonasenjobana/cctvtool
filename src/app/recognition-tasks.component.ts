@@ -1,5 +1,5 @@
 import { DatePipe, DecimalPipe } from '@angular/common';
-import { ChangeDetectionStrategy, Component, ElementRef, EventEmitter, Input, Output, ViewChild, computed, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, ElementRef, EventEmitter, Input, Output, ViewChild, computed, effect, inject, signal, viewChild } from '@angular/core';
 import type { OnDestroy, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService, errorMessage } from './api.service';
@@ -9,6 +9,9 @@ import { addPanoramaGuideNode, createPanoramaFrame, extendHorizonLine, imagePoin
   panoramaGuideHeadingOffset, panoramaPixelToPoint, panoramaPointToImagePoint, panoramaPointToPixel, projectImageLine,
   panoramaGuidePointLimit, projectPanoramaGuide, projectPanoramaLine, removePanoramaGuideNode, samplePanoramaGuide } from './panorama-math';
 import type { PanoramaFrame, PanoramaPlan } from './panorama-math';
+import { fullHorizonView, horizonPixelStep, horizonUpperClip, horizonView, shiftHorizonPixels,
+  zoomHorizonView } from './horizon-precision';
+import type { HorizonAdjustment, HorizonView } from './horizon-precision';
 import { renderTaskPanorama, renderTaskPanoramaFrame } from './task-panorama';
 import type { PanoramaGuide, PanoramaGuidePoint } from '../../shared/panorama-guide';
 
@@ -25,6 +28,7 @@ interface ValidationSource {
 export class RecognitionTasksComponent implements OnInit, OnDestroy {
   @Input() taskId = '';
   @Output() readonly applied = new EventEmitter<Camera>();
+  private readonly annotationCanvas = viewChild<ElementRef<SVGSVGElement>>('annotationCanvas');
   @ViewChild('panoramaViewport') private panoramaViewport?: ElementRef<HTMLDivElement>;
   private readonly api = inject(ApiService);
   readonly tasks = signal<RecognitionTask[]>([]);
@@ -39,6 +43,30 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   readonly displayedPoints = computed(() => this.sourceImage()?.item.points || this.points());
   readonly points = signal<HorizonPoint[]>([]);
   readonly ignored = signal(false);
+  readonly precisionMode = signal(false);
+  readonly precisionActive = computed(() => this.precisionMode() && !this.sourceImage());
+  readonly precisionView = signal<HorizonView>(fullHorizonView);
+  private readonly annotationSize = signal<{ width: number; height: number } | null>(null);
+  readonly precisionStep = computed(() => {
+    const size = this.annotationSize(), snapshot = this.displayedItem()?.snapshot;
+    return size && snapshot ? horizonPixelStep(this.precisionView().zoom, snapshot, size) : null;
+  });
+  readonly precisionTarget = signal<HorizonAdjustment>('line');
+  readonly precisionZooms = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+  readonly precisionTargets = [{ value: 'line', label: '整线' }, { value: 0, label: '端点 1' }, { value: 1, label: '端点 2' }] as const;
+  readonly originalView = computed(() => this.precisionActive() ? this.precisionView() : fullHorizonView);
+  readonly originalViewBox = computed(() => {
+    const { width = 1, height = 1 } = this.displayedItem()?.snapshot ?? {};
+    const { left, top, zoom } = this.originalView();
+    return `${left * width} ${top * height} ${width / zoom} ${height / zoom}`;
+  });
+  readonly originalLineClip = computed(() => {
+    const snapshot = this.displayedItem()?.snapshot;
+    return snapshot ? horizonUpperClip(this.displayedPoints(), snapshot.width, snapshot.height) : '';
+  });
+  readonly originalEditable = computed(() => !this.sourceImage() && !this.running() && !this.busy() && !this.loading()
+    && !this.generatingPanorama() && !this.guideDrawing() && !!this.item() && !this.item()?.missing
+    && this.singleImageId() === this.selectedItemId());
   readonly dirty = signal(false);
   readonly busy = signal(false);
   readonly loading = signal(false);
@@ -231,6 +259,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   private guideRevision = 0;
   private savedGuide: PanoramaGuide | null = null;
   private dragIndex: number | null = null;
+  private precisionDrag: { pointerId: number; start: HorizonPoint; view: HorizonView;
+    endpoint: 0 | 1 | null; adjustment: HorizonAdjustment | null; points: HorizonPoint[] } | null = null;
   private panoramaController?: AbortController;
   private focusedImageController?: AbortController;
   private readonly guideHeadingOffset = signal<number | null>(null);
@@ -238,6 +268,19 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     start: { x: number; y: number }; kind: PanoramaGuide['kind']; headingOffset: number } | null = null;
   private panoramaDrag: { pointerId: number; index: number; stage: HTMLElement; frame: PanoramaFrame;
     points: HorizonPoint[]; startY: number; lastY: number } | null = null;
+
+  constructor() {
+    effect((onCleanup) => {
+      const container = this.annotationCanvas()?.nativeElement.parentElement;
+      this.annotationSize.set(null);
+      if (!container) return;
+      const observer = new ResizeObserver(([{ contentRect: { width, height } }]) => {
+        this.annotationSize.set({ width, height });
+      });
+      observer.observe(container);
+      onCleanup(() => observer.disconnect());
+    });
+  }
 
   ngOnInit() {
     void this.refresh();
@@ -340,6 +383,7 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.closeSourceImage();
     }
     if (previous?.id !== task.id) {
+      this.precisionMode.set(false);
       this.comparisonMode.set(task.refinementSelection?.base ? task.refinement && !task.refinement.stale ? 'after' : 'before' : 'validation');
       this.validationReferenceId.set('');
       this.clearPanorama();
@@ -364,7 +408,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
   selectItem(item?: RecognitionItem) {
     this.endPanoramaDrag();
     this.closeSourceImage();
-    if (item?.snapshotId !== this.selectedItemId()) {
+    const changed = item?.snapshotId !== this.selectedItemId();
+    if (changed) {
       this.activePanoramaEndpoint.set(0);
       this.clearFocusedImage();
       this.singleImageId.set('');
@@ -374,7 +419,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
     this.points.set((item?.points || []).map((point) => ({ ...point })));
     this.ignored.set(item?.ignored ?? true);
     this.dirty.set(false);
-    this.dragIndex = null;
+    this.endDrag();
+    if (changed && this.precisionActive()) this.centerPrecision();
   }
 
   async openItem(item: RecognitionItem) {
@@ -382,7 +428,8 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
       this.selectItem(this.items().find((entry) => entry.snapshotId === item.snapshotId) || item);
       void this.measure();
       if (this.panorama()) this.showFocusedPanorama();
-      this.focusPanorama();
+      if (this.precisionActive()) this.focusAnnotationCanvas();
+      else this.focusPanorama();
     }
   }
   undo() { const item = this.item(); if (item) { this.selectItem(item); void this.measure(); } }
@@ -835,35 +882,139 @@ export class RecognitionTasksComponent implements OnInit, OnDestroy {
 
   editPoint(index: number, axis: 'x' | 'y', value: number | null) {
     if (value === null || !Number.isFinite(value) || value < 0 || value > 1) return;
-    this.points.update((points) => points.map((point, i) => i === index ? { ...point, [axis]: value } : point));
+    this.updateEditedPoints(this.points().map((point, i) => i === index ? { ...point, [axis]: value } : point));
+  }
+  private updateEditedPoints(points: HorizonPoint[]) {
+    const before = this.points();
+    if (points.length === before.length && points.every((point, i) => point.x === before[i].x && point.y === before[i].y)) return;
+    this.points.set(points);
     this.dirty.set(true);
     this.message.set('');
   }
+  annotationCoordinate(value: number, dimension: number) {
+    return this.precisionActive() ? Number((value * dimension).toFixed(6)) : value;
+  }
+  editAnnotationCoordinate(index: number, axis: 'x' | 'y', value: number | null, dimension: number) {
+    this.editPoint(index, axis, value === null || !this.precisionActive() ? value : value / dimension);
+  }
+  togglePrecision() {
+    if (!this.originalEditable()) return;
+    this.endDrag();
+    this.precisionMode.update(value => !value);
+    if (this.precisionActive()) {
+      this.precisionTarget.set('line');
+      this.centerPrecision(16);
+      this.focusAnnotationCanvas();
+    }
+  }
+  private focusAnnotationCanvas() { this.annotationCanvas()?.nativeElement.focus({ preventScroll: true }); }
+  private centerPrecision(zoom = this.precisionView().zoom) {
+    const points = this.points(), target = this.precisionTarget();
+    const center = points.length !== 2 ? { x: 0.5, y: 0.5 } : target === 'line'
+      ? { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 } : points[target];
+    this.precisionView.set(horizonView(zoom, center.x - 0.5 / zoom, center.y - 0.5 / zoom));
+  }
+  selectPrecisionTarget(target: HorizonAdjustment) {
+    this.precisionTarget.set(target);
+    this.centerPrecision();
+    this.focusAnnotationCanvas();
+  }
+  setPrecisionZoom(zoom: number, anchor: HorizonPoint = { x: 0.5, y: 0.5 }) {
+    if (this.precisionZooms.includes(zoom)) this.precisionView.update(view => zoomHorizonView(view, zoom, anchor));
+  }
+  zoomAnnotation(event: WheelEvent) {
+    if (!this.precisionActive() || this.precisionDrag || !event.deltaY) return;
+    const anchor = this.annotationPointer(event);
+    if (!anchor) return;
+    event.preventDefault();
+    const next = this.precisionZooms.indexOf(this.precisionView().zoom) + (event.deltaY < 0 ? 1 : -1);
+    this.setPrecisionZoom(this.precisionZooms[next], anchor);
+  }
+  nudgePrecision(direction: 1 | -1) {
+    const item = this.item(), step = this.precisionStep();
+    if (!this.precisionActive() || !this.originalEditable() || !item || step === null) return;
+    this.updateEditedPoints(shiftHorizonPixels(this.points(), this.precisionTarget(),
+      direction * step, item.snapshot.height));
+    this.focusAnnotationCanvas();
+  }
+  annotationKeydown(event: KeyboardEvent) {
+    if (!this.precisionActive() || !this.originalEditable() || event.defaultPrevented || event.isComposing || event.altKey) return;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+      event.preventDefault();
+      void this.save();
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || this.precisionDrag || this.points().length !== 2) return;
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      this.nudgePrecision(event.key === 'ArrowUp' ? -1 : 1);
+    }
+  }
   setIgnored(value: boolean) { this.ignored.set(value); this.dirty.set(true); this.message.set(''); }
   resetLine() {
-    this.points.set([{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }]);
-    this.dirty.set(true);
+    this.updateEditedPoints([{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }]);
+    if (this.precisionActive()) this.centerPrecision();
+  }
+  private annotationPointer(event: MouseEvent): HorizonPoint | null {
+    const rect = (event.currentTarget as SVGSVGElement).getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0
+      ? { x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height } : null;
   }
   startDrag(event: PointerEvent) {
-    if (this.sourceImage() || this.running() || this.busy() || this.loading() || this.generatingPanorama() || this.panoramaDrag || this.guideDrawing()
-      || this.guideDrag || this.item()?.missing || this.singleImageId() !== this.selectedItemId() || this.points().length !== 2 || event.button !== 0) return;
-    event.preventDefault();
+    if (!this.originalEditable() || this.panoramaDrag || this.guideDrag || this.precisionDrag || event.button !== 0) return;
     const svg = event.currentTarget as SVGSVGElement;
-    const rect = svg.getBoundingClientRect();
-    const x = (event.clientX - rect.left) / rect.width, y = (event.clientY - rect.top) / rect.height;
+    const start = this.annotationPointer(event);
+    if (!start) return;
+    if (this.precisionActive()) {
+      event.preventDefault();
+      this.focusAnnotationCanvas();
+      const hit = event.shiftKey ? null : event.target as Element | null;
+      const mark = hit?.getAttribute('data-annotation-endpoint');
+      const endpoint = mark === '0' ? 0 : mark === '1' ? 1 : null;
+      if (endpoint !== null) this.precisionTarget.set(endpoint);
+      this.precisionDrag = { pointerId: event.pointerId, start, view: this.precisionView(), endpoint,
+        adjustment: hit?.hasAttribute('data-annotation-line') ? this.precisionTarget() : null, points: this.points() };
+      svg.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (this.points().length !== 2) return;
+    event.preventDefault();
+    const { x, y } = start;
     this.dragIndex = this.points().map((point) => Math.hypot(point.x - x, point.y - y)).reduce((best, distance, index, values) => distance < values[best] ? index : best, 0);
     svg.setPointerCapture(event.pointerId);
     this.drag(event);
   }
   drag(event: PointerEvent) {
+    if (this.precisionDrag) {
+      const { pointerId, start, view, endpoint, adjustment, points } = this.precisionDrag;
+      if (event.pointerId !== pointerId || !this.originalEditable()) return;
+      const cursor = this.annotationPointer(event);
+      if (!cursor) return;
+      const x = (cursor.x - start.x) / view.zoom, y = (cursor.y - start.y) / view.zoom;
+      if (endpoint !== null) {
+        const point = points[endpoint];
+        const moved = { x: Math.max(0, Math.min(1, point.x + x)), y: Math.max(0, Math.min(1, point.y + y)) };
+        this.updateEditedPoints(points.map((value, index) => index === endpoint ? moved : value));
+      } else if (adjustment !== null) {
+        const height = this.item()!.snapshot.height;
+        this.updateEditedPoints(shiftHorizonPixels(points, adjustment, y * height, height));
+      } else this.precisionView.set(horizonView(view.zoom, view.left - x, view.top - y));
+      return;
+    }
     if (this.dragIndex === null) return;
-    const rect = (event.currentTarget as SVGSVGElement).getBoundingClientRect();
-    this.editPoint(this.dragIndex, 'x', Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)));
-    this.editPoint(this.dragIndex, 'y', Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)));
+    const cursor = this.annotationPointer(event);
+    if (!cursor || !this.originalEditable()) return;
+    this.editPoint(this.dragIndex, 'x', Math.max(0, Math.min(1, cursor.x)));
+    this.editPoint(this.dragIndex, 'y', Math.max(0, Math.min(1, cursor.y)));
   }
-  endDrag() { this.dragIndex = null; }
+  endDrag(event?: PointerEvent) {
+    if (event && this.precisionDrag && event.pointerId !== this.precisionDrag.pointerId) return;
+    this.dragIndex = null;
+    this.precisionDrag = null;
+  }
 
   async save(annotations = true): Promise<boolean> {
+    this.endDrag();
     this.endPanoramaDrag();
     this.endGuideDrag();
     this.guideDrawing.set(null);

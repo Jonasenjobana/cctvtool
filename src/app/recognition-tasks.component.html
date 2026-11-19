@@ -179,16 +179,44 @@
               <p class="image-info">{{ entry.snapshot.width }} × {{ entry.snapshot.height }}<span>P {{ entry.snapshot.ptz.raw.Pan | number:'1.2-2' }}°</span><span>T {{ entry.snapshot.ptz.raw.Tilt | number:'1.2-2' }}°</span><span>Z {{ entry.snapshot.ptz.raw.Zoom }}</span></p>
               @if (entry.missing) { <p class="error">原图已删除，重新生成数据时会排除此图。</p> }
               @else {
-                <div class="annotation" [style.aspect-ratio]="entry.snapshot.width + ' / ' + entry.snapshot.height">
+                @if (!sourceImage()) {
+                  <div class="precision-toolbar">
+                    <button type="button" [disabled]="!originalEditable()" [attr.aria-pressed]="precisionActive()" (click)="togglePrecision()">高精度调试</button>
+                    @if (precisionActive()) {
+                      <label>局部放大
+                        <select [ngModel]="precisionView().zoom" (ngModelChange)="setPrecisionZoom($event)" aria-label="局部放大倍率">
+                          @for (zoom of precisionZooms; track zoom) { <option [ngValue]="zoom">{{ zoom }}×</option> }
+                        </select>
+                      </label>
+                      <div class="precision-targets" role="group" aria-label="微调对象">
+                        @for (target of precisionTargets; track target.value) {
+                          <button type="button" [attr.aria-pressed]="precisionTarget() === target.value" [disabled]="points().length !== 2"
+                            (click)="selectPrecisionTarget(target.value)">{{ target.label }}</button>
+                        }
+                      </div>
+                      @let step = precisionStep();
+                      <div class="precision-targets" role="group" aria-label="每步移动一个屏幕像素">
+                        <button type="button" aria-label="上移一个屏幕像素" [disabled]="!originalEditable() || points().length !== 2 || step === null" (click)="nudgePrecision(-1)">↑</button>
+                        <button type="button" aria-label="下移一个屏幕像素" [disabled]="!originalEditable() || points().length !== 2 || step === null" (click)="nudgePrecision(1)">↓</button>
+                      </div>
+                      @if (step !== null) { <span>{{ step | number:'1.0-6' }} 原图 px / 步</span> }
+                    }
+                  </div>
+                }
+                <div class="annotation" [class.precision-annotation]="precisionActive()" [style.aspect-ratio]="entry.snapshot.width + ' / ' + entry.snapshot.height">
                   @for (source of [entry]; track source.snapshotId) {
-                    <img [src]="source.snapshot.imageUrl" [class.ready]="singleImageId() === source.snapshotId" alt="当前复核原图"
+                    <img [src]="source.snapshot.imageUrl" [class.ready]="singleImageId() === source.snapshotId && !precisionActive()" alt="当前复核原图"
                       (load)="imageLoaded(source.snapshotId)" (error)="imageFailed(source.snapshotId)">
                   }
                   @if (singleImageId() !== entry.snapshotId) {
                     <div class="annotation-feedback" [class.error]="singleImageError()" [attr.role]="singleImageError() ? 'alert' : 'status'">{{ singleImageError() || '正在读取当前原图…' }}</div>
                   }
-                  <svg [attr.viewBox]="'0 0 ' + entry.snapshot.width + ' ' + entry.snapshot.height" role="img" aria-label="海天线标注与理论线"
-                    (pointerdown)="startDrag($event)" (pointermove)="drag($event)" (pointerup)="endDrag()" (pointercancel)="endDrag()" (lostpointercapture)="endDrag()">
+                  <svg #annotationCanvas [attr.viewBox]="originalViewBox()" tabindex="0" role="img" aria-label="海天线标注与理论线，红线下沿为标注"
+                    (keydown)="annotationKeydown($event)" (wheel)="zoomAnnotation($event)"
+                    (pointerdown)="startDrag($event)" (pointermove)="drag($event)" (pointerup)="endDrag($event)" (pointercancel)="endDrag($event)" (lostpointercapture)="endDrag($event)">
+                    @if (precisionActive() && singleImageId() === entry.snapshotId) {
+                      <image class="precision-source" [attr.href]="entry.snapshot.imageUrl" [attr.width]="entry.snapshot.width" [attr.height]="entry.snapshot.height" />
+                    }
                     @if (!sourceImage() && showNeighbors()) {
                       @for (reference of neighbors(); track reference.side) {
                         <g class="neighbor-reference" [class.previous]="reference.side === 'previous'" [class.next]="reference.side === 'next'" [class.ignored]="reference.ignored" aria-hidden="true">
@@ -202,15 +230,11 @@
                     @if (!sourceImage() && showGuide()) {
                       @for (line of singleGuide().lines; track $index) { <polyline class="guide-line" [attr.points]="line" /> }
                     }
-                    @if (entry.detectedPoints.length === 2) {
-                      <line class="model-line" [attr.x1]="entry.detectedPoints[0].x * entry.snapshot.width" [attr.y1]="entry.detectedPoints[0].y * entry.snapshot.height"
-                        [attr.x2]="entry.detectedPoints[1].x * entry.snapshot.width" [attr.y2]="entry.detectedPoints[1].y * entry.snapshot.height" />
-                    }
                     @if (measurement(); as row) {
                       <g class="horizon-measurement" aria-hidden="true">
                         <defs><marker id="horizon-residual-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 8 4 L 0 8 z" /></marker></defs>
                         @for (line of row.theoreticalHorizon; track $index) { <polyline class="theoretical-line" [attr.points]="imageLinePoints(line, entry)" /> }
-                        @for (residual of row.verticalResiduals; track residual.position) {
+                        @for (residual of precisionActive() ? [] : row.verticalResiduals; track residual.position) {
                           @if (residual.theoreticalY !== null) {
                             <line class="residual-arrow" [attr.x1]="residual.x * row.width" [attr.x2]="residual.x * row.width"
                               [attr.y1]="residual.theoreticalY * row.height" [attr.y2]="residual.observedY * row.height" marker-end="url(#horizon-residual-arrow)" />
@@ -221,16 +245,27 @@
                       </g>
                     }
                     @if (displayedPoints().length === 2) {
-                      <line class="edited-line" [attr.x1]="displayedPoints()[0].x * entry.snapshot.width" [attr.y1]="displayedPoints()[0].y * entry.snapshot.height"
-                        [attr.x2]="displayedPoints()[1].x * entry.snapshot.width" [attr.y2]="displayedPoints()[1].y * entry.snapshot.height" />
+                      @let x1 = displayedPoints()[0].x * entry.snapshot.width;
+                      @let y1 = displayedPoints()[0].y * entry.snapshot.height;
+                      @let x2 = displayedPoints()[1].x * entry.snapshot.width;
+                      @let y2 = displayedPoints()[1].y * entry.snapshot.height;
+                      <defs><clipPath id="original-horizon-upper-clip"><polygon [attr.points]="originalLineClip()" /></clipPath></defs>
+                      <line class="edited-line" clip-path="url(#original-horizon-upper-clip)" [attr.x1]="x1" [attr.y1]="y1" [attr.x2]="x2" [attr.y2]="y2" />
+                      @if (precisionActive()) {
+                        <line class="precision-line-hit" data-annotation-line aria-hidden="true" [attr.x1]="x1" [attr.y1]="y1" [attr.x2]="x2" [attr.y2]="y2" />
+                      }
                       @if (!sourceImage()) {
-                        @for (point of displayedPoints(); track $index) { <circle [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height" [attr.r]="entry.snapshot.width / 100" /> }
+                        @for (point of displayedPoints(); track $index) {
+                          <circle [attr.data-annotation-endpoint]="$index" [class.precision-selected]="precisionActive() && precisionTarget() === $index"
+                            [attr.cx]="point.x * entry.snapshot.width" [attr.cy]="point.y * entry.snapshot.height"
+                            [attr.r]="entry.snapshot.width / (100 * originalView().zoom)" />
+                        }
                       }
                     }
                   </svg>
                 </div>
               }
-              <div class="legend reference-legend"><span><i class="model-swatch" aria-hidden="true"></i>模型原始结果</span><span><i class="edited-swatch" aria-hidden="true"></i>当前标注</span>
+              <div class="legend reference-legend"><span><i class="edited-swatch" aria-hidden="true"></i>当前标注（红线下沿）</span>
                 @if (measurement()) { <span><i class="theoretical-swatch" aria-hidden="true"></i>{{ theoreticalLabel() }}</span> }
                 @if (!sourceImage()) {
                   <label><input type="checkbox" [ngModel]="showNeighbors()" (ngModelChange)="showNeighbors.set($event)">相邻参照</label>
@@ -265,17 +300,20 @@
               }
               @if (measurementExclusion(); as reason) { <p class="image-info" role="status">本图已排除：{{ reason }}</p> }
               @if (!sourceImage()) {
-                <fieldset [disabled]="busy() || loading() || running() || generatingPanorama() || guideDrawing() !== null || entry.missing || singleImageId() !== entry.snapshotId">
+                <fieldset [disabled]="!originalEditable()">
                   <div class="annotation-actions">
                     <label class="ignore-toggle"><input type="checkbox" [ngModel]="ignored()" (ngModelChange)="setIgnored($event)">忽略此图</label>
                     <div class="actions"><button type="button" (click)="resetLine()">重新画线</button><button type="button" [disabled]="!dirty()" (click)="undo()">撤销修改</button>
                       <button type="button" class="primary" [disabled]="!dirty()" (click)="save()"><app-icon name="save" />保存标注</button></div>
                   </div>
+                  @if (precisionActive() && points().length) { <div class="coordinate-unit">原图像素</div> }
                   <div class="coordinates">
                     @for (point of points(); track $index; let i = $index) {
                       <div class="coordinate-point"><span>端点 {{ i + 1 }}</span>
-                        <label>X<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'" [ngModel]="point.x" (ngModelChange)="editPoint(i, 'x', $event)"></label>
-                        <label>Y<input type="number" min="0" max="1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'" [ngModel]="point.y" (ngModelChange)="editPoint(i, 'y', $event)"></label>
+                        <label>X<input type="number" min="0" [max]="precisionActive() ? entry.snapshot.width : 1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' X 坐标'"
+                          [ngModel]="annotationCoordinate(point.x, entry.snapshot.width)" (ngModelChange)="editAnnotationCoordinate(i, 'x', $event, entry.snapshot.width)"></label>
+                        <label>Y<input type="number" min="0" [max]="precisionActive() ? entry.snapshot.height : 1" step="0.001" [attr.aria-label]="'端点 ' + (i + 1) + ' Y 坐标'"
+                          [ngModel]="annotationCoordinate(point.y, entry.snapshot.height)" (ngModelChange)="editAnnotationCoordinate(i, 'y', $event, entry.snapshot.height)"></label>
                       </div>
                     }
                   </div>

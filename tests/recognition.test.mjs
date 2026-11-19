@@ -270,6 +270,21 @@ test('原图基准来源拒绝历史预扫粗结果，未知来源保持未找�
   assert.equal((await f.validate({ referenceTaskId: 'unknown-reference' })).statusCode, 404);
 });
 
+test('正式标注保存和回读保留 0.001 原图像素的变化', async (t) => {
+  const f = await fixture(t);
+  const task = await createAndWait(f);
+  const path = `/api/recognition-tasks/${task.id}/items`;
+  const original = (await f.app.inject(`${path}?limit=1`)).json().items[0];
+  const height = original.snapshot.height;
+  const points = original.points.map((point) => ({ ...point, y: point.y + 0.001 / height }));
+  const saved = await f.app.inject({ method: 'PUT', url: `${path}/${original.snapshotId}`, payload: { revision: task.revision, points } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.deepEqual(saved.json().item.points, points);
+  const reloaded = (await f.app.inject(`${path}?limit=1`)).json().items[0];
+  assert.deepEqual(reloaded.points, points);
+  assert.ok(Math.abs((reloaded.points[0].y - original.points[0].y) * height - 0.001) < 1e-10);
+});
+
 test('全景参考线对已有识别任务缺省为空，未知任务返回 404', async (t) => {
   const f = await fixture(t);
   const task = await createAndWait(f);

@@ -5,13 +5,13 @@ import type { AfterViewInit, OnChanges, OnDestroy, SimpleChanges } from '@angula
 import {
   ArcType, Cartesian2, Cartesian3, Color, ConstantPositionProperty, ConstantProperty, Ellipsoid, EllipsoidalOccluder, Entity, GeometryInstance,
   HeadingPitchRange, LabelStyle, Material, MaterialAppearance, Matrix3, Matrix4, PerspectiveFrustum, PlaneGeometry, PolylineCollection,
-  Primitive, Quaternion, Transforms, Viewer,
+  Primitive, Quaternion, SceneTransforms, Transforms, Viewer,
 } from 'cesium';
 import type { Polyline } from 'cesium';
-import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, observationFov, vesselCorners, videoFovPlane } from './camera-math';
-import type { CameraBasis, CameraPose, VesselDimensions } from './camera-math';
+import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, imageDragZoomBox, observationFov, vesselCorners, videoFovPlane } from './camera-math';
+import type { CameraBasis, CameraPose, ScreenBox, VesselDimensions } from './camera-math';
 import type { ZeroPose } from '#zero-pose';
-import type { CameraDraft, PtzReading } from './models';
+import type { CameraDraft, DragZoomBox, DragZoomDirection, PtzReading } from './models';
 import { createAmapImagery } from './amap-imagery';
 import { startVideoFrameLoop } from './video-frame-loop';
 import { createVideoMaterial } from './video-material';
@@ -55,8 +55,24 @@ export type ZeroPoseView = 'current' | 'external' | 'lens';
   selector: 'app-camera-scene',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  template: '<div #container class="cesium-host"></div>@if (snapshotUrl) { <img hidden [src]="snapshotUrl" alt="" (load)="onSnapshotLoad($event)" (error)="onSnapshotError()"> }@if (problem()) { <div class="scene-problem" role="status">{{ problem() }}</div> }@if (videoProblem()) { <div class="scene-problem video-problem" role="alert">{{ videoProblem() }}</div> }',
-  styles: `:host{display:block;position:absolute;inset:0}.cesium-host{position:absolute;inset:0}.scene-problem{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:360px;background:rgba(255,255,255,.95);color:#4d5563;padding:12px 18px;border:1px solid #e2e6ec;border-radius:4px;font-size:13px;line-height:1.7;text-align:center;pointer-events:none}.video-problem{top:80px;transform:translateX(-50%);color:#b65345}`,
+  template: `<div #container class="cesium-host"></div>@if (snapshotUrl) { <img hidden [src]="snapshotUrl" alt="" (load)="onSnapshotLoad($event)" (error)="onSnapshotError()"> }@if (problem()) { <div class="scene-problem" role="status">{{ problem() }}</div> }@if (videoProblem()) { <div class="scene-problem video-problem" role="alert">{{ videoProblem() }}</div> }
+    @if (dragZoom) {
+      <div class="drag-zoom-surface" [class.busy]="dragZoomBusy"
+        (pointerdown)="startZoomDrag($event)" (pointermove)="moveZoomDrag($event)" (pointerup)="finishZoomDrag($event)"
+        (pointercancel)="cancelZoomDrag($event.pointerId)" (lostpointercapture)="cancelZoomDrag($event.pointerId)"
+        (wheel)="$event.preventDefault()" (contextmenu)="$event.preventDefault()">
+        @if (zoomSelection(); as box) {
+          <div class="drag-zoom-box" [style.left.px]="box.left" [style.top.px]="box.top"
+            [style.width.px]="box.width" [style.height.px]="box.height"></div>
+        }
+      </div>
+    }
+  `,
+  styles: `:host{display:block;position:absolute;inset:0}.cesium-host{position:absolute;inset:0}.scene-problem{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:360px;background:rgba(255,255,255,.95);color:#4d5563;padding:12px 18px;border:1px solid #e2e6ec;border-radius:4px;font-size:13px;line-height:1.7;text-align:center;pointer-events:none}.video-problem{top:80px;transform:translateX(-50%);color:#b65345}
+    .drag-zoom-surface{position:absolute;inset:0;cursor:crosshair;touch-action:none;user-select:none}
+    .drag-zoom-surface.busy{cursor:progress}
+    .drag-zoom-box{position:absolute;box-sizing:border-box;border:1px solid #3687ff;background:rgba(54,135,255,.18);pointer-events:none}
+  `,
 })
 export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy {
   @ViewChild('container', { static: true }) container!: ElementRef<HTMLDivElement>;
@@ -64,6 +80,11 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   @Input() reading: PtzReading | null = null;
   @Input() zeroPosePreview: { pose: ZeroPose; view: ZeroPoseView; showDraft: boolean } | null = null;
   @Input() following = true;
+  @Input() dragZoom: DragZoomDirection | null = null;
+  @Input() dragZoomBusy = false;
+  @Output() readonly zoomBoxSelected = new EventEmitter<DragZoomBox>();
+  readonly zoomSelection = signal<ScreenBox | null>(null);
+  private zoomDrag?: { pointerId: number; start: Cartesian2; bounds: ScreenBox; length: number; width: number };
   @Input() video: HTMLVideoElement | null = null;
   @Input() snapshotUrl: string | null = null;
   @Input() videoOpacity = 1;
@@ -95,7 +116,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   private previousKey = '';
   private wasFollowing = false;
   private videoPlane?: Primitive;
-  private videoMaterial?: Material;
+  private videoMaterial?: ReturnType<typeof createVideoMaterial>;
   private boundMedia?: HTMLVideoElement | HTMLImageElement;
   private snapshotImage?: HTMLImageElement;
   private videoDimensions = '';
@@ -120,6 +141,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         this.viewer.imageryLayers.addImageryProvider(createAmapImagery());
         this.viewer.scene.globe.depthTestAgainstTerrain = false;
         this.viewer.scene.screenSpaceCameraController.minimumZoomDistance = 0.1;
+        this.viewer.scene.screenSpaceCameraController.enableInputs = !this.dragZoom;
         this.stopVisibility = this.viewer.scene.preRender.addEventListener(() => {
           this.occluder.cameraPosition = this.viewer!.camera.positionWC;
           if (this.videoPlane && this.pose) this.videoPlane.show = !this.videoFailed && this.occluder.isPointVisible(this.pose.position);
@@ -136,20 +158,22 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
         });
         this.observer = new ResizeObserver(() => {
           if (!this.viewer || this.viewer.isDestroyed()) return;
+          this.cancelZoomDrag();
           this.viewer.resize();
           this.focusIfFollowing();
           this.viewer.scene.requestRender();
         });
         this.observer.observe(this.container.nativeElement);
         this.syncTemporaryPoints();
+        this.aisScene = new AisScene(this.viewer, mmsi => this.zone.run(() => this.vesselSelected.emit(mmsi)),
+          () => !this.snapshotUrl && !!this.videoPlane?.show && this.videoOpacity > 0 && this.videoMaterial?.uniforms.hasAisPixels === true);
+        this.aisScene.sync(this.vessels, this.vesselSource, this.trackedMmsi, this.vesselBodies, this.useVesselBodyGeometry, this.predictedMmsi);
         this.update();
         this.plotScene = new PlotLayerScene(this.viewer,
           (error) => this.zone.run(() => this.plotLayerError.emit(error)),
           (result) => this.zone.run(() => this.plotFocusResult.emit(result)));
         this.plotScene.sync(this.plotLayers);
         this.plotScene.focus(this.plotFocus);
-        this.aisScene = new AisScene(this.viewer, mmsi => this.zone.run(() => this.vesselSelected.emit(mmsi)));
-        this.aisScene.sync(this.vessels, this.vesselSource, this.trackedMmsi, this.vesselBodies, this.useVesselBodyGeometry, this.predictedMmsi);
       } catch (error) {
         this.sceneFailed = true;
         this.problem.set('三维场景初始化失败，请检查显卡与 WebGL 支持');
@@ -160,12 +184,17 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   ngOnChanges(changes: SimpleChanges) {
+    if (changes['dragZoom'] || changes['dragZoomBusy'] || changes['video']) this.cancelZoomDrag();
+    if (changes['dragZoom'] && this.viewer && !this.viewer.isDestroyed()) {
+      this.viewer.scene.screenSpaceCameraController.enableInputs = !this.dragZoom;
+    }
     if (changes['snapshotUrl']) {
       this.snapshotImage = undefined;
       this.releaseVideo();
     }
-    this.update();
     this.aisScene?.sync(this.vessels, this.vesselSource, this.trackedMmsi, this.vesselBodies, this.useVesselBodyGeometry, this.predictedMmsi);
+    this.update();
+    if (changes['dragZoom'] && this.dragZoom) this.focus();
     if (changes['temporaryPoints']) this.syncTemporaryPoints();
     if (changes['plotLayers']) this.plotScene?.sync(this.plotLayers);
     if (changes['plotFocus']) {
@@ -240,7 +269,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   private focusIfFollowing() {
-    if (this.zeroPosePreview?.view === 'lens' || (this.usesCurrentView() && this.following && this.pose)) this.focus();
+    if (this.zeroPosePreview?.view === 'lens' || (this.usesCurrentView() && (this.following || this.dragZoom) && this.pose)) this.focus();
   }
 
   private update() {
@@ -256,6 +285,7 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
       this.updateVideo();
       return;
     }
+    this.cancelZoomDrag();
     const exterior = preview?.view === 'external';
     const centerExterior = exterior && (this.previewView !== 'external' || !this.previewBasis);
     const openingEditor = preview?.view === 'current' && this.previewView === undefined;
@@ -396,12 +426,18 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     Matrix4.clone(plane.matrix, this.videoPlane.modelMatrix);
     this.videoMaterial.uniforms.uvScale = plane.uvScale;
     this.videoMaterial.uniforms.opacity = this.videoOpacity;
+    if (video) {
+      const projection = this.videoOpacity > 0 ? this.aisScene?.projectVideoPixels(this.pose, plane.matrix, width, height) : undefined;
+      this.videoMaterial.setAisPixels(projection?.pixels ?? [], width, height, projection?.radius ?? 0);
+    }
     viewer.scene.requestRender();
   }
 
   private onVideoFailure(error: unknown) {
+    this.cancelZoomDrag();
     this.videoFailed = true;
     if (this.videoPlane) this.videoPlane.show = false;
+    this.viewer?.scene.requestRender();
     this.stopVideoFrames?.();
     this.stopVideoFrames = undefined;
     const media = this.snapshotUrl ? '历史快照' : '视频';
@@ -411,6 +447,8 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
   }
 
   private releaseVideo() {
+    this.cancelZoomDrag();
+    this.aisScene?.clearVideoProjection();
     this.stopVideoFrames?.();
     this.stopVideoFrames = undefined;
     if (this.videoPlane) this.viewer!.scene.primitives.remove(this.videoPlane);
@@ -422,6 +460,62 @@ export class CameraSceneComponent implements AfterViewInit, OnChanges, OnDestroy
     this.videoFailed = false;
     this.videoProblem.set('');
     this.viewer?.scene.requestRender();
+  }
+
+  canBoxZoom() {
+    return !!this.pose && !!this.videoPlane && this.boundMedia === this.video && !this.videoFailed && (this.video?.readyState ?? 0) >= 2;
+  }
+
+  startZoomDrag(event: PointerEvent) {
+    if (event.button !== 0 || !event.isPrimary || this.zoomDrag || this.dragZoomBusy || !this.canBoxZoom()) return;
+    const surface = event.currentTarget as HTMLElement;
+    const scene = this.viewer!.scene;
+    const [upperLeft, , lowerRight] = frustumCorners(this.pose!, videoPlaneDistance);
+    const first = SceneTransforms.worldToWindowCoordinates(scene, upperLeft);
+    const last = SceneTransforms.worldToWindowCoordinates(scene, lowerRight);
+    if (!first || !last || first.x >= last.x || first.y >= last.y) return;
+    const origin = surface.getBoundingClientRect();
+    const canvas = scene.canvas.getBoundingClientRect();
+    const bounds = {
+      left: canvas.left - origin.left + first.x, top: canvas.top - origin.top + first.y,
+      width: last.x - first.x, height: last.y - first.y,
+    };
+    const start = new Cartesian2(event.clientX - origin.left, event.clientY - origin.top);
+    if (start.x < bounds.left || start.x > bounds.left + bounds.width
+      || start.y < bounds.top || start.y > bounds.top + bounds.height) return;
+    event.preventDefault();
+    surface.setPointerCapture(event.pointerId);
+    this.zoomDrag = { pointerId: event.pointerId, start, bounds, length: this.video!.videoWidth, width: this.video!.videoHeight };
+  }
+
+  moveZoomDrag(event: PointerEvent) {
+    const drag = this.zoomDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const origin = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const { start, bounds } = drag;
+    const x = Math.min(bounds.left + bounds.width, Math.max(bounds.left, event.clientX - origin.left));
+    const y = Math.min(bounds.top + bounds.height, Math.max(bounds.top, event.clientY - origin.top));
+    this.zoomSelection.set({ left: Math.min(start.x, x), top: Math.min(start.y, y),
+      width: Math.abs(x - start.x), height: Math.abs(y - start.y) });
+  }
+
+  finishZoomDrag(event: PointerEvent) {
+    const drag = this.zoomDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    this.moveZoomDrag(event);
+    const selection = this.zoomSelection();
+    this.cancelZoomDrag();
+    if (!selection || selection.width < 4 || selection.height < 4 || !this.canBoxZoom()
+      || this.video!.videoWidth !== drag.length || this.video!.videoHeight !== drag.width) return;
+    const { bounds, length, width } = drag;
+    const box = imageDragZoomBox(selection, bounds, length, width);
+    if (box) this.zoomBoxSelected.emit(box);
+  }
+
+  cancelZoomDrag(pointerId?: number) {
+    if (pointerId !== undefined && this.zoomDrag?.pointerId !== pointerId) return;
+    this.zoomDrag = undefined;
+    this.zoomSelection.set(null);
   }
 
   focus() {

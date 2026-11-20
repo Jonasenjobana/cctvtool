@@ -27,6 +27,8 @@ test('Cesium 画面材质保留视频及历史截图的原始引用，不克隆�
     assert.equal(first.uniforms.opacity, 0.8);
     assert.equal(next.uniforms.uvScale.x, 2);
     assert.match(first.shaderSource, /sampler2D/);
+    assert.match(first.shaderSource, /texture\(aisPixels_\d+, uv\)\.a/);
+    assert.equal(snapshot.uniforms.hasAisPixels, false);
     first.destroy();
     next.destroy();
     snapshot.destroy();

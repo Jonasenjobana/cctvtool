@@ -21,7 +21,7 @@ const input = {
 async function fixture(t) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cctv-tool-test-'));
   const state = {
-    loginCount: 0, validToken: '', controls: [], ptzCommands: [], ptzCount: 0, snapshotCount: 0,
+    loginCount: 0, validToken: '', controls: [], dragZooms: [], ptzCommands: [], ptzCount: 0, snapshotCount: 0,
     ptz: { DeviceID: input.code, Pan: 232.2, Tilt: 2.8, Zoom: 15, HorizontalFieldAngle: 4.32, VerticalFieldAngle: 2.43, MaxViewDistance: 0 },
     ptzStatus: 200, failLogin: false, invalidPtz: false,
     changeDuringSnapshot: false, snapshotWait: null, onSnapshot: null, badImage: false,
@@ -66,6 +66,16 @@ async function fixture(t) {
       state.controls.push(target);
       state.ptz = { ...state.ptz, Pan: target.pan, Tilt: target.tilt, Zoom: target.zoom };
       return json(200, { success: true });
+    }
+    if (['/api/v1/control/dragzoomin', '/api/v1/control/dragzoomout'].includes(url.pathname)) {
+      assert.equal(request.method, 'POST');
+      const box = Object.fromEntries(['length', 'width', 'midpointx', 'midpointy', 'lengthx', 'lengthy']
+        .map((key) => [key, Number(url.searchParams.get(key))]));
+      state.dragZooms.push({ path: url.pathname, box });
+      state.onMotion?.();
+      if (state.motionWait) await state.motionWait;
+      response.writeHead(state.failMotion ? 500 : 200);
+      return response.end();
     }
     if (url.pathname === '/api/v1/device/channelsnap') {
       state.snapshotCount++;
@@ -322,6 +332,43 @@ test('精确定位仅由独立请求提交完整 P/T/Z，安装修正不进入�
     assert.equal((await f.app.inject({ method: 'POST', url, payload })).statusCode, 400);
   }
   assert.equal(f.state.controls.length, 4);
+});
+
+test('框选缩放发送当前通道及画面像素，拒绝越界并将停止排在在途请求之后', async (t) => {
+  const { app, camera, state } = await fixture(t);
+  const base = `/api/cameras/${camera.id}`;
+  const box = { length: 1921, width: 1080, midpointx: 960, midpointy: 330, lengthx: 1921, lengthy: 501 };
+  const zoom = (direction, pixels = box) => app.inject({
+    method: 'POST', url: `${base}/drag-zoom`, payload: { direction, ...pixels },
+  });
+  assert.equal((await zoom('in', { ...box, midpointx: 961 })).statusCode, 400);
+  assert.equal((await zoom('out', { ...box, lengthy: 0 })).statusCode, 400);
+  assert.equal((await zoom('other')).statusCode, 400);
+  assert.equal(state.dragZooms.length, 0);
+  assert.equal((await zoom('in')).statusCode, 200);
+  assert.deepEqual(state.dragZooms[0], { path: '/api/v1/control/dragzoomin', box });
+  const arrived = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  state.onMotion = arrived.resolve;
+  state.motionWait = release.promise;
+  const zooming = zoom('out');
+  await arrived.promise;
+  let stopping;
+  try {
+    assert.equal((await zoom('in')).statusCode, 409);
+    stopping = app.inject({ method: 'POST', url: `${base}/control`, payload: { command: 'stop' } }).then();
+    await new Promise((accept) => setImmediate(accept));
+    assert.deepEqual(state.ptzCommands, []);
+  } finally {
+    release.resolve();
+  }
+  assert.equal((await zooming).statusCode, 200);
+  assert.equal((await stopping).statusCode, 200);
+  assert.deepEqual(state.dragZooms[1], { path: '/api/v1/control/dragzoomout', box });
+  assert.deepEqual(state.ptzCommands, [{ command: 'stop', speed: 129 }]);
+  state.failMotion = true;
+  assert.equal((await zoom('out')).statusCode, 502);
+  assert.equal(state.ptzCount, 0);
 });
 
 test('最大倍率按摄像头保存并在重启后恢复，精确定位拒绝超过已保存上限的 Z', async (t) => {

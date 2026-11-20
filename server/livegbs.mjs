@@ -136,6 +136,11 @@ export class LiveGbsClient {
     });
   }
 
+  dragZoom(camera, direction, box) {
+    const path = direction === 'in' ? '/api/v1/control/dragzoomin' : '/api/v1/control/dragzoomout';
+    return this.#sendControl(path, camera, box);
+  }
+
   async #sendControl(path, camera, parameters) {
     const response = await this.#request(path, camera, parameters, 'POST');
     let text;

@@ -28,6 +28,7 @@
 | `DELETE /api/plot-layers/:id` | 删除图层原文、元数据和全部摄像头关联，成功返回 HTTP 204 |
 | `GET /api/cameras/:id/ptz` | 返回 `{ raw, requestedAt, receivedAt, durationMs }`；`raw` 为上游 PTZ 业务值 |
 | `POST /api/cameras/:id/control` | 接收 `{ command, speed? }`，转发连续控制或停止，返回 `{ command, speed, sentAt }` |
+| `POST /api/cameras/:id/drag-zoom` | 接收方向与原始视频像素选区，转发设备框选缩放，返回 `{ direction, sentAt }` |
 | `POST /api/cameras/:id/precise` | 接收完整 `{ pan, tilt, zoom }`，供高级表单和临时点手动追踪下发原始精确定位，返回 `{ target, sentAt }` |
 | `GET /api/cameras/:id/snapshots` | 返回该通道截图记录，按创建时间倒序排列 |
 | `POST /api/cameras/:id/snapshots` | 接收 `{ calibration? }`，完成前后回读、抓图、图片和元数据保存，返回 HTTP 201 及截图记录 |
@@ -96,6 +97,8 @@
 新部署可通过 `npm run db:init` 使用相同存储模块建库，导入 `scripts/initial-cameras.json` 中的已注册摄像头和完整安装参数。脚本沿用 `.env` 的 `DATA_DIR`，保留初始数据中的 ID 和时间；同一事务中跳过已有 `serial + code` 通道，其他摄像头写入错误会回滚，不覆盖现有配置。使用方式及数据范围见 [数据库初始化](../README.md#数据库初始化)。
 
 `command` 可选 `left/right/up/down/upleft/upright/downleft/downright/zoomin/zoomout/stop`，`speed` 为 0～255 整数，省略时使用 129。连续控制直接调用上游 `/api/v1/control/ptz`，不预先回读，不计算角度目标。前端方向和变倍按钮按下发送启动、松手发送 stop，界面保持 PTZ 轮询。
+
+框选缩放使用 `POST /api/cameras/:id/drag-zoom`，请求体为 `{ direction, length, width, midpointx, midpointy, lengthx, lengthy }`。方向 `in`、`out` 分别转发至 LiveGBS `/api/v1/control/dragzoomin` 和 `/api/v1/control/dragzoomout`，按已保存的摄像头配置附加 `serial` 和 `code`，经 POST 查询参数传递。六个像素字段为整数，`length`、`width` 是视频的横纵像素数，`lengthx`、`lengthy` 是矩形的宽高，`midpointx`、`midpointy` 是从画面左上角起算并向下取整的中心。矩形必须完整位于画面内。该请求沿用设备操作互斥，停止指令等待在途框选请求结束再发送。HTTP 200 表示上游已接受，设备动作以回读为准。
 
 精确定位使用独立 `/api/cameras/:id/precise`，要求完整提交 `pan/tilt/zoom`，P 为 0～360°，T 为 -90～90°、负值上抬且正值下俯，Z 为 1 至该摄像头已保存的 `maxZoom`。高级表单展开和编辑不发指令，点击提交才调用上游 `/api/v1/control/ptzprecise`。临时点手动追踪由前端根据当前安装位置、姿态及零高程目标反算原始 P/T，点击后先重新回读 PTZ；普通点保留该次 Zoom，带船体尺寸的点根据同次 Z/HFOV/VFOV 估算横纵占比不超过 50% 的倍率，并受该摄像头已保存的最大 Z 约束，再调用此接口。船体尺寸、船高及朝向只保留在前端，不加入请求或数据库；估算假设及边界见 [README](../README.md#cesium-视场与最佳观察)。P/T 仅从 T 合法范围内选择更接近当前读数的解，停止、切页、保存修改或删除目标使回读后尚未下发的追踪失效。后端原样转发原始目标，不再次叠加安装修正，原始回读也不修改。HTTP 校验和 LiveGBS 下发边界均拒绝越界 T 与 Z，扫描下发也遵守当前设备最大 Z；负 T 不包装成 360°附近的数值。接口返回仅表示请求已发送，设备位置及停稳状态以回读和现场为准。
 
@@ -436,6 +439,7 @@ HTTP 请求按次处理，无会话 ID，支持多个客户端以及 2025 版 St
 | 登录 | POST | `/api/v1/login` | 已验证无 Cookie 登录及 JSON 响应 |
 | 姿态回读 | GET | `/api/v1/device/fetchptzposition` | 已验证 PTZ、视场角响应及两种认证方式 |
 | 连续控制 | POST | `/api/v1/control/ptz` | 用户提供的指令和速度接口资料，默认速度 129，含 stop |
+| 框选缩放 | POST | `/api/v1/control/dragzoomin`、`/api/v1/control/dragzoomout` | 用户提供的画面尺寸及矩形中心、宽高契约 |
 | 精确控制 | POST | `/api/v1/control/ptzprecise` | `pan`、`tilt`、`zoom` 查询参数的请求示例 |
 | 通道快照 | GET | `/api/v1/device/channelsnap` | 已验证 `stime=now` 返回 JPEG 二进制及快照时间头 |
 

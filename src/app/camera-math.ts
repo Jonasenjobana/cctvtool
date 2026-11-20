@@ -1,7 +1,7 @@
 import {
   Cartesian2, Cartesian3, Ellipsoid, EllipsoidalOccluder, IntersectionTests, Math as CesiumMath, Matrix3, Matrix4, Ray, Transforms,
 } from 'cesium';
-import type { CameraDraft, PreciseTarget, RawPtz } from './models';
+import type { CameraDraft, DragZoomBox, PreciseTarget, RawPtz } from './models';
 import { activeZeroPoseOf, createZeroPoseRigRotation, legacyZeroPose } from '#zero-pose';
 import type { ZeroPose } from '#zero-pose';
 
@@ -191,6 +191,31 @@ export function frustumCorners(pose: CameraPose, distance: number): Cartesian3[]
   return [[-1, 1], [1, 1], [1, -1], [-1, -1]].map(([x, y]) => Cartesian3.add(
     pose.position, Cartesian3.multiplyByScalar(rayDirection(pose, x, y), distance, new Cartesian3()), new Cartesian3(),
   ));
+}
+
+/** 返回左上角为原点的原图坐标，横纵焦距分别由回读的视场角确定。 */
+export function projectToImagePixel(pose: CameraPose, position: Cartesian3, width: number, height: number): Cartesian2 | null {
+  const offset = Cartesian3.subtract(position, pose.position, new Cartesian3());
+  const depth = Cartesian3.dot(offset, pose.direction);
+  if (depth <= 0) return null;
+  const halfWidth = depth * Math.tan(CesiumMath.toRadians(pose.horizontalFov / 2));
+  const halfHeight = depth * Math.tan(CesiumMath.toRadians(pose.verticalFov / 2));
+  const x = Cartesian3.dot(offset, pose.right) / halfWidth;
+  const y = Cartesian3.dot(offset, pose.up) / halfHeight;
+  if (Math.abs(x) > 1 || Math.abs(y) > 1) return null;
+  return new Cartesian2((x + 1) * width / 2, (1 - y) * height / 2);
+}
+
+export interface ScreenBox { left: number; top: number; width: number; height: number }
+
+/** 视频画面与视口可能有留边，按实际投影矩形将选区转换为原始画面像素。 */
+export function imageDragZoomBox(selection: ScreenBox, bounds: ScreenBox, length: number, width: number): DragZoomBox | null {
+  const left = Math.round((selection.left - bounds.left) / bounds.width * length);
+  const top = Math.round((selection.top - bounds.top) / bounds.height * width);
+  const lengthx = Math.round((selection.left + selection.width - bounds.left) / bounds.width * length) - left;
+  const lengthy = Math.round((selection.top + selection.height - bounds.top) / bounds.height * width) - top;
+  if (lengthx <= 0 || lengthy <= 0) return null;
+  return { length, width, lengthx, lengthy, midpointx: left + Math.floor(lengthx / 2), midpointy: top + Math.floor(lengthy / 2) };
 }
 
 /** 视频截面固定在摄像头视场内，不随地图观察相机转动。 */

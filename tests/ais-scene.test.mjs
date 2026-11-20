@@ -4,7 +4,8 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
-import { Cartesian3, EntityCollection, Event as CesiumEvent, PrimitiveCollection } from 'cesium';
+import { Cartesian3, Color, EntityCollection, Event as CesiumEvent, Matrix4, PrimitiveCollection, Ray } from 'cesium';
+import { createCameraPose, videoFovPlane } from '../src/app/camera-math.ts';
 
 const cache = resolve('node_modules/.cache');
 const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
@@ -37,13 +38,16 @@ const vessel = { mmsi: '123456789', time: '2026-11-17T06:00:00Z', longitude: 117
 function fixture(t) {
   const canvas = Object.assign(new EventTarget(), { disableRootEvents: true, onwheel: null,
     getBoundingClientRect: () => ({ left: 0, top: 0 }) });
-  let picked;
+  let picked, videoVisible = false, ray;
   const selected = [];
-  const viewer = { entities: new EntityCollection(), camera: { positionWC: Cartesian3.fromDegrees(117, 39, 1000) },
+  const viewer = { entities: new EntityCollection(),
+    camera: { positionWC: Cartesian3.fromDegrees(117, 39, 1000), getPickRay: () => ray },
     scene: { canvas, primitives: new PrimitiveCollection(), preRender: new CesiumEvent(), requestRender() {}, pick: () => picked } };
-  const scene = new AisScene(viewer, mmsi => selected.push(mmsi));
+  const scene = new AisScene(viewer, mmsi => selected.push(mmsi), () => videoVisible);
   t.after(() => scene.destroy());
-  return { scene, viewer, selected,
+  return { scene, viewer, selected, mapPoints: viewer.scene.primitives.get(0),
+    setVideoPickRay(value) { ray = value; },
+    setVideoVisible(value) { videoVisible = value; },
     click(entity) {
       picked = { id: entity };
       for (const type of ['mousedown', 'mouseup']) {
@@ -60,11 +64,13 @@ test('AIS 点不依赖摄像头 PTZ，近处、远处及背向位置均创建且
     ({ ...vessel, mmsi: String(123456780 + index), longitude, latitude }));
   f.scene.sync(targets, source, '', new Map());
   assert.equal(f.viewer.entities.values.length, targets.length);
+  assert.equal(f.mapPoints.length, targets.length);
   f.viewer.scene.preRender.raiseEvent();
-  for (const target of targets) {
+  for (const [index, target] of targets.entries()) {
     const entity = f.viewer.entities.getById(`ais-${source.id}-${target.mmsi}`);
     assert.ok(entity?.show, target.mmsi);
-    assert.ok(entity.point);
+    assert.equal(f.mapPoints.get(index).id, entity);
+    assert.ok(Color.equals(f.mapPoints.get(index).color, Color.CYAN));
   }
 });
 
@@ -73,7 +79,7 @@ test('AIS 点可点选，切源、目标移除与关闭显示会清理旧实体'
   f.scene.sync([vessel], source, '', new Map());
   const entity = f.viewer.entities.getById(`ais-${source.id}-${vessel.mmsi}`);
   assert.ok(entity);
-  f.click(entity);
+  f.click(f.mapPoints.get(0).id);
   assert.deepEqual(f.selected, [vessel.mmsi]);
   const next = { ...source, id: 'next-ais' };
   f.scene.sync([vessel], next, '', new Map());
@@ -81,6 +87,7 @@ test('AIS 点可点选，切源、目标移除与关闭显示会清理旧实体'
   assert.equal(f.viewer.entities.values.length, 1);
   f.scene.sync([], next, '', new Map());
   assert.equal(f.viewer.entities.values.length, 0);
+  assert.equal(f.mapPoints.length, 0);
   f.scene.sync([vessel], next, vessel.mmsi, new Map());
   assert.equal(f.viewer.entities.values.length, 1);
   f.scene.sync([vessel], null, '', new Map());
@@ -95,20 +102,20 @@ test('默认按 AIS 报告点显示，ABCD 开关切换中心并释放旧船体�
   const report = Cartesian3.fromDegrees(ship.longitude, ship.latitude);
   f.scene.sync([ship], source, ship.mmsi, bodies);
   let entity = f.viewer.entities.getById(id);
-  assert.ok(entity.point);
+  assert.equal(f.mapPoints.get(0).id, entity);
   assert.ok(Cartesian3.distance(entity.position.getValue(), report) < 1e-8);
-  assert.equal(f.viewer.scene.primitives.length, 0);
+  assert.equal(f.viewer.scene.primitives.length, 1);
   f.scene.sync([ship], source, ship.mmsi, bodies, true);
   entity = f.viewer.entities.getById(id);
-  assert.equal(entity.point, undefined);
+  assert.equal(f.mapPoints.length, 0);
   assert.ok(Cartesian3.distance(entity.position.getValue(), report) > 30);
-  assert.equal(f.viewer.scene.primitives.length, 1);
+  assert.equal(f.viewer.scene.primitives.length, 2);
   f.scene.sync([ship], source, ship.mmsi, bodies, false);
   entity = f.viewer.entities.getById(id);
-  assert.ok(entity.point);
+  assert.equal(f.mapPoints.get(0).id, entity);
   assert.ok(Cartesian3.distance(entity.position.getValue(), report) < 1e-8);
   assert.equal(entity.label.text.getValue(), ship.mmsi);
-  assert.equal(f.viewer.scene.primitives.length, 0);
+  assert.equal(f.viewer.scene.primitives.length, 1);
   assert.equal(ship.longitude, vessel.longitude);
   assert.equal(ship.latitude, vessel.latitude);
 });
@@ -129,13 +136,63 @@ test('ABCD 使用缺失船艏时的 COG 建立船体，两种方向均缺失时�
   const report = Cartesian3.fromDegrees(ship.longitude, ship.latitude);
   f.scene.sync([ship], source, ship.mmsi, new Map(), true);
   let entity = f.viewer.entities.getById(id);
-  assert.equal(entity.point, undefined);
+  assert.equal(f.mapPoints.length, 0);
   assert.ok(Cartesian3.distance(entity.position.getValue(), report) > 30);
-  assert.equal(f.viewer.scene.primitives.length, 1);
+  assert.equal(f.viewer.scene.primitives.length, 2);
   assert.equal(ship.heading, null);
   f.scene.sync([{ ...ship, cog: null }], source, ship.mmsi, new Map(), true);
   entity = f.viewer.entities.getById(id);
-  assert.ok(entity.point);
+  assert.equal(f.mapPoints.get(0).id, entity);
   assert.ok(Cartesian3.distance(entity.position.getValue(), report) < 1e-8);
-  assert.equal(f.viewer.scene.primitives.length, 0);
+  assert.equal(f.viewer.scene.primitives.length, 1);
+});
+
+test('直播投影返回原图像素，背向和越过地平线的船舶仅保留地图点', t => {
+  const f = fixture(t);
+  const front = { ...vessel, latitude: 39.01 };
+  const behind = { ...vessel, latitude: 38.99, mmsi: '123456780' };
+  const beyondHorizon = { ...vessel, latitude: 40, mmsi: '123456781' };
+  f.scene.sync([front, behind, beyondHorizon], source, '', new Map());
+  const camera = { ...vessel, height: 100, pAxisPitch: 0, pAxisRoll: 0, panOffset: 0, tiltOffset: 0, imageRoll: 0 };
+  const raw = { Pan: 0, Tilt: 0, HorizontalFieldAngle: 60, VerticalFieldAngle: 30 };
+  const pose = createCameraPose(camera, raw);
+  const plane = videoFovPlane(pose, 500).matrix;
+  const { pixels } = f.scene.projectVideoPixels(pose, plane, 1920, 1080);
+  assert.equal(f.mapPoints.length, 3);
+  assert.equal(f.viewer.scene.primitives.length, 1);
+  assert.equal(pixels.length, 1);
+  assert.ok(Math.abs(pixels[0].x - 960) < 1e-7);
+  assert.ok(pixels[0].y > 540 && pixels[0].y < 1080);
+  const { pixels: halfResolution } = f.scene.projectVideoPixels(pose, plane, 960, 540);
+  assert.equal(halfResolution[0].x, pixels[0].x / 2);
+  assert.equal(halfResolution[0].y, pixels[0].y / 2);
+  f.scene.sync([behind], source, '', new Map());
+  assert.deepEqual(f.scene.projectVideoPixels(pose, plane, 1920, 1080).pixels, []);
+});
+
+test('点击视频绿色点按画面原像素选船，空白、隐藏或释放后不选船', t => {
+  const f = fixture(t);
+  const front = { ...vessel, longitude: 117.001, latitude: 39.01 };
+  f.scene.sync([front], source, '', new Map());
+  const camera = { ...vessel, height: 100, pAxisPitch: 0, pAxisRoll: 0, panOffset: 0, tiltOffset: 0, imageRoll: 0 };
+  const pose = createCameraPose(camera, { Pan: 0, Tilt: 0, HorizontalFieldAngle: 60, VerticalFieldAngle: 30 });
+  const width = 1920, height = 1080;
+  const plane = videoFovPlane(pose, 500).matrix;
+  const { pixels: [pixel], radius } = f.scene.projectVideoPixels(pose, plane, width, height);
+  const rayAt = (x, y) => {
+    const world = Matrix4.multiplyByPoint(plane, new Cartesian3(x / width - 0.5, 0.5 - y / height, 0), new Cartesian3());
+    return new Ray(f.viewer.camera.positionWC, Cartesian3.subtract(world, f.viewer.camera.positionWC, new Cartesian3()));
+  };
+  f.setVideoPickRay(rayAt(pixel.x, pixel.y));
+  f.click();
+  assert.deepEqual(f.selected, []);
+  f.setVideoVisible(true);
+  f.click();
+  assert.deepEqual(f.selected, [front.mmsi]);
+  f.setVideoPickRay(rayAt(pixel.x, pixel.y + 2 * radius));
+  f.click();
+  f.scene.clearVideoProjection();
+  f.setVideoPickRay(rayAt(pixel.x, pixel.y));
+  f.click();
+  assert.deepEqual(f.selected, [front.mmsi]);
 });

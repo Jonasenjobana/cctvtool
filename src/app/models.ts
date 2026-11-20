@@ -139,6 +139,17 @@ export const snapshotTaskStatus = {
   failed: '失败', cancelled: '已取消', interrupted: '已中断',
 };
 
+export type DragZoomDirection = 'in' | 'out';
+
+export interface DragZoomBox {
+  length: number;
+  width: number;
+  midpointx: number;
+  midpointy: number;
+  lengthx: number;
+  lengthy: number;
+}
+
 export type MotionCommand = 'left' | 'right' | 'up' | 'down' | 'upleft' | 'upright' | 'downleft' | 'downright' | 'zoomin' | 'zoomout';
 export type PtzCommand = MotionCommand | 'stop';
 export interface PreciseTarget { pan: number; tilt: number; zoom: number }

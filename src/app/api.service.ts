@@ -2,7 +2,7 @@ import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { firstValueFrom, timeout } from 'rxjs';
 import { ZERO_POSE_MODEL } from '#zero-pose';
-import type { Calibration, Camera, CameraInput, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
+import type { Calibration, Camera, CameraInput, DragZoomBox, DragZoomDirection, PlaybackSource, PreciseTarget, PtzCommand, PtzReading, Snapshot, SnapshotGroup, SnapshotGroupPage, SnapshotPage } from './models';
 import type { HorizonPoint, RecognitionTask, RecognitionTaskPage, RecognitionItem, RecognitionItemPage,
   ZeroPoseCandidate, ZeroPoseMeasurement } from './models';
 import type { PlotLayerAssociation, PlotLayerDetail, PlotLayerImportInput, PlotLayerSummary, PlotLayerUpdateInput } from './plot-layer.models';
@@ -73,6 +73,12 @@ export class ApiService {
         });
     }
     return firstValueFrom(this.http.post(url, body).pipe(timeout(95000)));
+  }
+
+  dragZoom(id: string, direction: DragZoomDirection, box: DragZoomBox) {
+    return firstValueFrom(this.http.post(
+      `/api/cameras/${id}/drag-zoom`, { direction, ...box },
+    ).pipe(timeout(95000)));
   }
 
   precise(id: string, target: PreciseTarget) {

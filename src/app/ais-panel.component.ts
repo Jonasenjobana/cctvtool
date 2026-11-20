@@ -23,6 +23,7 @@ export class AisPanelComponent {
   @Input() maxZoom = 73;
   @Input() operationError = '';
   @Input() operationMessage = '';
+  @Output() readonly located = new EventEmitter<string>();
   @Output() readonly tracked = new EventEmitter<string>();
   @Output() readonly predicted = new EventEmitter<{ mmsi: string; seconds: number | null }>();
   @Output() readonly closed = new EventEmitter<void>();

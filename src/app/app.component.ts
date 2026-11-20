@@ -29,7 +29,7 @@ import { calibratedZeroPose, ZERO_POSE_MODEL } from '#zero-pose';
 import type { ZeroPose } from '#zero-pose';
 import { ZeroPoseEditorComponent } from './zero-pose-editor.component';
 import { emptyCamera, snapshotTaskName, snapshotTaskStatus } from './models';
-import type { Calibration, Camera, CameraDraft, CameraInput, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
+import type { Calibration, Camera, CameraDraft, CameraInput, DragZoomBox, DragZoomDirection, MotionCommand, PlaybackSource, PreciseTarget, PtzReading, RawPtz, Snapshot, SnapshotGroup } from './models';
 import type { PlotLayerError, PlotLayerFocusRequest, PlotLayerFocusResult, PlotLayerRenderInput } from './plot-layer.models';
 
 const editableKeys = ['name', 'serial', 'code', 'maxZoom', 'longitude', 'latitude', 'height'] as const;
@@ -126,7 +126,8 @@ export class AppComponent implements OnDestroy {
   readonly panel = signal<'devices' | 'snapshots' | null>(null);
   readonly following = signal(true);
   readonly saving = signal(false);
-  readonly operating = signal<'control' | 'precise' | 'snapshot' | 'scan' | null>(null);
+  readonly operating = signal<'control' | 'precise' | 'snapshot' | 'scan' | 'dragZoom' | null>(null);
+  readonly dragZoomDirection = signal<DragZoomDirection | null>(null);
   readonly historyLoading = signal(false);
   readonly apiConnected = signal(false);
   readonly pageError = signal('');
@@ -186,6 +187,10 @@ export class AppComponent implements OnDestroy {
   });
   readonly sceneVideo = computed(() => this.showVideo() && !this.selectedSnapshot() && this.videoChannelMatches()
     ? this.liveVideo() : null);
+  private readonly dragZoomAvailable = computed(() => this.page() === 'scene' && !!this.selectedId()
+    && !!this.sceneVideo() && !!this.sceneReading() && this.videoOpacity() > 0 && !this.zeroPosePreview()
+    && !this.saving() && !this.scanning() && !this.plotPreparing());
+  readonly canDragZoom = computed(() => this.dragZoomAvailable() && !this.operating());
   readonly preview = computed(() => this.hidePreview() ? null : (this.selectedSnapshot() || this.lastSnapshot()));
   readonly zeroPoseDirty = computed(() => !sameZeroPose(this.draft().zeroPose, this.selectedCamera()?.zeroPose));
   readonly zeroPoseToApply = computed(() => {
@@ -212,14 +217,14 @@ export class AppComponent implements OnDestroy {
       && this.inRange(draft.tiltOffset, -180, 180)
       && this.inRange(draft.imageRoll, -180, 180);
   });
-  readonly canControl = computed(() => Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning()
+  readonly canControl = computed(() => Boolean(this.selectedId() && !this.dragZoomDirection() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning()
     && this.inRange(this.controlSpeed(), 0, 255) && Number.isInteger(this.controlSpeed())));
   readonly canPrecise = computed(() => {
     const target = this.preciseTarget();
-    return Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning()
+    return Boolean(this.selectedId() && !this.dragZoomDirection() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning()
       && this.inRange(target.pan, 0, 360) && this.inRange(target.tilt, -90, 90) && this.inRange(target.zoom, 1, this.pointZoomMax()));
   });
-  readonly canCapture = computed(() => Boolean(this.selectedId() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning() && this.formValid()));
+  readonly canCapture = computed(() => Boolean(this.selectedId() && !this.dragZoomDirection() && !this.saving() && !this.operating() && !this.selectedSnapshot() && !this.scanning() && this.formValid()));
   readonly canTrackPoint = computed(() => this.page() === 'scene' && this.canCapture() && !this.stale() && !!this.reading()
     && this.draft().serial === this.selectedCamera()?.serial && this.draft().code === this.selectedCamera()?.code);
   readonly pointTargets = computed(() => {
@@ -261,6 +266,9 @@ export class AppComponent implements OnDestroy {
 
   constructor() {
     const ptzPollingInterval = toObservable(this.ptzPollingIntervalSeconds);
+    effect(() => {
+      if (!this.dragZoomAvailable()) this.exitDragZoom();
+    });
     effect(() => {
       const active = this.page() === 'scene' && !this.selectedSnapshot();
       untracked(() => this.ais.setActive(active));
@@ -305,7 +313,7 @@ export class AppComponent implements OnDestroy {
     effect(() => {
       const problem = this.plots.problem(), errors = this.plots.layerErrors();
       const hasLayerError = this.cameraPlotLayers().some((layer) => errors.has(layer.id));
-      if (this.page() === 'scene' && (problem || hasLayerError)) this.showPlotPanel.set(true);
+      if (this.page() === 'scene' && !this.dragZoomDirection() && (problem || hasLayerError)) this.showPlotPanel.set(true);
     });
     effect((onCleanup) => {
       const id = this.selectedId();
@@ -377,6 +385,7 @@ export class AppComponent implements OnDestroy {
   }
 
   private activate(camera: Camera) {
+    this.exitDragZoom();
     this.ais.clearTracking();
     this.plotNavigationRevision++;
     this.plotFocusRequest.set(null);
@@ -430,6 +439,7 @@ export class AppComponent implements OnDestroy {
     const revision = ++this.plotNavigationRevision;
     if (this.recognition?.busy() || (this.recognition && !await this.recognition.save())) return false;
     if (revision !== this.plotNavigationRevision) return false;
+    this.exitDragZoom();
     this.plotFocusRequest.set(null);
     this.page.set(page);
     this.showTemporaryPoints.set(false);
@@ -731,6 +741,7 @@ export class AppComponent implements OnDestroy {
     if (this.holdControl.busy) { this.releaseControl(); return; }
     if (!this.selectedId() || this.saving() || this.operating() === 'snapshot') return;
     this.preciseRevision++;
+    this.exitDragZoom();
     this.ais.clearTracking();
     this.operating.set('control');
     this.stopping.set(true);
@@ -775,17 +786,19 @@ export class AppComponent implements OnDestroy {
       && this.temporaryPoints().some(item => item === point)));
   }
 
-  async selectAisTarget(mmsi: string) {
+  selectAisTarget(mmsi: string) {
     this.ais.selectTarget(mmsi);
     this.showPlotPanel.set(false);
     this.showTemporaryPoints.set(false);
     this.showAisPanel.set(true);
-    if (this.following()) return;
+  }
+
+  async locateSelectedAis(mmsi: string) {
+    if (!this.canTrackPoint() || this.ais.status() !== 'connected' || mmsi !== this.ais.selectedTarget()?.mmsi) return;
     this.ais.clearTracking();
-    if (!this.canTrackPoint() || this.ais.status() !== 'connected' || !this.ais.selectedTarget()) return;
     const id = this.selectedId(), sourceId = this.ais.selectedId(), selection = this.ais.selectionRevision();
-    const navigation = this.plotNavigationRevision, bodyRevision = this.ais.bodyRevision();
-    await this.locateAis(mmsi, id, sourceId, () => !this.following() && this.page() === 'scene' && !this.selectedSnapshot()
+    const navigation = this.plotNavigationRevision, bodyRevision = this.ais.bodyRevision(), following = this.following();
+    await this.locateAis(mmsi, id, sourceId, () => following === this.following() && this.page() === 'scene' && !this.selectedSnapshot()
       && id === this.selectedId() && sourceId === this.ais.selectedId() && selection === this.ais.selectionRevision()
       && mmsi === this.ais.selectedMmsi() && this.ais.status() === 'connected'
       && navigation === this.plotNavigationRevision && bodyRevision === this.ais.bodyRevision());
@@ -1073,6 +1086,46 @@ export class AppComponent implements OnDestroy {
   }
 
   exitHistory() { this.selectedSnapshot.set(null); }
+  toggleDragZoom(direction: DragZoomDirection) {
+    if (this.dragZoomDirection() === direction) { this.exitDragZoom(); return; }
+    if (!this.canDragZoom()) return;
+    if (!this.scene?.canBoxZoom()) {
+      this.operationError.set('等待直播画面和有效视场加载后再框选');
+      return;
+    }
+    this.ais.clearTracking();
+    this.panel.set(null);
+    this.showAisPanel.set(false);
+    this.showPlotPanel.set(false);
+    this.showTemporaryPoints.set(false);
+    this.operationError.set('');
+    this.operationMessage.set('');
+    this.dragZoomDirection.set(direction);
+  }
+
+  @HostListener('document:keydown.escape')
+  @HostListener('window:blur')
+  exitDragZoom() { this.dragZoomDirection.set(null); }
+
+  async sendDragZoom(box: DragZoomBox) {
+    const direction = this.dragZoomDirection();
+    if (!direction || !this.canDragZoom()) return;
+    const id = this.selectedId(), revision = this.preciseRevision;
+    const current = () => this.preciseRevision === revision && this.selectedId() === id && this.operating() === 'dragZoom';
+    this.operating.set('dragZoom');
+    this.controlTarget.set(null);
+    this.operationError.set('');
+    this.operationMessage.set('');
+    try {
+      await this.api.dragZoom(id, direction, box);
+      if (current()) this.operationMessage.set(`框选${direction === 'in' ? '放大' : '缩小'}指令已发送，状态以回读为准`);
+    } catch (error) {
+      if (current()) this.operationError.set(errorMessage(error));
+    } finally {
+      if (current()) this.operating.set(null);
+    }
+  }
+
   bestView() { this.scene?.focus(); }
   overview() { this.following.set(false); this.scene?.overview(); }
   ngOnDestroy() {

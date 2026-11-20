@@ -19,6 +19,7 @@
       <app-plot-layers [cameras]="cameras()" [selectedCameraId]="selectedId()" [focusing]="plotPreparing() || !!operating() || saving()" (focused)="focusPlotLayer($event)" />
     } @else {
     <app-camera-scene [camera]="sceneCamera()" [reading]="sceneReading()" [zeroPosePreview]="zeroPosePreview()" [following]="following()" [video]="sceneVideo()" [snapshotUrl]="selectedSnapshot()?.imageUrl || null" [videoOpacity]="videoOpacity()"
+      [dragZoom]="dragZoomDirection()" [dragZoomBusy]="!!operating()" (zoomBoxSelected)="sendDragZoom($event)"
       [plotLayers]="plotRenderLayers()" [plotFocus]="plotFocusRequest()" [temporaryPoints]="temporaryPoints()" (plotLayerError)="onPlotLayerError($event)" (plotFocusResult)="onPlotFocusResult($event)"
       [vessels]="aisTargets()" [vesselSource]="ais.selectedSource()" [vesselBodies]="ais.bodyOverrides()" [useVesselBodyGeometry]="ais.useBodyGeometry()" [trackedMmsi]="ais.trackedMmsi()" [predictedMmsi]="ais.predictedTarget()?.mmsi ?? ''" (vesselSelected)="selectAisTarget($event)" />
     <header class="map-toolbar">
@@ -26,11 +27,17 @@
         <app-icon name="camera" /><span>{{ selectedCamera()?.name || '选择摄像头' }}</span><app-icon name="down" />
       </button>
       <div class="view-actions">
-        <button type="button" [class.selected]="showAisPanel()" [attr.aria-expanded]="showAisPanel()" [title]="ais.problem() || 'AIS 数据源'" (click)="showAisPanel.set(!showAisPanel()); showPlotPanel.set(false); showTemporaryPoints.set(false)">AIS{{ ais.problem() ? ' !' : '' }}</button>
-        <button type="button" [class.selected]="showPlotPanel()" [attr.aria-expanded]="showPlotPanel()" (click)="togglePlotPanel()"><app-icon name="layers" />图层</button>
-        <button type="button" [class.selected]="showTemporaryPoints()" [attr.aria-expanded]="showTemporaryPoints()" aria-controls="temporary-point-panel" (click)="toggleTemporaryPoints()"><app-icon name="plus" />临时点</button>
+        <button type="button" [disabled]="!!dragZoomDirection()" [class.selected]="showAisPanel()" [attr.aria-expanded]="showAisPanel()" [title]="ais.problem() || 'AIS 数据源'" (click)="showAisPanel.set(!showAisPanel()); showPlotPanel.set(false); showTemporaryPoints.set(false)">AIS{{ ais.problem() ? ' !' : '' }}</button>
+        <button type="button" [disabled]="!!dragZoomDirection()" [class.selected]="showPlotPanel()" [attr.aria-expanded]="showPlotPanel()" (click)="togglePlotPanel()"><app-icon name="layers" />图层</button>
+        <button type="button" [disabled]="!!dragZoomDirection()" [class.selected]="showTemporaryPoints()" [attr.aria-expanded]="showTemporaryPoints()" aria-controls="temporary-point-panel" (click)="toggleTemporaryPoints()"><app-icon name="plus" />临时点</button>
         @if (!selectedSnapshot()) {
           <button type="button" [class.selected]="showVideo()" (click)="showVideo.set(!showVideo())"><app-icon name="video" />直播融合</button>
+          @if (!zeroPosePreview()) {
+            <button type="button" [class.selected]="dragZoomDirection() === 'in'" [attr.aria-pressed]="dragZoomDirection() === 'in'"
+              [disabled]="dragZoomDirection() !== 'in' && !canDragZoom()" (click)="toggleDragZoom('in')">框选放大</button>
+            <button type="button" [class.selected]="dragZoomDirection() === 'out'" [attr.aria-pressed]="dragZoomDirection() === 'out'"
+              [disabled]="dragZoomDirection() !== 'out' && !canDragZoom()" (click)="toggleDragZoom('out')">框选缩小</button>
+          }
         }
         @if (selectedSnapshot()) {
           <span class="history-badge">历史快照</span>
@@ -40,9 +47,9 @@
           <button type="button" [class.selected]="preview.view === 'external'" [attr.aria-pressed]="preview.view === 'external'" (click)="setZeroPoseView('external')">模型外侧</button>
           <button type="button" [class.selected]="preview.view === 'lens'" [attr.aria-pressed]="preview.view === 'lens'" (click)="setZeroPoseView('lens')">镜头视角</button>
         } @else {
-          <button type="button" [class.selected]="following()" [disabled]="!selectedId()" (click)="following.set(!following())">{{ following() ? '跟随摄像头' : '固定观察' }}</button>
+          <button type="button" [class.selected]="following()" [disabled]="!selectedId() || !!dragZoomDirection()" (click)="following.set(!following())">{{ following() ? '跟随摄像头' : '固定观察' }}</button>
           <button type="button" [disabled]="!selectedId()" (click)="bestView()"><app-icon name="target" />最佳观察</button>
-          <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId()" (click)="overview()"><app-icon name="map" /></button>
+          <button type="button" class="icon-button" title="区域总览" aria-label="区域总览" [disabled]="!selectedId() || !!dragZoomDirection()" (click)="overview()"><app-icon name="map" /></button>
         }
       </div>
       @if (showTemporaryPoints()) {
@@ -90,7 +97,7 @@
         </div>
       }
     </header>
-    @if (showAisPanel()) { <app-ais-panel [canTrack]="canTrackPoint()" [busy]="!!operating() || saving()" [currentZoom]="reading()?.raw?.Zoom ?? null" [maxZoom]="pointZoomMax()" [operationError]="operationError()" [operationMessage]="operationMessage()" (tracked)="trackAis($event)" (predicted)="predictAis($event)" (closed)="showAisPanel.set(false)" /> }
+    @if (showAisPanel()) { <app-ais-panel [canTrack]="canTrackPoint()" [busy]="!!operating() || saving()" [currentZoom]="reading()?.raw?.Zoom ?? null" [maxZoom]="pointZoomMax()" [operationError]="operationError()" [operationMessage]="operationMessage()" (located)="locateSelectedAis($event)" (tracked)="trackAis($event)" (predicted)="predictAis($event)" (closed)="showAisPanel.set(false)" /> }
     @if (showPlotPanel()) {
       <section class="plot-panel" aria-label="当前摄像头标绘图层">
         <div class="plot-panel-heading"><h2>标绘图层</h2><button type="button" class="icon-button" aria-label="关闭图层面板" (click)="showPlotPanel.set(false)"><app-icon name="close" /></button></div>
@@ -175,7 +182,7 @@
 
   <aside class="right-panel" [hidden]="page() === 'recognition' || page() === 'plotting'" aria-label="云台控制与安装参数">
     <section class="controller-section">
-      <div class="section-heading"><h1>云台控制</h1><span class="connection-label" [class.live]="!!reading() && !stale() && !selectedSnapshot()">{{ selectedSnapshot() ? '历史状态' : operating() === 'snapshot' ? '正在截图' : stopping() ? '正在停止' : operating() === 'control' ? '控制未结束' : operating() === 'precise' ? '精确定位' : !selectedId() ? '未选择设备' : stale() ? '等待回读' : '实时' }}</span></div>
+      <div class="section-heading"><h1>云台控制</h1><span class="connection-label" [class.live]="!!reading() && !stale() && !selectedSnapshot()">{{ selectedSnapshot() ? '历史状态' : operating() === 'snapshot' ? '正在截图' : stopping() ? '正在停止' : operating() === 'control' ? '控制未结束' : operating() === 'precise' ? '精确定位' : operating() === 'dragZoom' ? '框选缩放' : !selectedId() ? '未选择设备' : stale() ? '等待回读' : '实时' }}</span></div>
       <div class="controller-workbench">
         <div class="ptz-pad">
           @for (control of padControls; track control.command) {

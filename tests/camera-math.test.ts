@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Cartesian3, Cartographic, Matrix3, Matrix4, Quaternion, Transforms } from 'cesium';
-import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, observationFov, pointTargetPtz, videoFovPlane } from '../src/app/camera-math.ts';
+import { createCameraPose, createZeroPosePreview, footprintSegments, frustumCorners, imageDragZoomBox, observationFov, pointTargetPtz, projectToImagePixel, videoFovPlane } from '../src/app/camera-math.ts';
 import type { CameraDraft, RawPtz } from '../src/app/models.ts';
 import { createLocalRigRotation } from '#camera-rotation';
 import { createZeroPoseQuaternion, createZeroPoseRigRotation, createZeroPoseRotation, legacyZeroPose } from '#zero-pose';
@@ -12,6 +12,28 @@ const camera = {
 } satisfies CameraDraft;
 const ptz: RawPtz = { Pan: 0, Tilt: 0, Zoom: 15, HorizontalFieldAngle: 4.32, VerticalFieldAngle: 2.43 };
 const near = (a: number, b: number, epsilon = 1e-9) => assert.ok(Math.abs(a - b) <= epsilon, `${a} ≠ ${b}`);
+
+test('原图投影沿当前光轴取深度，使用独立横纵焦距和向下的图像 Y 轴', () => {
+  const pose = createCameraPose({ ...camera, imageRoll: 16 }, {
+    ...ptz, Pan: 71, Tilt: 12, HorizontalFieldAngle: 90, VerticalFieldAngle: 60,
+  });
+  const world = (right: number, up: number, forward: number) => {
+    const point = Cartesian3.clone(pose.position);
+    for (const [axis, distance] of [[pose.right, right], [pose.up, up], [pose.direction, forward]] as const) {
+      Cartesian3.add(point, Cartesian3.multiplyByScalar(axis, distance, new Cartesian3()), point);
+    }
+    return point;
+  };
+  const center = projectToImagePixel(pose, world(0, 0, 200), 1920, 1080)!;
+  near(center.x, 960, 1e-7);
+  near(center.y, 540, 1e-7);
+  const pixel = projectToImagePixel(pose, world(100, 50, 200), 1920, 1080)!;
+  near(pixel.x, 1440, 1e-7);
+  near(pixel.y, 540 * (1 - Math.sqrt(3) / 4), 1e-7);
+  assert.equal(projectToImagePixel(pose, world(0, 0, -200), 1920, 1080), null);
+  assert.equal(projectToImagePixel(pose, world(201, 0, 200), 1920, 1080), null);
+  assert.equal(projectToImagePixel(pose, world(0, 116, 200), 1920, 1080), null);
+});
 
 test('零位预览在回读缺失时显示零位方向，转动后按补偿与实际视场角显示', () => {
   const location = { ...camera, longitude: 0, latitude: 0, panOffset: 24 };
@@ -344,4 +366,15 @@ test('临时点追踪保留上抬负 T，不包装成 300 多度', () => {
   const result = pointTargetPtz(setup, { Pan: 0, Tilt: 2, Zoom: 8 }, { longitude: 0, latitude: 0.01 });
   assert.ok(result.tilt < 0 && result.tilt > -1, `应为小幅负 T，实际 ${result.tilt}`);
   assert.equal(result.zoom, 8);
+});
+
+test('视频框选按截面留边和横纵比例换算，并保留贴边的奇数尺寸', () => {
+  const bounds = { left: 200, top: 120, width: 640, height: 270 };
+  assert.deepEqual(imageDragZoomBox({ left: 360, top: 174, width: 320, height: 135 }, bounds, 1920, 1080), {
+    length: 1920, width: 1080, midpointx: 960, midpointy: 486, lengthx: 960, lengthy: 540,
+  });
+  assert.deepEqual(imageDragZoomBox(bounds, bounds, 1921, 1081), {
+    length: 1921, width: 1081, midpointx: 960, midpointy: 540, lengthx: 1921, lengthy: 1081,
+  });
+  assert.equal(imageDragZoomBox({ ...bounds, width: 0 }, bounds, 1920, 1080), null);
 });

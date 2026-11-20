@@ -331,6 +331,30 @@ export async function createApp({
     return { target, sentAt: new Date().toISOString() };
   }));
 
+  const dragZoomPixels = ['length', 'width', 'midpointx', 'midpointy', 'lengthx', 'lengthy'];
+  app.post('/api/cameras/:id/drag-zoom', {
+    schema: { body: {
+      type: 'object', additionalProperties: false, required: ['direction', ...dragZoomPixels],
+      properties: {
+        direction: { type: 'string', enum: ['in', 'out'] },
+        ...Object.fromEntries(dragZoomPixels.map((key) => [key, {
+          type: 'integer', minimum: key.startsWith('midpoint') ? 0 : 1, maximum: 2147483647,
+        }])),
+      },
+    } },
+  }, async (request) => {
+    const { direction, ...box } = request.body;
+    const left = box.midpointx - Math.floor(box.lengthx / 2);
+    const top = box.midpointy - Math.floor(box.lengthy / 2);
+    if (left < 0 || top < 0 || left + box.lengthx > box.length || top + box.lengthy > box.width) {
+      throw httpError(400, '框选区域必须位于视频画面内');
+    }
+    return trackControl(request.params.id, async () => {
+      await livegbs.dragZoom(store.getCamera(request.params.id), direction, box);
+      return { direction, sentAt: new Date().toISOString() };
+    });
+  });
+
   app.get('/api/cameras/:id/snapshots', async (request) => store.listSnapshots(request.params.id));
   app.get('/api/cameras/:id/snapshot-groups', { schema: { querystring: pageSchema } }, async (request) =>
     store.listSnapshotGroups(request.params.id, pageOptions(request.query)));
